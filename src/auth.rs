@@ -51,11 +51,15 @@ impl Auth {
     }
 
     async fn take_flow(&self, pool: &PgPool, id: Uuid, expected: &str) -> Result<(Uuid, Value)> {
+        // 先在同一事务里加锁读取并校验，通过后再删除。
+        // 旧实现是「DELETE ... RETURNING」先消费再校验：只要攻击者拿到 flow_id
+        // 并用错误的 kind / 过期流程去请求，就能把别人的认证流程消耗掉（拒绝服务）。
+        let mut tx = pool.begin().await?;
         let row = sqlx::query_as::<_, (String, Uuid, Value, chrono::DateTime<Utc>)>(
-            "DELETE FROM auth_flows WHERE id = $1 RETURNING kind, user_id, state, expires_at",
+            "SELECT kind, user_id, state, expires_at FROM auth_flows WHERE id = $1 FOR UPDATE",
         )
         .bind(id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await?
         .context("认证流程不存在或已使用")?;
 
@@ -66,7 +70,29 @@ impl Auth {
         if expires_at < Utc::now() {
             bail!("认证流程已过期");
         }
+
+        sqlx::query("DELETE FROM auth_flows WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok((user_id, state))
+    }
+
+    /// 生成一份 Passkey 注册挑战（纯内存，不访问数据库）。
+    ///
+    /// 新用户没有任何已注册凭证，所以 exclude 传空。返回的 state 交给调用方
+    /// 与「占用邀请码 + 创建用户」放进同一事务落库，保证注册流程原子。
+    /// 注意 `user.id` 必须与实际落库的用户 ID 一致，它是 WebAuthn 的 user handle。
+    pub fn create_registration_challenge(
+        &self,
+        user: &User,
+    ) -> Result<(CreationChallengeResponse, Value)> {
+        let (options, state) = self
+            .webauthn
+            .start_passkey_registration(user.id, &user.username, &user.display_name, None)
+            .map_err(|e| anyhow!("无法开始 Passkey 注册: {e}"))?;
+        Ok((options, serde_json::to_value(state)?))
     }
 
     pub async fn start_registration(
