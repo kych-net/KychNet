@@ -98,10 +98,12 @@ kych-net 启动服务
 kych-net 生成静态站到public
 kych-net 创建邀请码可用三次有效期七天
 kych-net 作废邀请码ABCD1234
-kych-net 创建管理员alice
-kych-net 创建用户alice名为爱丽丝设为管理员
-kych-net 重置alice的通行密钥
+kych-net 创建管理员爱丽丝
+kych-net 创建用户爱丽丝设为管理员
+kych-net 重置爱丽丝的通行密钥
 ```
+
+**用户名直接用中文，不需要显示名。** 后端 `validate_username` 接受 Unicode（单测里 `张三丰` 通过），英文 CLI 创建用户时若不传 `--display`，会用 `display.unwrap_or_else(|| username.clone())` 把显示名设成用户名。所以中文命令直接写 `创建用户爱丽丝` 即可，不提供「名为…」这类把英文 `--display` 硬译过来的写法；误写会给出中文提示。
 
 中文不像英文靠空格分词，程序先去掉空白，再按中文短语切出命令名、数量、时长、所属与参数；支持中文数字（`三次`）、中文时长（`七天`、`永不过期`）和多种说法（`运行服务`、`撤销邀请码`、`解禁用户`）。解析后直接交给同一个 `kychnet` 执行，与英文 CLI 共用 service 层。
 
