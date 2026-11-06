@@ -6,6 +6,7 @@ mod db;
 mod models;
 mod render;
 mod service;
+mod svg;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};

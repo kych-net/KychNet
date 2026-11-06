@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context, Result};
+use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::{header, HeaderValue, Method, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
@@ -495,6 +496,50 @@ async fn patch_me(
     Ok(Json(user))
 }
 
+async fn upload_avatar(
+    State(state): State<AppState>,
+    session: Session,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Json<User>> {
+    let user = current_user(&state, &session).await?;
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !content_type.starts_with("image/svg+xml") {
+        api_bail!("头像必须使用 image/svg+xml");
+    }
+    crate::svg::validate_svg(&body)?;
+    let svg = std::str::from_utf8(&body).context("SVG 必须是 UTF-8 文本")?;
+    let user = service::update_avatar(&state.pool, user.id, svg).await?;
+    Ok(Json(user))
+}
+
+async fn avatar(State(state): State<AppState>, Path(id): Path<Uuid>) -> ApiResult<Response> {
+    match service::get_avatar(&state.pool, id).await? {
+        Some(svg) => {
+            let mut response = svg.into_response();
+            let headers = response.headers_mut();
+            headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("image/svg+xml; charset=utf-8"),
+            );
+            headers.insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=300"),
+            );
+            headers.insert(
+                axum::http::HeaderName::from_static("content-security-policy"),
+                HeaderValue::from_static("default-src 'none'; style-src 'unsafe-inline'"),
+            );
+            Ok(response)
+        }
+        None => Ok(StatusCode::NOT_FOUND.into_response()),
+    }
+}
+
 pub async fn serve(cfg: Config) -> Result<()> {
     let pool = crate::db::connect(&cfg.database_url).await?;
     crate::db::migrate(&pool).await?;
@@ -534,6 +579,8 @@ pub async fn serve(cfg: Config) -> Result<()> {
         .route("/api/auth/totp/login", post(totp_login))
         .route("/api/auth/logout", post(logout))
         .route("/api/me", get(me).patch(patch_me))
+        .route("/api/me/avatar", post(upload_avatar))
+        .route("/api/avatar/{id}", get(avatar))
         .route("/api/settings", get(get_settings).put(put_settings))
         .route("/api/totp/setup", post(totp_setup))
         .route("/api/totp/confirm", post(totp_confirm))

@@ -125,6 +125,28 @@ pub async fn update_display_name(pool: &PgPool, id: Uuid, display_name: &str) ->
     Ok(user)
 }
 
+pub async fn update_avatar(pool: &PgPool, id: Uuid, svg: &str) -> Result<User> {
+    let user =
+        sqlx::query_as::<_, User>("UPDATE users SET avatar_svg = $2 WHERE id = $1 RETURNING *")
+            .bind(id)
+            .bind(svg)
+            .fetch_one(pool)
+            .await?;
+    Ok(user)
+}
+
+pub async fn get_avatar(pool: &PgPool, id: Uuid) -> Result<Option<String>> {
+    Ok(
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT avatar_svg FROM users WHERE id = $1 AND avatar_svg IS NOT NULL",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await?
+        .flatten(),
+    )
+}
+
 pub async fn get_settings(pool: &PgPool) -> Result<SiteSettings> {
     let row = sqlx::query_as::<_, (serde_json::Value,)>(
         "SELECT value FROM site_settings WHERE key = 'site'",

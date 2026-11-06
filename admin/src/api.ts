@@ -61,6 +61,19 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify({ display_name: displayName }),
     }),
+  uploadAvatar: async (file: File) => {
+    const response = await fetch("/api/me/avatar", {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "image/svg+xml" },
+      body: await file.text(),
+    });
+    if (!response.ok) {
+      const data = await response.json().catch(() => null);
+      throw new Error(data?.error ?? response.statusText);
+    }
+    return (await response.json()) as User;
+  },
   logout: () => request<void>("/auth/logout", { method: "POST" }),
 
   register: (code: string, username: string, displayName: string) =>
