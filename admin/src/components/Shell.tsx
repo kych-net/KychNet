@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, SiteSettings, User } from "../api";
+import { api, avatarUrl, SiteSettings, User } from "../api";
 import { Theme } from "../theme";
 import { ContentsView } from "../views/ContentsView";
 import { InvitesView } from "../views/InvitesView";
@@ -100,7 +100,7 @@ export function Shell({
               ) : (
                 <img
                   className="avatar-img"
-                  src={`/api/avatar/${user.id}?v=${avatarVersion}`}
+                  src={avatarUrl(user.id, avatarVersion)}
                   alt=""
                   onError={() => setAvatarFailed(true)}
                 />
