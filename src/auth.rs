@@ -234,10 +234,13 @@ pub async fn provision_totp(
 ) -> Result<(String, String)> {
     let secret = Secret::generate_secret();
     let bytes = secret.to_bytes()?;
+    // CLI 建管理员时必须立刻可用（没有人能替它走一遍确认流程），
+    // 所以这里直接写成生效密钥，并把可能残留的待确认密钥清掉。
     sqlx::query(
-        "INSERT INTO totp_secrets (user_id, secret, confirmed_at)
-         VALUES ($1, $2, now())
-         ON CONFLICT (user_id) DO UPDATE SET secret = EXCLUDED.secret, confirmed_at = now()",
+        "INSERT INTO totp_secrets (user_id, secret, pending_secret, confirmed_at)
+         VALUES ($1, $2, NULL, now())
+         ON CONFLICT (user_id) DO UPDATE
+         SET secret = EXCLUDED.secret, pending_secret = NULL, confirmed_at = now()",
     )
     .bind(user_id)
     .bind(&bytes)
@@ -248,13 +251,20 @@ pub async fn provision_totp(
     Ok((totp.get_url(), totp.get_secret_base32()))
 }
 
+/// 生成一份**待确认**的 TOTP 密钥，不动已经生效的旧密钥。
+///
+/// 旧实现是这一步就直接 `secret = 新值, confirmed_at = NULL`，两个后果：
+/// 1. 会话一旦被劫持，攻击者能把用户的 TOTP 换成自己的、再走一次确认，完成持久接管；
+/// 2. 用户点了「生成验证码」却没走完确认，原来的 TOTP 会当场失效（`confirmed_at` 为空
+///    时 `totp_verify` 直接返回 false），只能回 CLI 恢复。
+/// 现在新密钥先进 `pending_secret`，只有确认成功后才提升为生效密钥。
 pub async fn totp_setup(pool: &PgPool, user_id: Uuid, username: &str) -> Result<(String, String)> {
     let secret = Secret::generate_secret();
     let bytes = secret.to_bytes()?;
     sqlx::query(
-        "INSERT INTO totp_secrets (user_id, secret, confirmed_at)
-         VALUES ($1, $2, NULL)
-         ON CONFLICT (user_id) DO UPDATE SET secret = EXCLUDED.secret, confirmed_at = NULL",
+        "INSERT INTO totp_secrets (user_id, pending_secret)
+         VALUES ($1, $2)
+         ON CONFLICT (user_id) DO UPDATE SET pending_secret = EXCLUDED.pending_secret",
     )
     .bind(user_id)
     .bind(&bytes)
@@ -265,43 +275,48 @@ pub async fn totp_setup(pool: &PgPool, user_id: Uuid, username: &str) -> Result<
     Ok((totp.get_url(), totp.get_secret_base32()))
 }
 
+/// 用一次正确的验证码确认待生效的密钥；成功后才替换掉旧密钥。
 pub async fn totp_confirm(
     pool: &PgPool,
     user_id: Uuid,
     username: &str,
     code: &str,
 ) -> Result<bool> {
-    let secret: Option<Vec<u8>> =
-        sqlx::query_scalar("SELECT secret FROM totp_secrets WHERE user_id = $1")
+    let pending: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT pending_secret FROM totp_secrets WHERE user_id = $1")
             .bind(user_id)
             .fetch_optional(pool)
-            .await?;
-    let Some(secret) = secret else {
-        bail!("尚未生成 TOTP 密钥");
+            .await?
+            .flatten();
+    let Some(pending) = pending else {
+        bail!("没有待确认的 TOTP 密钥，请重新生成后再验证");
     };
-    let totp = build_totp(username, &secret)?;
+    let totp = build_totp(username, &pending)?;
     if !totp.check_current(code)? {
         return Ok(false);
     }
-    sqlx::query("UPDATE totp_secrets SET confirmed_at = now() WHERE user_id = $1")
-        .bind(user_id)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "UPDATE totp_secrets
+         SET secret = pending_secret, pending_secret = NULL, confirmed_at = now()
+         WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await?;
     Ok(true)
 }
 
 pub async fn totp_verify(pool: &PgPool, user: &User, code: &str) -> Result<bool> {
-    let secret: Option<(Vec<u8>, Option<chrono::DateTime<Utc>>)> =
-        sqlx::query_as("SELECT secret, confirmed_at FROM totp_secrets WHERE user_id = $1")
-            .bind(user.id)
-            .fetch_optional(pool)
-            .await?;
-    let Some((secret, confirmed_at)) = secret else {
+    let row: Option<(Option<Vec<u8>>, Option<chrono::DateTime<Utc>>)> = sqlx::query_as(
+        "SELECT secret, confirmed_at FROM totp_secrets WHERE user_id = $1",
+    )
+    .bind(user.id)
+    .fetch_optional(pool)
+    .await?;
+    // 只认「已确认的生效密钥」：待确认密钥和从没绑定过的账号都不能登录。
+    let Some((Some(secret), Some(_))) = row else {
         return Ok(false);
     };
-    if confirmed_at.is_none() {
-        return Ok(false);
-    }
     let totp = build_totp(&user.username, &secret)?;
     Ok(totp.check_current(code)?)
 }
