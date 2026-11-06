@@ -7,7 +7,6 @@ use uuid::Uuid;
 pub struct User {
     pub id: Uuid,
     pub username: String,
-    pub display_name: String,
     pub disabled: bool,
     pub is_admin: bool,
     pub created_at: DateTime<Utc>,

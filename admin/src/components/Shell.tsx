@@ -37,7 +37,7 @@ export function Shell({
   const [view, setView] = useState<View>("contents");
   const [menuOpen, setMenuOpen] = useState(false);
   const [avatarFailed, setAvatarFailed] = useState(false);
-  const initial = (user.display_name || user.username).slice(0, 1).toUpperCase();
+  const initial = user.username.slice(0, 1).toUpperCase();
 
   useEffect(() => {
     setAvatarFailed(false);
