@@ -38,8 +38,23 @@ export type Content = {
   updated_at: string;
 };
 
+// API 基址：开发环境留空，请求走 vite 的 /api 代理（见 vite.config.ts）；
+// 生产环境把 VITE_API_BASE_URL 设为 API 服务的完整 origin（如 https://api.kych.net）。
+// 管理前端是独立发布的静态站，本身没有同源 /api 可以转发，必须显式指向 API 子域。
+const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/+$/, "");
+
+function apiUrl(path: string): string {
+  return `${API_BASE}/api${path}`;
+}
+
+/** 头像地址同样要跟随 API 基址，否则生产环境下头像会 404。 */
+export function avatarUrl(id: string, version?: number): string {
+  const suffix = version === undefined ? "" : `?v=${version}`;
+  return `${apiUrl(`/avatar/${id}`)}${suffix}`;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`/api${path}`, {
+  const response = await fetch(apiUrl(path), {
     credentials: "include",
     headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
     ...init,
@@ -62,7 +77,7 @@ export const api = {
       body: JSON.stringify({ display_name: displayName }),
     }),
   uploadAvatar: async (file: File) => {
-    const response = await fetch("/api/me/avatar", {
+    const response = await fetch(apiUrl("/me/avatar"), {
       method: "POST",
       credentials: "include",
       headers: { "Content-Type": "image/svg+xml" },

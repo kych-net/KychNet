@@ -23,7 +23,9 @@
 | html | 原样注入模板,不做转义与过滤 |
 | typst | typst 编译为 HTML,并同时输出 PDF 供下载 |
 
-三种格式均不做内容限制.内容作者均为邀请注册的可信用户,因此允许存储型 XSS 是预期内的取舍;通过子域隔离降低影响面(内容站 `www`、管理端 `admin`、API `api`,Cookie 仅作用于 `admin` 与 `api`).
+三种格式均不做内容限制,内容作者均为邀请注册的可信用户,因此允许存储型 XSS 是项目明确的取舍。
+
+必须注意:**子域隔离本身并不能阻止攻击**。`www` / `admin` / `api` 同属一个 eTLD+1(同站),`SameSite` Cookie 不会阻止同站跨源请求,CORS 也只阻止读取响应、不阻止带凭据的写请求被发出。因此后端对所有写接口增加了 Origin 白名单校验(仅放行管理端 origin),挡住内容站 XSS 冒用管理员会话发起写操作。这层防护仍以「内容作者可信」为前提;若要允许不可信作者,需要让 `api` 使用完全独立的站点(不同 eTLD+1)并对内容页加 CSP,而不是只靠子域划分。
 
 ## 界面
 
@@ -42,7 +44,7 @@
 | 内容渲染 | pulldown-cmark / typst |
 | 数据库 | PostgreSQL + SQLx |
 | 认证 | webauthn-rs(Passkey) + totp-rs(TOTP) |
-| 会话 | tower-sessions + HttpOnly/Secure/SameSite Cookie |
+| 会话 | tower-sessions + HttpOnly/Secure/SameSite Cookie(当前为 MemoryStore,进程重启后登录态丢失,多实例不共享) |
 | 命令行 | clap |
 | 管理前端 | React + TypeScript + Vite |
 | 数据与表单 | 原生 fetch + React state |
@@ -54,14 +56,19 @@
 ```text
 .
 ├── src/
-│   ├── main.rs          # kychnet 入口,子命令分发
-│   ├── cli/             # 管理子命令实现
-│   ├── auth/            # passkey / totp / 会话
-│   ├── render/          # markdown / html / typst 渲染
-│   ├── domain/          # 内容与用户模型
-│   ├── templates/       # Askama 模板
-│   └── db/              # SQLx 查询与迁移
-└── admin/               # 管理前端(独立工程)
+│   ├── main.rs          # 入口与 clap 子命令分发
+│   ├── config.rs        # 环境变量配置
+│   ├── db.rs            # 连接池与迁移
+│   ├── models.rs        # 领域模型(用户/邀请码/内容/站点设置)
+│   ├── service.rs       # 数据库访问层,API 与 CLI 共用
+│   ├── auth.rs          # Passkey / TOTP / 认证流程
+│   ├── render.rs        # markdown / html / typst 渲染
+│   ├── svg.rs           # 上传头像的 SVG 校验
+│   ├── api.rs           # Axum 路由、会话、CORS、Origin 校验
+│   └── build.rs         # 静态站生成
+├── templates/           # Askama 模板(layout / index / page)
+├── migrations/          # SQLx 迁移
+└── admin/               # 管理前端(独立 Vite 工程)
 ```
 
 ## 命令行
@@ -103,15 +110,17 @@ cargo run -- serve
 cargo run -- build --out dist
 
 # 管理前端
-cd admin && pnpm install && pnpm dev
+cd admin && pnpm install && cp .env.example .env && pnpm dev
 ```
+
+开发时 `VITE_API_BASE_URL` 留空,`/api` 由 vite 代理转发到后端。生产构建前必须把它设为 API 服务的完整 origin(例如 `https://api.kych.net`),因为管理前端是独立静态站,没有同源 `/api` 可转发;后端 CORS 与写接口 Origin 白名单均以 `ADMIN_ORIGIN` 为准。
 
 ## 构建与部署
 
 1. [.github/workflows/build.yml](.github/workflows/build.yml) 在 push、PR 和手动触发时运行测试,并编译 Linux 二进制;推送 `v*` 标签时自动创建 Release.
    - `x86_64-unknown-linux-gnu`:依赖系统 glibc,在 Ubuntu 22.04 上构建.
    - `x86_64-unknown-linux-musl`:静态链接,启用 `vendored-openssl` 特性,适配 Alpine 与老版本发行版.
-2. 静态站仍需在有数据库的环境中执行 `kychnet build --out dist`,Typst 页面同时产出 `.pdf`.
+2. 先执行 `kychnet db migrate`,再执行 `kychnet build --out dist`,生成静态产物;Typst 页面同时产出 `.pdf`.构建会先渲染到内存,全部成功后才清理并重写 `posts/` 与 `index.html`,中途失败不会破坏现有站点.
 3. `dist/` 同时发布到 Cloudflare Pages 与 EdgeOne Pages.
 4. 管理前端构建为静态产物,单独发布.
 5. 媒体资源放在单一对象存储源,由两家 CDN 回源同一份.
@@ -120,8 +129,9 @@ cd admin && pnpm install && pnpm dev
 
 - 内容以数据库为唯一事实源,构建直接读库,不调用线上 API.
 - 站点名称、图标与顶栏导航存于 `site_settings`,由管理端编辑,构建时读取.
+- 内容 slug 允许任意 Unicode 字母与数字(中文、日文等)以及 `-` `_`;禁止空格、标点、路径分隔符 `/` `\`、点号 `.`、URL 保留字符(`?` `#` `%` 等)与控制字符,UTF-8 长度上限 180 字节.写入时即校验,避免脏数据卡死构建.链接中的非 ASCII slug 会按 `%XX` 编码,磁盘文件名仍是原始 UTF-8;带变音符号的文字请使用 NFC 预组合形式.
 - 模板与 API 共用同一套领域模型,避免两端口径漂移.
-- Typst 编译在断网容器内执行,并用 `--root` 限定输入目录,避免内容作者访问构建机文件系统.
-- Typst 产物按内容哈希缓存,避免每次构建全量重编译.
+- Typst 在当前进程内编译,由 `VirtualPath::resolve(root)` 加 canonicalize 双重校验把文件读取限制在 `CONTENT_ROOT` 内,避免内容作者通过 `#include` 读到构建机上的任意文件;生产仍建议放进断网容器并加 CPU/内存限额,构建机上的 `.env` 与云凭据不要落在可读目录.
+- 编译缓存尚未实现;目前每篇 Typst 内容会分别编译 `PagedDocument`(出 PDF)与 `HtmlDocument`(出 HTML)各一次.
 - 静态产物保持平台中立:只用相对路径、不写死域名,重定向与 404 分别在各平台配置.
 - 静态资源使用哈希文件名并长缓存,HTML 短缓存;压缩交给 CDN.
