@@ -89,6 +89,48 @@ kychnet user disable <user>
 kychnet passkey reset <user>
 ```
 
+## kych-net（中文命令行）
+
+英文 CLI 叫 `kychnet`，中文入口的二进制叫 `kych-net`。中文命令按中文语序书写，且**连写、不加空格**：
+
+```text
+kych-net 启动服务
+kych-net 生成静态站到public
+kych-net 创建邀请码可用三次有效期七天
+kych-net 作废邀请码ABCD1234
+kych-net 创建管理员alice
+kych-net 创建用户alice名为爱丽丝设为管理员
+kych-net 重置alice的通行密钥
+```
+
+中文不像英文靠空格分词，程序先去掉空白，再按中文短语切出命令名、数量、时长、所属与参数；支持中文数字（`三次`）、中文时长（`七天`、`永不过期`）和多种说法（`运行服务`、`撤销邀请码`、`解禁用户`）。解析后直接交给同一个 `kychnet` 执行，与英文 CLI 共用 service 层。
+
+### 中文名「跨越晨昏」：在服务器环境变量里设置别名
+
+中文命令名由**服务器环境变量/初始化文件里的别名**提供，不改动二进制与源码名。最直接的是 `alias`：
+
+| 场景 | 写入位置 | 内容 |
+| --- | --- | --- |
+| 所有登录用户（推荐） | 新建 `/etc/profile.d/kychnet-alias.sh` | `alias 跨越晨昏='kych-net'` |
+| 单个用户 | `~/.bashrc` / `~/.zshrc` / `~/.profile` | 同上 |
+| 仅当前会话 | 直接执行 | `alias 跨越晨昏='kych-net'` |
+
+前提是 `kych-net` 所在目录已在服务器环境变量 `PATH` 里（例如装到 `/usr/local/bin`；若放在自定义目录，在同一份脚本里先加 `export PATH=/opt/kychnet:$PATH`）。重新登录后：
+
+```bash
+alias 跨越晨昏                              # 确认别名已生效
+跨越晨昏 创建邀请码可用三次有效期七天
+```
+
+**一处要注意**：`alias` 是 shell 内置命令，**不是环境变量**，不会出现在 `env` 或 `systemctl show -p Environment` 里；systemd 的 `Environment=`、Docker 的 `ENV`、`/etc/environment` 这些只能设置变量的地方写不了 `alias`。服务托管与容器场景改用 PATH 目录里的**同名链接**作为命令别名，效果一样且不依赖 shell：
+
+```bash
+ln -sfn /opt/kychnet/kych-net /usr/local/bin/跨越晨昏
+export PATH=/usr/local/bin:$PATH            # 通常已默认包含
+```
+
+源码见 `src/bin/kych-net.rs`：零新增依赖，由 Cargo 自动发现为第二个二进制，内含单元测试（`cargo test --bin kych-net`）。运行时需能找到 `kychnet`（`KYCHNET_BIN` → 同目录 → PATH）。
+
 ## 注册与登录
 
 - 注册必须持有有效邀请码.邀请码可由 CLI 或管理员在管理前端生成,支持设置使用次数与有效期.
