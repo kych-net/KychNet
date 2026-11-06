@@ -11,15 +11,31 @@
 - 内容前端是纯静态站,由后端编译输出 html.
 - 管理前端是动态的,以 SPA 形式通过 JSON API 读写内容.
 
+后端为单一二进制 `kychnet`,同时提供 HTTP 服务与命令行管理能力,两者共用同一套 service 层.
+
+## 内容格式
+
+每篇内容在数据库中记录一种主格式:
+
+| 格式 | 渲染方式 |
+| --- | --- |
+| markdown | pulldown-cmark,保留 raw HTML 透传 |
+| html | 原样注入模板,不做转义与过滤 |
+| typst | typst 编译为 HTML |
+
+三种格式均不做内容限制.内容作者均为邀请注册的可信用户,因此允许存储型 XSS 是预期内的取舍;通过子域隔离降低影响面(内容站 `www`、管理端 `admin`、API `api`,Cookie 仅作用于 `admin` 与 `api`).
+
 ## 技术栈
 
 | 层 | 选型 |
 | --- | --- |
 | 后端框架 | Rust + Axum + Tokio |
 | 静态生成 | Askama 模板 + `build` 子命令 |
-| Markdown | pulldown-cmark |
+| 内容渲染 | pulldown-cmark / typst |
 | 数据库 | PostgreSQL + SQLx |
-| 鉴权 | Argon2 + HttpOnly Cookie 会话 |
+| 认证 | webauthn-rs(Passkey) + totp-rs(TOTP) + qrcode |
+| 会话 | tower-sessions + HttpOnly/Secure/SameSite Cookie |
+| 命令行 | clap |
 | 管理前端 | React + TypeScript + Vite |
 | 数据与表单 | TanStack Query + React Hook Form + Zod |
 | 样式 | Tailwind CSS + shadcn/ui |
@@ -30,9 +46,11 @@
 ```text
 .
 ├── src/
-│   ├── main.rs          # bin: api —— 管理 API
-│   ├── bin/build.rs     # bin: build —— 读库、渲染、输出 dist/
-│   ├── domain/          # 内容模型,两个 bin 共享
+│   ├── main.rs          # kychnet 入口,子命令分发
+│   ├── cli/             # 管理子命令实现
+│   ├── auth/            # passkey / totp / 会话
+│   ├── render/          # markdown / html / typst 渲染
+│   ├── domain/          # 内容与用户模型
 │   ├── templates/       # Askama 模板
 │   └── db/              # SQLx 查询与迁移
 └── admin/               # 管理前端(独立工程)
@@ -40,15 +58,40 @@
 
 当前仓库尚未包含实现代码,以上为规划结构.
 
+## 命令行
+
+```text
+kychnet serve                          # 启动 HTTP 服务
+kychnet build --out dist               # 生成静态站
+kychnet db migrate                     # 执行迁移
+
+kychnet invite create --uses 1 --expires 7d
+kychnet invite list
+kychnet invite revoke <code>
+
+kychnet user create
+kychnet user list
+kychnet user disable <user>
+kychnet passkey reset <user>
+```
+
+## 注册与登录
+
+- 注册必须持有有效邀请码.邀请码可由 CLI 或管理前端生成,支持设置使用次数与有效期.
+- 邀请码由 CSPRNG 生成、Base32 编码,长度不少于 16 字符(约 80 bit 熵).
+- 登录支持通行密钥(Passkey)与 TOTP 动态验证码,用户注册后可绑定任一或全部.
+- 会话存放于 HttpOnly + Secure + SameSite Cookie,不落地到前端存储.
+
 ## 开发
 
 ```bash
-# 后端 API
-cp .env.example .env        # DATABASE_URL / SESSION_SECRET
-cargo run --bin api
+# 后端
+cp .env.example .env        # DATABASE_URL / SESSION_SECRET / WEBAUTHN_RP_ID / WEBAUTHN_ORIGIN
+cargo run -- db migrate
+cargo run -- serve
 
 # 生成静态站
-cargo run --bin build -- --out dist
+cargo run -- build --out dist
 
 # 管理前端
 cd admin && pnpm install && pnpm dev
@@ -56,7 +99,7 @@ cd admin && pnpm install && pnpm dev
 
 ## 构建与部署
 
-1. CI 执行 `cargo run --bin build -- --out dist`,生成静态产物.
+1. CI 执行 `kychnet build --out dist`,生成静态产物.
 2. `dist/` 同时发布到 Cloudflare Pages 与 EdgeOne Pages.
 3. 管理前端构建为静态产物,单独发布.
 4. 媒体资源放在单一对象存储源,由两家 CDN 回源同一份.
@@ -65,5 +108,7 @@ cd admin && pnpm install && pnpm dev
 
 - 内容以数据库为唯一事实源,构建直接读库,不调用线上 API.
 - 模板与 API 共用同一套领域模型,避免两端口径漂移.
+- Typst 编译在断网容器内执行,并用 `--root` 限定输入目录,避免内容作者访问构建机文件系统.
+- Typst 产物按内容哈希缓存,避免每次构建全量重编译.
 - 静态产物保持平台中立:只用相对路径、不写死域名,重定向与 404 分别在各平台配置.
 - 静态资源使用哈希文件名并长缓存,HTML 短缓存;压缩交给 CDN.
