@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use axum::body::Bytes;
-use axum::extract::{ConnectInfo, Path, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -14,7 +14,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-use tower_sessions::{cookie::SameSite, Expiry, MemoryStore, Session, SessionManagerLayer};
+use tower_sessions::{cookie::SameSite, ExpiredDeletion, Expiry, Session, SessionManagerLayer};
+use tower_sessions_sqlx_store::PostgresStore;
 use uuid::Uuid;
 use webauthn_rs::prelude::{
     CreationChallengeResponse, PublicKeyCredential, RegisterPublicKeyCredential,
@@ -36,7 +37,15 @@ const TOTP_LOGIN_PER_IP: (u32, u64) = (10, 60);
 /// 验证码 6 位、单步 30 秒（`check_current` 允许 ±1 步），
 /// 因此每账号 15 分钟内最多 5 次，猜中的概率被压到可以忽略。
 const TOTP_ATTEMPTS_PER_USER: (u32, u64) = (5, 900);
+/// 绑定流程里确认密钥的尝试次数；猜中一次就等于换绑成功，所以比登录更紧。
+const TOTP_CONFIRM_PER_USER: (u32, u64) = (5, 900);
 const REGISTER_PER_IP: (u32, u64) = (10, 60);
+
+/// 全局请求体上限。Typst / Markdown 正文写满 2 MiB 已经是极限量级。
+const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+/// 头像上限：比 svg.rs 自己的 256 KB 稍大，让「超长」由 svg.rs 报出中文提示，
+/// 而不是被传输层截成一句 413。
+const AVATAR_MAX_BODY_BYTES: usize = 256 * 1024 + 1024;
 
 /// 会话最长存活时间。用 OnInactivity 表达，但只有会话被写入时才会顺延，
 /// 实际效果就是「登录后最多 8 小时」，配合下面各处 `cycle_id` 使用。
@@ -265,10 +274,16 @@ fn login_failed(reason: impl std::fmt::Display) -> ApiError {
     ApiError::with_status(StatusCode::UNAUTHORIZED, "用户名或凭证无效")
 }
 
+/// 会话里记录「本次认证成功的时间」，改二次验证时要求它足够新鲜。
+const STEP_UP_WINDOW_SECS: i64 = 300;
+
 /// 登录/注册成功后轮换会话 ID。
 ///
 /// 不换 ID 的话，攻击者可以事先拿到一个会话 ID 让受害者用上（会话固定），
 /// 受害者完成认证后攻击者手里那个 ID 就带着已登录的身份。
+///
+/// `auth_at` 同时是「最近一次真实认证」的时间戳，用来做敏感操作的 step-up
+/// 判断。它写在会话里而不是数据库里，所以换 store、重启进程都会自然失效。
 async fn establish_session(session: &Session, user_id: Uuid) -> ApiResult<()> {
     session
         .cycle_id()
@@ -278,6 +293,38 @@ async fn establish_session(session: &Session, user_id: Uuid) -> ApiResult<()> {
         .insert("user_id", user_id)
         .await
         .map_err(|e| anyhow!("写入会话失败: {e}"))?;
+    session
+        .insert("auth_at", Utc::now().timestamp())
+        .await
+        .map_err(|e| anyhow!("写入会话失败: {e}"))?;
+    Ok(())
+}
+
+/// 认证成功的时间是否在 step-up 窗口内。抽成纯函数方便单测。
+fn step_up_fresh(auth_at: Option<i64>, now: i64) -> bool {
+    match auth_at {
+        Some(at) => (now - at).abs() < STEP_UP_WINDOW_SECS,
+        None => false,
+    }
+}
+
+/// 修改凭证（绑定 / 替换 / 确认 TOTP、新增通行密钥）前要求最近 5 分钟内
+/// 有过一次真实认证。
+///
+/// 没有这一步的话，只要会话被短暂借用（共享电脑没锁屏、XSS 拿到 cookie、
+/// 或者只读到 `/api/me` 的 CSRF），攻击者就能把受害者的二次验证换绑到自己
+/// 的设备上，之后用受害者身份正常登录，看起来完全合法。
+async fn require_step_up(session: &Session) -> ApiResult<()> {
+    let auth_at: Option<i64> = session
+        .get("auth_at")
+        .await
+        .map_err(|e| anyhow!("读取会话失败: {e}"))?;
+    if !step_up_fresh(auth_at, Utc::now().timestamp()) {
+        api_reject!(
+            StatusCode::FORBIDDEN,
+            "修改二次验证或通行密钥需要重新登录确认（登录后的 5 分钟内有效）"
+        );
+    }
     Ok(())
 }
 
@@ -316,6 +363,11 @@ async fn register(
         api_bail!("用户名已被占用");
     }
 
+    // 邀请码在这里只做只读校验，不扣次数：真正的占用发生在 finish 里、
+    // 凭证校验通过之后的那个事务内。用户中途取消 WebAuthn 仪式时，
+    // 只留下一条 5 分钟后被清理掉的 flow 行。
+    service::peek_invite(&state.pool, &req.code).await?;
+
     // user_id 提前生成：它同时是 WebAuthn 的 user handle，必须与最终落库的
     // 用户 ID 完全一致，否则后续 Passkey 登录会找不到对应用户。
     let user_id = Uuid::new_v4();
@@ -328,22 +380,14 @@ async fn register(
         created_at: Utc::now(),
     };
     let (options, flow_state) = state.auth.create_registration_challenge(&pending_user)?;
-    let flow_id = Uuid::new_v4();
+    let flow_id = state
+        .auth
+        .start_pending_registration(&state.pool, &pending_user, &req.code, flow_state)
+        .await?;
 
-    // 占用邀请码、创建用户、保存认证流程在同一个事务里完成，任一步失败整体回滚。
-    let user = service::register_user(
-        &state.pool,
-        user_id,
-        &req.code,
-        &req.username,
-        &req.display_name,
-        flow_id,
-        flow_state,
-    )
-    .await?;
-
+    // 此时用户还不存在，返回的 user 只是给前端展示将要注册的账号信息。
     Ok(Json(RegisterResponse {
-        user,
+        user: pending_user,
         flow_id,
         options,
     }))
@@ -360,14 +404,12 @@ async fn finish_registration(
     session: Session,
     Json(req): Json<FinishRegistrationRequest>,
 ) -> ApiResult<Json<User>> {
-    let user_id = state
+    // 凭证有效才占用邀请码并建用户；无效或已被用过时数据库不会有任何变化。
+    let user = state
         .auth
-        .finish_registration(&state.pool, req.flow_id, &req.credential)
+        .finish_pending_registration(&state.pool, req.flow_id, &req.credential)
         .await?;
-    let user = service::find_user_by_id(&state.pool, user_id)
-        .await?
-        .context("用户不存在")?;
-    establish_session(&session, user_id).await?;
+    establish_session(&session, user.id).await?;
     Ok(Json(user))
 }
 
@@ -504,6 +546,7 @@ async fn totp_setup(
     session: Session,
 ) -> ApiResult<Json<serde_json::Value>> {
     let user = current_user(&state, &session).await?;
+    require_step_up(&session).await?;
     let (url, secret) = auth::totp_setup(&state.pool, user.id, &user.username).await?;
     Ok(Json(json!({ "otpauth_url": url, "secret": secret })))
 }
@@ -513,6 +556,7 @@ async fn passkey_setup(
     session: Session,
 ) -> ApiResult<Json<serde_json::Value>> {
     let user = current_user(&state, &session).await?;
+    require_step_up(&session).await?;
     let (options, flow_id) = state.auth.start_registration(&state.pool, &user).await?;
     Ok(Json(json!({ "flow_id": flow_id, "options": options })))
 }
@@ -529,6 +573,7 @@ async fn passkey_setup_finish(
     Json(req): Json<PasskeySetupFinishRequest>,
 ) -> ApiResult<StatusCode> {
     let user = current_user(&state, &session).await?;
+    require_step_up(&session).await?;
     let user_id = state
         .auth
         .finish_registration(&state.pool, req.flow_id, &req.credential)
@@ -550,10 +595,19 @@ async fn totp_confirm(
     Json(req): Json<TotpConfirmRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let user = current_user(&state, &session).await?;
+    // 这里不再要求 step-up：待确认的密钥只能由已经通过 step-up 的 totp_setup
+    // 产生，攻击者拿不到旧会话就无法生成它。但确认本身是一次 6 位验证码的
+    // 在线判断，仍然限流，避免有人对着 pending 密钥硬猜。
+    limited(
+        &state,
+        &format!("totp-confirm:user:{}", user.id),
+        TOTP_CONFIRM_PER_USER,
+    )?;
     let ok = auth::totp_confirm(&state.pool, user.id, &user.username, &req.code).await?;
     if !ok {
         api_bail!("验证码错误");
     }
+    state.limits.reset(&format!("totp-confirm:user:{}", user.id));
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -697,8 +751,8 @@ async fn patch_user(
     Path(id): Path<Uuid>,
     Json(req): Json<PatchUserRequest>,
 ) -> ApiResult<StatusCode> {
-    current_admin(&state, &session).await?;
-    service::set_user_disabled(&state.pool, id, req.disabled).await?;
+    let admin = current_admin(&state, &session).await?;
+    service::set_user_disabled_guarded(&state.pool, admin.id, id, req.disabled).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -837,15 +891,27 @@ pub async fn serve(cfg: Config) -> Result<()> {
 
     // 会话属性全部写出来，不吃库的默认值：默认虽然是 HttpOnly=true、
     // SameSite=Strict、Secure=true，但有效期是两周且不显式配置的话，
-    // 一旦换 store 或升级依赖就会悄悄变松。
+    // 升级依赖就会悄悄变松。
     //
     // SameSite 选 Strict 不影响管理端调 API：`admin.kych.net` 与 `api.kych.net`
     // 同属 kych.net，属于同站请求，Strict 照样带 Cookie；它只挡住跨站的导航与请求。
     //
-    // 已知遗留问题：MemoryStore 的 `load` 会过滤过期记录但从不删除，
-    // 也没有实现 ExpiredDeletion，所以过期会话仍会留在内存里；
-    // 进程重启丢登录态、多实例不共享也还是老样子。要长期跑得换 Postgres/Redis store。
-    let session_layer = SessionManagerLayer::new(MemoryStore::default())
+    // 会话改放 Postgres（schema `tower_sessions`、表 `session`，由 store 自己建）：
+    // MemoryStore 的过期记录只过滤不删除、重启即全员掉登录、多实例不共享，
+    // 这三条在这里一次性解决。代价是每个请求多一次按主键的会话读；对个人站
+    // 来说远小于它换来的确定性。过期行由下面 spawn 的清理任务按 `ExpiredDeletion`
+    // 每 5 分钟删一次。
+    let session_store = PostgresStore::new(state.pool.clone());
+    session_store
+        .migrate()
+        .await
+        .context("会话表迁移失败")?;
+    tokio::spawn(
+        session_store
+            .clone()
+            .continuously_delete_expired(std::time::Duration::from_secs(300)),
+    );
+    let session_layer = SessionManagerLayer::new(session_store)
         .with_secure(cfg.rp_origin.starts_with("https"))
         .with_http_only(true)
         .with_same_site(SameSite::Strict)
@@ -864,7 +930,12 @@ pub async fn serve(cfg: Config) -> Result<()> {
         .route("/api/auth/totp/login", post(totp_login))
         .route("/api/auth/logout", post(logout))
         .route("/api/me", get(me).patch(patch_me))
-        .route("/api/me/avatar", post(upload_avatar))
+        .route(
+            "/api/me/avatar",
+            // 头像是纯矢量 SVG，svg.rs 自己限 256 KB，这里给一个更小的
+            // 传输上限，避免先收满 2 MiB 再判长度。
+            post(upload_avatar).layer(DefaultBodyLimit::max(AVATAR_MAX_BODY_BYTES)),
+        )
         .route("/api/avatar/{id}", get(avatar))
         .route("/api/settings", get(get_settings).put(put_settings))
         .route("/api/totp/setup", post(totp_setup))
@@ -878,6 +949,10 @@ pub async fn serve(cfg: Config) -> Result<()> {
         .route("/api/users", get(users))
         .route("/api/users/{id}", patch(patch_user))
         .with_state(state)
+        // 请求体上限写成显式常量，不依赖 axum 的默认 2 MiB：正文里塞一个
+        // 几十 MB 的字符串除了把内存和 SQL 连接拖死之外没有任何作用，
+        // 而 `Bytes` 提取器会整块缓冲，限制必须在读之前就在扩展里声明。
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(session_layer)
         .layer(cors)
         .layer(middleware::from_fn_with_state(
@@ -933,5 +1008,27 @@ mod tests {
         assert!(validate_username("a.b.c").is_err());
         assert!(validate_username("a;b;c").is_err());
         assert!(validate_username("a<b>c").is_err());
+    }
+
+    #[test]
+    fn step_up_requires_fresh_authentication() {
+        let now = 1_700_000_000;
+        // 没有 auth_at（旧会话、或改动之前建立的会话）一律要求重新登录。
+        assert!(!step_up_fresh(None, now));
+        assert!(step_up_fresh(Some(now), now));
+        assert!(step_up_fresh(Some(now - STEP_UP_WINDOW_SECS + 1), now));
+        assert!(!step_up_fresh(Some(now - STEP_UP_WINDOW_SECS), now));
+        assert!(!step_up_fresh(Some(now - 3600), now));
+        // 客户端与服务器时钟差几秒不应该把有效会话判成过期。
+        assert!(step_up_fresh(Some(now + 60), now));
+        assert!(!step_up_fresh(Some(now + 3600), now));
+    }
+
+    #[test]
+    fn body_limits_are_below_database_column_checks() {
+        // 头像：传输层上限必须不小于 svg.rs 的内容上限，否则合法头像会被 413 拦下。
+        assert!(AVATAR_MAX_BODY_BYTES >= crate::svg::MAX_BYTES);
+        // 全局上限必须大于头像上限，否则上一条的「让 svg.rs 报错」意图就反了。
+        assert!(MAX_BODY_BYTES > AVATAR_MAX_BODY_BYTES);
     }
 }

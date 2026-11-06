@@ -101,7 +101,16 @@ impl TypstWorld {
         if !real_parent.starts_with(&root) {
             return Err(FileError::NotFound(path));
         }
-        Ok(real_parent.join(path.file_name().unwrap_or_default()))
+        let target = real_parent.join(path.file_name().unwrap_or_default());
+
+        // 父目录安全不等于文件本身安全:`content/img/link.png -> /etc/passwd`
+        // 照样会被后面的 fs::read 跟进去。构建目录里不该存在符号链接,直接拒绝。
+        let meta = std::fs::symlink_metadata(&target)
+            .map_err(|_| FileError::NotFound(target.clone()))?;
+        if meta.file_type().is_symlink() {
+            return Err(FileError::NotFound(target));
+        }
+        Ok(target)
     }
 }
 
@@ -212,5 +221,34 @@ mod tests {
         let body = "# Hi\n\n<script>alert(1)</script>";
         let out = render(ContentFormat::Markdown, body, Path::new(".")).unwrap();
         assert!(out.html.contains("<script>alert(1)</script>"));
+    }
+
+    /// 内容目录里的符号链接不能成为读取 root 之外文件的口子。
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_escaping_content_root() {
+        use std::os::unix::fs::symlink;
+        use typst::diag::FileError;
+
+        let base = std::env::temp_dir().join(format!("kychnet-symlink-{}", std::process::id()));
+        let content = base.join("content");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&content).expect("创建临时目录");
+        std::fs::write(base.join("secret.txt"), "top secret").expect("写入 root 外的文件");
+        symlink(base.join("secret.txt"), content.join("link.txt")).expect("创建符号链接");
+        std::fs::write(content.join("normal.txt"), "fine").expect("写入普通文件");
+
+        let world = TypstWorld::new("", &content);
+        // 普通文件仍然可以解析。
+        let ok = world.path_for(FileId::new(None, VirtualPath::new("normal.txt")));
+        assert!(ok.is_ok(), "普通文件应通过: {ok:?}");
+        // 指向 root 外的符号链接必须被拒绝，而不是被 read 跟进去。
+        let link = world.path_for(FileId::new(None, VirtualPath::new("link.txt")));
+        assert!(
+            matches!(link, Err(FileError::NotFound(_))),
+            "符号链接应被拒绝: {link:?}"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
     }
 }
