@@ -166,12 +166,13 @@ async fn current_admin(state: &AppState, session: &Session) -> ApiResult<User> {
 }
 
 fn validate_username(username: &str) -> ApiResult<()> {
-    let valid = (3..=32).contains(&username.len())
+    let length = username.chars().count();
+    let valid = (3..=32).contains(&length)
         && username
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-');
     if !valid {
-        api_bail!("用户名需为 3-32 位字母、数字、下划线或连字符");
+        api_bail!("用户名需为 3-32 个字符,仅限字母、数字、下划线或连字符(支持中文等 Unicode 字母)");
     }
     Ok(())
 }
