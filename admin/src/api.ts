@@ -1,7 +1,6 @@
 export type User = {
   id: string;
   username: string;
-  display_name: string;
   disabled: boolean;
   is_admin: boolean;
   created_at: string;
@@ -71,11 +70,6 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   me: () => request<User | null>("/me"),
-  updateProfile: (displayName: string) =>
-    request<User>("/me", {
-      method: "PATCH",
-      body: JSON.stringify({ display_name: displayName }),
-    }),
   uploadAvatar: async (file: File) => {
     const response = await fetch(apiUrl("/me/avatar"), {
       method: "POST",
@@ -91,10 +85,10 @@ export const api = {
   },
   logout: () => request<void>("/auth/logout", { method: "POST" }),
 
-  register: (code: string, username: string, displayName: string) =>
+  register: (code: string, username: string) =>
     request<{ user: User; flow_id: string; options: any }>("/auth/register", {
       method: "POST",
-      body: JSON.stringify({ code, username, display_name: displayName }),
+      body: JSON.stringify({ code, username }),
     }),
   finishRegister: (flowId: string, credential: any) =>
     request<User>("/auth/register/finish", {

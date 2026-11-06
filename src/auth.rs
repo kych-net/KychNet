@@ -90,7 +90,7 @@ impl Auth {
     ) -> Result<(CreationChallengeResponse, Value)> {
         let (options, state) = self
             .webauthn
-            .start_passkey_registration(user.id, &user.username, &user.display_name, None)
+            .start_passkey_registration(user.id, &user.username, &user.username, None)
             .map_err(|e| anyhow!("无法开始 Passkey 注册: {e}"))?;
         Ok((options, serde_json::to_value(state)?))
     }
@@ -108,7 +108,7 @@ impl Auth {
         };
         let (options, state) = self
             .webauthn
-            .start_passkey_registration(user.id, &user.username, &user.display_name, exclude)
+            .start_passkey_registration(user.id, &user.username, &user.username, exclude)
             .map_err(|e| anyhow!("无法开始 Passkey 注册: {e}"))?;
         let flow_id = self
             .save_flow(pool, user.id, "register", serde_json::to_value(state)?)

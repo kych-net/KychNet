@@ -285,7 +285,6 @@ async fn establish_session(session: &Session, user_id: Uuid) -> ApiResult<()> {
 struct RegisterRequest {
     code: String,
     username: String,
-    display_name: String,
 }
 
 #[derive(Serialize)]
@@ -306,9 +305,6 @@ async fn register(
     let ip = client_ip(&state, &headers, peer);
     limited(&state, &format!("register:ip:{ip}"), REGISTER_PER_IP)?;
     validate_username(&req.username)?;
-    if req.display_name.trim().is_empty() || req.display_name.chars().count() > 64 {
-        api_bail!("显示名称需为 1-64 个字符");
-    }
     if service::find_user_by_username(&state.pool, &req.username)
         .await?
         .is_some()
@@ -322,7 +318,6 @@ async fn register(
     let pending_user = User {
         id: user_id,
         username: req.username.clone(),
-        display_name: req.display_name.clone(),
         disabled: false,
         is_admin: false,
         created_at: Utc::now(),
@@ -336,7 +331,6 @@ async fn register(
         user_id,
         &req.code,
         &req.username,
-        &req.display_name,
         flow_id,
         flow_state,
     )
@@ -733,25 +727,6 @@ async fn put_settings(
     Ok(Json(json!({ "site": site })))
 }
 
-#[derive(Deserialize)]
-struct PatchMeRequest {
-    display_name: String,
-}
-
-async fn patch_me(
-    State(state): State<AppState>,
-    session: Session,
-    Json(req): Json<PatchMeRequest>,
-) -> ApiResult<Json<User>> {
-    let user = current_user(&state, &session).await?;
-    let display_name = req.display_name.trim();
-    if display_name.is_empty() || display_name.chars().count() > 64 {
-        api_bail!("显示名称需为 1-64 个字符");
-    }
-    let user = service::update_display_name(&state.pool, user.id, display_name).await?;
-    Ok(Json(user))
-}
-
 async fn upload_avatar(
     State(state): State<AppState>,
     session: Session,
@@ -863,7 +838,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
         .route("/api/auth/login/finish", post(login_finish))
         .route("/api/auth/totp/login", post(totp_login))
         .route("/api/auth/logout", post(logout))
-        .route("/api/me", get(me).patch(patch_me))
+        .route("/api/me", get(me))
         .route("/api/me/avatar", post(upload_avatar))
         .route("/api/avatar/{id}", get(avatar))
         .route("/api/settings", get(get_settings).put(put_settings))
