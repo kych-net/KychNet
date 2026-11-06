@@ -5,6 +5,7 @@ use std::path::PathBuf;
 pub struct Config {
     pub bind: String,
     pub database_url: String,
+    pub site_url: String,
     pub admin_origin: String,
     pub rp_id: String,
     pub rp_origin: String,
@@ -21,6 +22,7 @@ impl Config {
         Ok(Self {
             bind: env_or("BIND", "127.0.0.1:8080"),
             database_url: std::env::var("DATABASE_URL").context("DATABASE_URL 未设置")?,
+            site_url: env_or("SITE_URL", "https://www.kych.net"),
             admin_origin: env_or("ADMIN_ORIGIN", "https://admin.kych.net"),
             rp_id: env_or("WEBAUTHN_RP_ID", "kych.net"),
             rp_origin: env_or("WEBAUTHN_ORIGIN", "https://admin.kych.net"),

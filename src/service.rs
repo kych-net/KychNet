@@ -4,7 +4,7 @@ use rand::RngCore;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::models::{Content, Invite, User};
+use crate::models::{Content, Invite, SiteSettings, User};
 
 /// 使用 CSPRNG 生成 16 字节、Base32(Crockford) 编码的邀请码(约 80 bit 熵)。
 pub fn generate_invite_code() -> String {
@@ -95,16 +95,57 @@ pub async fn consume_invite(pool: &PgPool, code: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn create_user(pool: &PgPool, username: &str, display_name: &str) -> Result<User> {
+pub async fn create_user(
+    pool: &PgPool,
+    username: &str,
+    display_name: &str,
+    is_admin: bool,
+) -> Result<User> {
     let user = sqlx::query_as::<_, User>(
-        "INSERT INTO users (id, username, display_name) VALUES ($1, $2, $3) RETURNING *",
+        "INSERT INTO users (id, username, display_name, is_admin)
+         VALUES ($1, $2, $3, $4) RETURNING *",
     )
     .bind(Uuid::new_v4())
     .bind(username)
     .bind(display_name)
+    .bind(is_admin)
     .fetch_one(pool)
     .await?;
     Ok(user)
+}
+
+pub async fn update_display_name(pool: &PgPool, id: Uuid, display_name: &str) -> Result<User> {
+    let user = sqlx::query_as::<_, User>(
+        "UPDATE users SET display_name = $2 WHERE id = $1 RETURNING *",
+    )
+    .bind(id)
+    .bind(display_name)
+    .fetch_one(pool)
+    .await?;
+    Ok(user)
+}
+
+pub async fn get_settings(pool: &PgPool) -> Result<SiteSettings> {
+    let row = sqlx::query_as::<_, (serde_json::Value,)>(
+        "SELECT value FROM site_settings WHERE key = 'site'",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row
+        .and_then(|(value,)| serde_json::from_value(value).ok())
+        .unwrap_or_default())
+}
+
+pub async fn save_settings(pool: &PgPool, settings: &SiteSettings) -> Result<()> {
+    let value = serde_json::to_value(settings)?;
+    sqlx::query(
+        "INSERT INTO site_settings (key, value) VALUES ('site', $1)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
+    )
+    .bind(value)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 pub async fn find_user_by_username(pool: &PgPool, username: &str) -> Result<Option<User>> {

@@ -19,13 +19,14 @@ use webauthn_rs::prelude::{
 
 use crate::auth::{self, Auth};
 use crate::config::Config;
-use crate::models::User;
+use crate::models::{SiteSettings, User};
 use crate::service;
 
 #[derive(Clone)]
 struct AppState {
     pool: PgPool,
     auth: Arc<Auth>,
+    site_url: String,
 }
 
 struct ApiError(anyhow::Error);
@@ -73,6 +74,14 @@ async fn current_user(state: &AppState, session: &Session) -> ApiResult<User> {
     Ok(user)
 }
 
+async fn current_admin(state: &AppState, session: &Session) -> ApiResult<User> {
+    let user = current_user(state, session).await?;
+    if !user.is_admin {
+        api_bail!("需要管理员权限");
+    }
+    Ok(user)
+}
+
 fn validate_username(username: &str) -> ApiResult<()> {
     let valid = (3..=32).contains(&username.len())
         && username
@@ -111,7 +120,8 @@ async fn register(
     }
 
     service::consume_invite(&state.pool, &req.code).await?;
-    let user = service::create_user(&state.pool, &req.username, &req.display_name).await?;
+    let user =
+        service::create_user(&state.pool, &req.username, &req.display_name, false).await?;
     let (options, flow_id) = state.auth.start_registration(&state.pool, &user).await?;
     Ok(Json(RegisterResponse {
         user,
@@ -363,7 +373,7 @@ async fn invites(
     State(state): State<AppState>,
     session: Session,
 ) -> ApiResult<Json<serde_json::Value>> {
-    current_user(&state, &session).await?;
+    current_admin(&state, &session).await?;
     let items = service::list_invites(&state.pool).await?;
     Ok(Json(json!({ "items": items })))
 }
@@ -389,7 +399,7 @@ async fn create_invite(
     session: Session,
     Json(req): Json<CreateInviteRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let user = current_user(&state, &session).await?;
+    let user = current_admin(&state, &session).await?;
     if req.max_uses < 1 || req.max_uses > 100 {
         api_bail!("使用次数需在 1-100 之间");
     }
@@ -408,7 +418,7 @@ async fn revoke_invite(
     session: Session,
     Path(code): Path<String>,
 ) -> ApiResult<StatusCode> {
-    current_user(&state, &session).await?;
+    current_admin(&state, &session).await?;
     service::revoke_invite(&state.pool, &code).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -417,7 +427,7 @@ async fn users(
     State(state): State<AppState>,
     session: Session,
 ) -> ApiResult<Json<serde_json::Value>> {
-    current_user(&state, &session).await?;
+    current_admin(&state, &session).await?;
     let items = service::list_users(&state.pool).await?;
     Ok(Json(json!({ "items": items })))
 }
@@ -433,9 +443,56 @@ async fn patch_user(
     Path(id): Path<Uuid>,
     Json(req): Json<PatchUserRequest>,
 ) -> ApiResult<StatusCode> {
-    current_user(&state, &session).await?;
+    current_admin(&state, &session).await?;
     service::set_user_disabled(&state.pool, id, req.disabled).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_settings(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
+    let site = service::get_settings(&state.pool).await?;
+    Ok(Json(json!({ "site": site, "site_url": state.site_url })))
+}
+
+async fn put_settings(
+    State(state): State<AppState>,
+    session: Session,
+    Json(site): Json<SiteSettings>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current_admin(&state, &session).await?;
+    if site.site_name.trim().is_empty() || site.site_name.chars().count() > 64 {
+        api_bail!("站点名称需为 1-64 个字符");
+    }
+    if site.nav.len() > 12 {
+        api_bail!("导航链接最多 12 条");
+    }
+    if site
+        .nav
+        .iter()
+        .any(|link| link.label.trim().is_empty() || link.href.trim().is_empty())
+    {
+        api_bail!("导航链接的标签与地址不能为空");
+    }
+    service::save_settings(&state.pool, &site).await?;
+    Ok(Json(json!({ "site": site })))
+}
+
+#[derive(Deserialize)]
+struct PatchMeRequest {
+    display_name: String,
+}
+
+async fn patch_me(
+    State(state): State<AppState>,
+    session: Session,
+    Json(req): Json<PatchMeRequest>,
+) -> ApiResult<Json<User>> {
+    let user = current_user(&state, &session).await?;
+    let display_name = req.display_name.trim();
+    if display_name.is_empty() || display_name.chars().count() > 64 {
+        api_bail!("显示名称需为 1-64 个字符");
+    }
+    let user = service::update_display_name(&state.pool, user.id, display_name).await?;
+    Ok(Json(user))
 }
 
 pub async fn serve(cfg: Config) -> Result<()> {
@@ -443,7 +500,11 @@ pub async fn serve(cfg: Config) -> Result<()> {
     crate::db::migrate(&pool).await?;
 
     let auth = Arc::new(Auth::new(&cfg.rp_id, &cfg.rp_origin)?);
-    let state = AppState { pool, auth };
+    let state = AppState {
+        pool,
+        auth,
+        site_url: cfg.site_url.clone(),
+    };
 
     let admin_origin: HeaderValue = cfg
         .admin_origin
@@ -472,7 +533,8 @@ pub async fn serve(cfg: Config) -> Result<()> {
         .route("/api/auth/login/finish", post(login_finish))
         .route("/api/auth/totp/login", post(totp_login))
         .route("/api/auth/logout", post(logout))
-        .route("/api/me", get(me))
+        .route("/api/me", get(me).patch(patch_me))
+        .route("/api/settings", get(get_settings).put(put_settings))
         .route("/api/totp/setup", post(totp_setup))
         .route("/api/totp/confirm", post(totp_confirm))
         .route("/api/passkey/setup", post(passkey_setup))
