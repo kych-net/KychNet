@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}KychNet{% endblock %}</title>
+  <style>
+    body { max-width: 42rem; margin: 0 auto; padding: 2rem 1rem; font-family: system-ui, sans-serif; line-height: 1.7; }
+    header { margin-bottom: 2rem; }
+    article img { max-width: 100%; }
+  </style>
+  {% block head %}{% endblock %}
+</head>
+<body>
+  <header><a href="/">KychNet</a></header>
+  <main>{% block content %}{% endblock %}</main>
+</body>
+</html>

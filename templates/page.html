@@ -1,0 +1,12 @@
+{% extends "layout.html" %}
+{% block title %}{{ title }}{% endblock %}
+{% block content %}
+<article>
+  <h1>{{ title }}</h1>
+  {{ content|safe }}
+  {% if !pdf_url.is_empty() %}
+  <p><a href="{{ pdf_url }}">下载 PDF</a></p>
+  {% endif %}
+  <p><a href="/">返回首页</a></p>
+</article>
+{% endblock %}

@@ -1,0 +1,37 @@
+[package]
+name = "kychnet"
+version = "0.1.0"
+edition = "2021"
+description = "KychNet personal site backend"
+
+[dependencies]
+anyhow = "1"
+askama = "0.12"
+axum = "0.8"
+base32 = "0.5"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+dotenvy = "0.15"
+pulldown-cmark = "0.12"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid", "migrate", "macros"] }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+totp-rs = { version = "5", features = ["gen_secret", "otpauth"] }
+tower-http = { version = "0.6", features = ["trace", "cors", "compression-gzip"] }
+tower-sessions = "0.14"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+typst = "0.13"
+typst-assets = { version = "0.13", features = ["fonts"] }
+typst-html = "0.13"
+typst-pdf = "0.13"
+url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
