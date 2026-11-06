@@ -24,7 +24,9 @@ export function AuthPage({ onLogin }: Props) {
         onLogin(await api.totpLogin(username, code));
       } else {
         const started = await api.loginStart(username);
-        const credential = await startAuthentication({ optionsJSON: started.options });
+        // webauthn-rs 返回 { publicKey: {...} }，SimpleWebAuthn 需要里面的 publicKey 对象
+        const options = started.options.publicKey ?? started.options;
+        const credential = await startAuthentication({ optionsJSON: options });
         onLogin(await api.loginFinish(started.flow_id, credential));
       }
     } catch (e) {
@@ -40,7 +42,8 @@ export function AuthPage({ onLogin }: Props) {
     setBusy(true);
     try {
       const started = await api.register(invite, username);
-      const credential = await startRegistration({ optionsJSON: started.options });
+      const options = started.options.publicKey ?? started.options;
+      const credential = await startRegistration({ optionsJSON: options });
       onLogin(await api.finishRegister(started.flow_id, credential));
     } catch (e) {
       setError((e as Error).message);
