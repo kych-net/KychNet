@@ -106,19 +106,31 @@ pub async fn revoke_invite(pool: &PgPool, code: &str) -> Result<()> {
     Ok(())
 }
 
-/// 注册用户：把「校验并占用邀请码 → 创建用户 → 保存 Passkey 注册流程」放在单个事务内。
+/// 只读校验邀请码：让注册在开始前就能报出准确原因，同时不占用名额。
+pub async fn peek_invite(pool: &PgPool, code: &str) -> Result<Invite> {
+    let invite = sqlx::query_as::<_, Invite>("SELECT * FROM invites WHERE code = $1")
+        .bind(code)
+        .fetch_optional(pool)
+        .await?
+        .context("邀请码无效")?;
+    check_invite(&invite)?;
+    Ok(invite)
+}
+
+/// 注册的最后一步：在一个事务里占用邀请码、创建用户、保存通行密钥。
 ///
-/// 之前这三步各自独立提交，只要后两步任一步失败，就会留下「邀请码已扣但账号没建成」
-/// 或「建了孤立用户却没有认证流程」的坏数据。事务化后任一步失败整体回滚。
+/// 等到凭证校验通过才动手，是因为 WebAuthn 仪式随时可能被用户取消：先扣码
+/// 再建号的话，一次取消就永久烧掉一个邀请名额，还会留下没有凭证、谁也登不
+/// 进去的孤立用户。用户名唯一性交给数据库兜底，撞名时整体回滚并给出提示。
 /// `user_id` 由调用方提前生成，必须与 WebAuthn 挑战里的 user handle 完全一致。
-pub async fn register_user(
+pub async fn complete_registration(
     pool: &PgPool,
     user_id: Uuid,
     code: &str,
     username: &str,
     display_name: &str,
-    flow_id: Uuid,
-    flow_state: serde_json::Value,
+    credential_id: &str,
+    passkey: &serde_json::Value,
 ) -> Result<User> {
     let mut tx = pool.begin().await?;
 
@@ -128,12 +140,8 @@ pub async fn register_user(
         .await?
         .context("邀请码无效")?;
     check_invite(&invite)?;
-    sqlx::query("UPDATE invites SET used_count = used_count + 1 WHERE code = $1")
-        .bind(code)
-        .execute(&mut *tx)
-        .await?;
 
-    let user = sqlx::query_as::<_, User>(
+    let user = match sqlx::query_as::<_, User>(
         "INSERT INTO users (id, username, display_name, is_admin)
          VALUES ($1, $2, $3, FALSE) RETURNING *",
     )
@@ -141,16 +149,29 @@ pub async fn register_user(
     .bind(username)
     .bind(display_name)
     .fetch_one(&mut *tx)
-    .await?;
+    .await
+    {
+        Ok(user) => user,
+        // 23505 = unique_violation：两个并行注册抢同一个用户名，后到的失败。
+        Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("23505") => {
+            bail!("用户名已被占用");
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    sqlx::query("UPDATE invites SET used_count = used_count + 1 WHERE code = $1")
+        .bind(code)
+        .execute(&mut *tx)
+        .await?;
 
     sqlx::query(
-        "INSERT INTO auth_flows (id, user_id, kind, state, expires_at)
-         VALUES ($1, $2, 'register', $3, $4)",
+        "INSERT INTO passkey_credentials (id, user_id, credential_id, passkey)
+         VALUES ($1, $2, $3, $4)",
     )
-    .bind(flow_id)
+    .bind(Uuid::new_v4())
     .bind(user.id)
-    .bind(flow_state)
-    .bind(Utc::now() + Duration::minutes(5))
+    .bind(credential_id)
+    .bind(passkey)
     .execute(&mut *tx)
     .await?;
 
@@ -268,6 +289,54 @@ pub async fn set_user_disabled(pool: &PgPool, id: Uuid, disabled: bool) -> Resul
     if result.rows_affected() == 0 {
         bail!("用户不存在");
     }
+    Ok(())
+}
+
+/// 后台「禁用/启用账号」的安全版本。
+///
+/// 裸的 `set_user_disabled` 会让管理员把自己关在门外，也会让最后一个管理员
+/// 被禁用后全站再也进不去（只有 CLI 能救）。两种情况在同一事务里锁住相关行
+/// 再判断，避免两个管理员同时点「禁用」把彼此关掉。
+pub async fn set_user_disabled_guarded(
+    pool: &PgPool,
+    actor_id: Uuid,
+    target_id: Uuid,
+    disabled: bool,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+
+    let target_is_admin =
+        sqlx::query_as::<_, (bool,)>("SELECT is_admin FROM users WHERE id = $1 FOR UPDATE")
+            .bind(target_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .context("用户不存在")?
+            .0;
+
+    if disabled {
+        if target_id == actor_id {
+            bail!("不能禁用自己的账号");
+        }
+        if target_is_admin {
+            // 锁定所有可用管理员再计数：并发操作下两个管理员互相禁用时，
+            // 后提交的那个会看到 count 已经变成 1 而失败。
+            let active = sqlx::query_as::<_, (Uuid,)>(
+                "SELECT id FROM users WHERE is_admin AND NOT disabled FOR UPDATE",
+            )
+            .fetch_all(&mut *tx)
+            .await?;
+            if active.len() <= 1 {
+                bail!("这是最后一个可用管理员，禁用后无人能进后台");
+            }
+        }
+    }
+
+    sqlx::query("UPDATE users SET disabled = $2 WHERE id = $1")
+        .bind(target_id)
+        .bind(disabled)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
     Ok(())
 }
 

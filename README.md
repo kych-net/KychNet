@@ -32,7 +32,7 @@
 - 内容端顶栏:左侧站点图标,中间为可编辑导航链接(管理端「站点设置」维护),右侧为主题切换与管理端入口.
 - 管理端顶栏:左侧站点图标,中间为功能导航(内容/邀请码/用户/站点设置),右侧为头像菜单(用户设置/网站管理/前往内容端)与主题切换.
 - 两端共用浅色、深色两套主题,基于 CSS 变量实现,选择持久化在 localStorage.
-- 用户头像为上传的 SVG 文件,由服务端校验确为纯矢量:必须是合法 XML 且根元素为 `svg`,至少包含一个矢量图形,禁止内嵌/外链位图、`<script>`、`<foreignObject>`、事件属性与外部资源;上限 256 KB.
+- 用户头像为上传的 SVG 文件,由服务端校验确为纯矢量:必须是合法 XML 且根元素为 `svg`,至少包含一个矢量图形,禁止内嵌/外链位图、`<script>`、`<foreignObject>`、事件属性、DTD 与实体声明、`<animate>`/`<set>` 等属性动画元素,`href` 只允许指向文档内图元(`#xxx`);内容上限 256 KB,传输上限 257 KB.
 
 
 ## 技术栈
@@ -44,7 +44,7 @@
 | 内容渲染 | pulldown-cmark / typst |
 | 数据库 | PostgreSQL + SQLx |
 | 认证 | webauthn-rs(Passkey) + totp-rs(TOTP) |
-| 会话 | tower-sessions + HttpOnly/Secure/SameSite=Strict Cookie,登录后轮换会话 ID,有效期 8 小时(当前为 MemoryStore,进程重启后登录态丢失,多实例不共享) |
+| 会话 | tower-sessions + Postgres store(schema `tower_sessions`,表 `session`) + HttpOnly/Secure/SameSite=Strict Cookie,登录后轮换会话 ID,有效期 8 小时 |
 | 命令行 | clap |
 | 管理前端 | React + TypeScript + Vite |
 | 数据与表单 | 原生 fetch + React state |
@@ -64,6 +64,7 @@
 │   ├── auth.rs          # Passkey / TOTP / 认证流程
 │   ├── render.rs        # markdown / html / typst 渲染
 │   ├── svg.rs           # 上传头像的 SVG 校验
+│   ├── rate.rs          # 登录/注册接口的有界内存限流
 │   ├── api.rs           # Axum 路由、会话、CORS、Origin 校验
 │   └── build.rs         # 静态站生成
 ├── templates/           # Askama 模板(layout / index / page)
@@ -139,11 +140,16 @@ export PATH=/usr/local/bin:$PATH            # 通常已默认包含
 - 普通成员可管理内容与个人设置;邀请码、用户管理、站点设置仅管理员可见.
 - 登录支持通行密钥(Passkey)与 TOTP 动态验证码,用户注册后可绑定任一或全部.
 - 会话存放于 HttpOnly + Secure + SameSite Cookie,不落地到前端存储;登录或注册成功后会轮换会话 ID,避免会话固定.
+- 会话记录存在 Postgres(schema `tower_sessions`,表 `session`),由 `serve` 启动时自动建表,每 5 分钟清理过期行;`kychnet db migrate` 不涉及它,但数据库角色需要有建 schema 的权限.换成集中存储后,进程重启不再让所有人掉登录,多实例也能共享会话,内存也不再随会话数无上限增长.代价是每个带 Cookie 的请求多一次按主键的会话读.
 - 登录相关接口有限流(按用户名与客户端 IP 双路计数):`login/start` 每用户名 10 次/分钟、`totp/login` 每账号 5 次/15 分钟(成功即清零)、注册每 IP 10 次/分钟,超额返回 429.限流是进程内的,重启清零、多实例各自计数,要跨实例统一得换集中存储.
 - 客户端 IP 默认取 TCP 对端地址;只有确实只经可信 CDN/反代进来时才设 `TRUST_PROXY_HEADERS=1` 改读 `X-Forwarded-For`——这个头任何人都能伪造,信错了等于让攻击者自己挑额度.
 - 绑定 TOTP 时新密钥先进 `pending_secret`,输入正确验证码确认后才替换旧密钥;中途放弃不会把原来能用的 TOTP 打死.
 - `login/start` 与 `totp/login` 的失败响应统一成同一条消息:这两个接口匿名可调,"用户不存在""账号已禁用""没绑定通行密钥"如果是可区分的,就等于在向外枚举用户名和每个人的 2FA 配置.真实原因只进日志.
 - 过期的 `auth_flows` 由 `serve` 内的后台任务每 60 秒清理一次;`login_start` 每次调用都会插一行,不清理就会被匿名请求撑爆.
+- 注册改为「凭证通过才落库」:`/api/auth/register` 只读校验邀请码并把用户资料暂存在认证流程里,`/api/auth/register/finish` 校验 Passkey 成功后才在一个事务内扣邀请码、建用户、存凭证.浏览器取消仪式不再消耗邀请名额,也不会留下没有凭证的孤立用户;撞用户名由唯一约束兜底.
+- 修改凭证需要 step-up:`totp/setup`、`totp/confirm` 之外的 `passkey/setup`、`passkey/setup/finish` 要求会话在最近一次真实认证的 5 分钟内,否则返回 403.只拿到旧 cookie 或只读到 `/api/me` 的攻击者无法把受害者的二次验证换绑到自己设备上.`totp/confirm` 不要求 step-up(pending 密钥只能由已 step-up 的 setup 产生),但每账号限 5 次/15 分钟.
+- 管理员启停账号有护栏:不能禁用自己的账号,也不能禁用最后一个可用管理员(同一事务内锁行判断,并发互关时后提交者失败).`kychnet user` CLI 不受此限制,保留为应急入口.
+- 请求体上限显式声明:全局 2 MiB,头像 257 KB,不再依赖框架默认值.
 
 ## 开发
 
@@ -178,7 +184,7 @@ cd admin && pnpm install && cp .env.example .env && pnpm dev
 - 站点名称、图标与顶栏导航存于 `site_settings`,由管理端编辑,构建时读取.
 - 内容 slug 允许任意 Unicode 字母与数字(中文、日文等)以及 `-` `_`;禁止空格、标点、路径分隔符 `/` `\`、点号 `.`、URL 保留字符(`?` `#` `%` 等)与控制字符,UTF-8 长度上限 180 字节.写入时即校验,避免脏数据卡死构建.链接中的非 ASCII slug 会按 `%XX` 编码,磁盘文件名仍是原始 UTF-8;带变音符号的文字请使用 NFC 预组合形式.
 - 模板与 API 共用同一套领域模型,避免两端口径漂移.
-- Typst 在当前进程内编译,由 `VirtualPath::resolve(root)` 加 canonicalize 双重校验把文件读取限制在 `CONTENT_ROOT` 内,避免内容作者通过 `#include` 读到构建机上的任意文件;生产仍建议放进断网容器并加 CPU/内存限额,构建机上的 `.env` 与云凭据不要落在可读目录.
+- Typst 在当前进程内编译,由 `VirtualPath::resolve(root)` 加 canonicalize 双重校验把文件读取限制在 `CONTENT_ROOT` 内,避免内容作者通过 `#include` 读到构建机上的任意文件;父目录校验之外还会对目标文件本身做 `symlink_metadata` 判断,内容目录里的符号链接一律拒绝(否则 `link.png -> /etc/passwd` 会被 `fs::read` 跟进去).生产仍建议放进断网容器并加 CPU/内存限额,构建机上的 `.env` 与云凭据不要落在可读目录.
 - 编译缓存尚未实现;目前每篇 Typst 内容会分别编译 `PagedDocument`(出 PDF)与 `HtmlDocument`(出 HTML)各一次.
 - 静态产物保持平台中立:只用相对路径、不写死域名,重定向与 404 分别在各平台配置.
 - 静态资源使用哈希文件名并长缓存,HTML 短缓存;压缩交给 CDN.
