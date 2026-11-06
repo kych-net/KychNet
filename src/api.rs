@@ -165,13 +165,20 @@ async fn current_admin(state: &AppState, session: &Session) -> ApiResult<User> {
     Ok(user)
 }
 
+/// 用户名中禁止出现的特殊字符。空白与控制字符另行判断。
+const USERNAME_SPECIAL_CHARS: &[char] = &[
+    '/', '\\', '.', ',', ':', ';', '"', '\'', '<', '>', '&', '%', '#', '?', '=', '+', '*', '(',
+    ')', '[', ']', '{', '}', '|', '@', '!', '^', '~', '$', '`',
+];
+
 fn validate_username(username: &str) -> ApiResult<()> {
-    let valid = (3..=32).contains(&username.len())
-        && username
+    let length = username.chars().count();
+    let valid = (3..=32).contains(&length)
+        && !username
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+            .any(|c| c.is_control() || c.is_whitespace() || USERNAME_SPECIAL_CHARS.contains(&c));
     if !valid {
-        api_bail!("用户名需为 3-32 位字母、数字、下划线或连字符");
+        api_bail!("用户名需为 3-32 个字符,不能包含空白、控制字符或 / \\ . 等特殊符号(支持中文与 emoji)");
     }
     Ok(())
 }
@@ -748,4 +755,27 @@ pub async fn serve(cfg: Config) -> Result<()> {
     tracing::info!("API 监听 {}", cfg.bind);
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn username_accepts_unicode_and_emoji() {
+        assert!(validate_username("张三丰").is_ok());
+        assert!(validate_username("kych_net-01").is_ok());
+        assert!(validate_username("🎉🎉🎉").is_ok());
+        assert!(validate_username("あい_う").is_ok());
+    }
+
+    #[test]
+    fn username_rejects_special_and_whitespace() {
+        assert!(validate_username("ab").is_err());
+        assert!(validate_username("a b c").is_err());
+        assert!(validate_username("a/b/c").is_err());
+        assert!(validate_username("a.b.c").is_err());
+        assert!(validate_username("a;b;c").is_err());
+        assert!(validate_username("a<b>c").is_err());
+    }
 }

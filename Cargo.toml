@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "KychNet personal site backend"
 
+[features]
+# 交叉编译 musl 静态二进制时启用,让 openssl 随源码编译而不是依赖系统库.
+vendored-openssl = ["dep:openssl", "openssl/vendored"]
+
 [dependencies]
 anyhow = "1"
 askama = "0.12"
@@ -12,6 +16,7 @@ base32 = "0.5"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 dotenvy = "0.15"
+openssl = { version = "0.10", optional = true }
 pulldown-cmark = "0.12"
 rand = "0.8"
 roxmltree = "0.20"
