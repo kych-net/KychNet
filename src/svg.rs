@@ -51,7 +51,16 @@ pub fn validate_svg(input: &[u8]) -> Result<()> {
             if name.starts_with("on") {
                 bail!("SVG 不允许包含事件属性");
             }
-            let value = attr.value().trim().to_ascii_lowercase();
+            // 浏览器解析 URL 时会忽略 tab / 换行 / 回车等控制字符，
+            // 例如 `java&#10;script:alert(1)` 解码后仍会被当作 javascript: 执行。
+            // 必须先剔除这些字符再做协议判断，否则前缀检查可被绕过。
+            let value: String = attr
+                .value()
+                .trim()
+                .to_ascii_lowercase()
+                .chars()
+                .filter(|c| !matches!(c, '\t' | '\n' | '\r' | '\0' | ' '))
+                .collect();
             if value.starts_with("javascript:") || value.starts_with("data:") {
                 bail!("SVG 不允许引用脚本或内嵌数据");
             }
@@ -104,6 +113,14 @@ mod tests {
     #[test]
     fn rejects_empty_svg() {
         let svg = r#"<svg xmlns="http://www.w3.org/2000/svg"></svg>"#;
+        assert!(validate_svg(svg.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn rejects_javascript_url_with_control_chars() {
+        // XML 字符实体解码后是 "java\nscript:alert(1)"，浏览器仍会执行；
+        // 单纯 starts_with("javascript:") 会被绕过。
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg"><a href="java&#10;script:alert(1)"><rect width="10" height="10"/></a></svg>"#;
         assert!(validate_svg(svg.as_bytes()).is_err());
     }
 }

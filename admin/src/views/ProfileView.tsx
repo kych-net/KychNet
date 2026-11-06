@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { startRegistration } from "@simplewebauthn/browser";
-import { api, User } from "../api";
+import { api, avatarUrl, User } from "../api";
 
 type Props = {
   user: User;
@@ -108,7 +108,7 @@ export function ProfileView({ user, avatarVersion, onUserChange, onAvatarChange 
           ) : (
             <img
               className="avatar-img"
-              src={avatarPreview || `/api/avatar/${user.id}?v=${avatarVersion}`}
+              src={avatarPreview || avatarUrl(user.id, avatarVersion)}
               alt=""
               onError={() => {
                 if (!avatarPreview) {

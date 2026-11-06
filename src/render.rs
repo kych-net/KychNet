@@ -76,8 +76,32 @@ impl TypstWorld {
         }
     }
 
-    fn path_for(&self, id: FileId) -> PathBuf {
-        self.root.join(id.vpath().as_rooted_path())
+    /// 把 Typst 的虚拟路径安全地解析到内容根目录内。
+    ///
+    /// 注意:`VirtualPath::as_rooted_path()` 返回带前导 `/` 的路径,直接交给
+    /// `PathBuf::join` 会丢弃左侧 root(实测 `content.join("/foo.typ") == "/foo.typ"`),
+    /// 使 `CONTENT_ROOT` 完全失效,并允许内容读取构建机上的任意文件。
+    /// 必须使用库自带的 `resolve(root)`,它会在路径词法逃逸时返回 None。
+    fn path_for(&self, id: FileId) -> FileResult<PathBuf> {
+        let path = id
+            .vpath()
+            .resolve(&self.root)
+            .ok_or_else(|| FileError::NotFound(id.vpath().as_rooted_path().to_path_buf()))?;
+
+        // resolve 只做词法校验,符号链接仍可能逃出根目录。
+        // 再对父目录做一次真实路径校验,确保最终读取位置确实位于 root 内。
+        let root = self
+            .root
+            .canonicalize()
+            .map_err(|_| FileError::NotFound(self.root.clone()))?;
+        let parent = path.parent().unwrap_or(&self.root);
+        let real_parent = parent
+            .canonicalize()
+            .map_err(|_| FileError::NotFound(path.clone()))?;
+        if !real_parent.starts_with(&root) {
+            return Err(FileError::NotFound(path));
+        }
+        Ok(real_parent.join(path.file_name().unwrap_or_default()))
     }
 }
 
@@ -98,8 +122,9 @@ impl World for TypstWorld {
         if id == self.main {
             return Ok(self.source.clone());
         }
-        let path = self.path_for(id);
-        let text = std::fs::read_to_string(&path).map_err(|_| FileError::NotFound(path))?;
+        let path = self.path_for(id)?;
+        let text = std::fs::read_to_string(&path)
+            .map_err(|_| FileError::NotFound(path.clone()))?;
         Ok(Source::new(id, text))
     }
 
@@ -107,8 +132,8 @@ impl World for TypstWorld {
         if id == self.main {
             return Ok(Bytes::new(self.source.text().as_bytes().to_vec()));
         }
-        let path = self.path_for(id);
-        let data = std::fs::read(&path).map_err(|_| FileError::NotFound(path))?;
+        let path = self.path_for(id)?;
+        let data = std::fs::read(&path).map_err(|_| FileError::NotFound(path.clone()))?;
         Ok(Bytes::new(data))
     }
 
