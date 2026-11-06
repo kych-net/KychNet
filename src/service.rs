@@ -279,6 +279,18 @@ pub async fn delete_passkeys(pool: &PgPool, user_id: Uuid) -> Result<()> {
     Ok(())
 }
 
+/// 清理过期的认证流程，返回删除的行数。
+///
+/// `auth_flows` 过去只在流程被正常走完时删除，而 `login_start` 是匿名可调的：
+/// 每次调用都会插入一行，放弃登录的人越多、试探登录的脚本越欢，表就单调增长。
+/// 现在由 `serve` 里的后台任务定期调用。
+pub async fn prune_auth_flows(pool: &PgPool) -> Result<u64> {
+    let result = sqlx::query("DELETE FROM auth_flows WHERE expires_at < now()")
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
 pub async fn list_contents(pool: &PgPool) -> Result<Vec<Content>> {
     Ok(
         sqlx::query_as::<_, Content>("SELECT * FROM contents ORDER BY updated_at DESC")

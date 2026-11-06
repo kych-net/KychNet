@@ -44,7 +44,7 @@
 | 内容渲染 | pulldown-cmark / typst |
 | 数据库 | PostgreSQL + SQLx |
 | 认证 | webauthn-rs(Passkey) + totp-rs(TOTP) |
-| 会话 | tower-sessions + HttpOnly/Secure/SameSite Cookie(当前为 MemoryStore,进程重启后登录态丢失,多实例不共享) |
+| 会话 | tower-sessions + HttpOnly/Secure/SameSite=Strict Cookie,登录后轮换会话 ID,有效期 8 小时(当前为 MemoryStore,进程重启后登录态丢失,多实例不共享) |
 | 命令行 | clap |
 | 管理前端 | React + TypeScript + Vite |
 | 数据与表单 | 原生 fetch + React state |
@@ -96,7 +96,12 @@ kychnet passkey reset <user>
 - 注册用户默认为普通成员;管理员通过 `kychnet user create --admin` 创建.
 - 普通成员可管理内容与个人设置;邀请码、用户管理、站点设置仅管理员可见.
 - 登录支持通行密钥(Passkey)与 TOTP 动态验证码,用户注册后可绑定任一或全部.
-- 会话存放于 HttpOnly + Secure + SameSite Cookie,不落地到前端存储.
+- 会话存放于 HttpOnly + Secure + SameSite Cookie,不落地到前端存储;登录或注册成功后会轮换会话 ID,避免会话固定.
+- 登录相关接口有限流(按用户名与客户端 IP 双路计数):`login/start` 每用户名 10 次/分钟、`totp/login` 每账号 5 次/15 分钟(成功即清零)、注册每 IP 10 次/分钟,超额返回 429.限流是进程内的,重启清零、多实例各自计数,要跨实例统一得换集中存储.
+- 客户端 IP 默认取 TCP 对端地址;只有确实只经可信 CDN/反代进来时才设 `TRUST_PROXY_HEADERS=1` 改读 `X-Forwarded-For`——这个头任何人都能伪造,信错了等于让攻击者自己挑额度.
+- 绑定 TOTP 时新密钥先进 `pending_secret`,输入正确验证码确认后才替换旧密钥;中途放弃不会把原来能用的 TOTP 打死.
+- `login/start` 与 `totp/login` 的失败响应统一成同一条消息:这两个接口匿名可调,"用户不存在""账号已禁用""没绑定通行密钥"如果是可区分的,就等于在向外枚举用户名和每个人的 2FA 配置.真实原因只进日志.
+- 过期的 `auth_flows` 由 `serve` 内的后台任务每 60 秒清理一次;`login_start` 每次调用都会插一行,不清理就会被匿名请求撑爆.
 
 ## 开发
 

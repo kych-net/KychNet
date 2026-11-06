@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use axum::body::Bytes;
-use axum::extract::{Path, Request, State};
+use axum::extract::{ConnectInfo, Path, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -10,10 +10,11 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::PgPool;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-use tower_sessions::{MemoryStore, Session, SessionManagerLayer};
+use tower_sessions::{cookie::SameSite, Expiry, MemoryStore, Session, SessionManagerLayer};
 use uuid::Uuid;
 use webauthn_rs::prelude::{
     CreationChallengeResponse, PublicKeyCredential, RegisterPublicKeyCredential,
@@ -22,13 +23,32 @@ use webauthn_rs::prelude::{
 use crate::auth::{self, Auth};
 use crate::config::Config;
 use crate::models::{SiteSettings, User};
+use crate::rate::RateLimiter;
 use crate::service;
+
+/// 认证相关接口的限流额度，格式为 `(窗口内最多几次, 窗口秒数)`。
+///
+/// 这里挡住的是「在线暴力尝试」，不是「离线爆破数据库」——TOTP 密钥明文入库，
+/// 数据库一旦泄露就只剩下密钥派生强度，限流帮不上忙。
+const LOGIN_START_PER_USER: (u32, u64) = (10, 60);
+const LOGIN_START_PER_IP: (u32, u64) = (30, 60);
+const TOTP_LOGIN_PER_IP: (u32, u64) = (10, 60);
+/// 验证码 6 位、单步 30 秒（`check_current` 允许 ±1 步），
+/// 因此每账号 15 分钟内最多 5 次，猜中的概率被压到可以忽略。
+const TOTP_ATTEMPTS_PER_USER: (u32, u64) = (5, 900);
+const REGISTER_PER_IP: (u32, u64) = (10, 60);
+
+/// 会话最长存活时间。用 OnInactivity 表达，但只有会话被写入时才会顺延，
+/// 实际效果就是「登录后最多 8 小时」，配合下面各处 `cycle_id` 使用。
+const SESSION_TTL: time::Duration = time::Duration::hours(8);
 
 #[derive(Clone)]
 struct AppState {
     pool: PgPool,
     auth: Arc<Auth>,
     site_url: String,
+    limits: RateLimiter,
+    trust_proxy_headers: bool,
 }
 
 struct ApiError {
@@ -199,6 +219,68 @@ fn safe_url(value: &str) -> bool {
         || normalized.starts_with("vbscript:"))
 }
 
+/// 消耗一个限流额度，超额就返回 429。
+fn limited(state: &AppState, key: &str, quota: (u32, u64)) -> ApiResult<()> {
+    let (max, seconds) = quota;
+    if let Some(retry_after) = state
+        .limits
+        .check(key, max, std::time::Duration::from_secs(seconds))
+    {
+        let secs = retry_after.as_secs().max(1);
+        tracing::warn!("限流拦截: {key}");
+        api_reject!(StatusCode::TOO_MANY_REQUESTS, "尝试过于频繁，请 {secs} 秒后重试");
+    }
+    Ok(())
+}
+
+/// 取客户端 IP 作为限流 key 的一部分。
+///
+/// 只有显式打开 `TRUST_PROXY_HEADERS` 才读 `X-Forwarded-For`：这个头任何人都能写，
+/// 在没有可信 CDN/反代改写它的部署里当成来源，等于让攻击者自己挑限流额度。
+/// 另外要注意，放到 Cloudflare/EdgeOne 后面时 `trust_proxy_headers = false`
+/// 会让所有请求共用同一个回源 IP，此时按 IP 的额度实际是全局限额，应按部署调整。
+fn client_ip(state: &AppState, headers: &HeaderMap, peer: SocketAddr) -> String {
+    if state.trust_proxy_headers {
+        if let Some(value) = headers
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok())
+        {
+            if let Some(first) = value.split(',').next().map(str::trim) {
+                if !first.is_empty() {
+                    return first.to_ascii_lowercase();
+                }
+            }
+        }
+    }
+    peer.ip().to_string()
+}
+
+/// 登录相关接口统一的失败响应。
+///
+/// 「用户不存在」「账号已禁用」「没绑定通行密钥」必须长得一模一样：
+/// 这几个接口都是匿名可调的，返回可区分的错误就等于把用户名和每个人的 2FA
+/// 配置情况摊开给外面看。真实原因只写日志。
+fn login_failed(reason: impl std::fmt::Display) -> ApiError {
+    tracing::debug!("登录失败: {reason}");
+    ApiError::with_status(StatusCode::UNAUTHORIZED, "用户名或凭证无效")
+}
+
+/// 登录/注册成功后轮换会话 ID。
+///
+/// 不换 ID 的话，攻击者可以事先拿到一个会话 ID 让受害者用上（会话固定），
+/// 受害者完成认证后攻击者手里那个 ID 就带着已登录的身份。
+async fn establish_session(session: &Session, user_id: Uuid) -> ApiResult<()> {
+    session
+        .cycle_id()
+        .await
+        .map_err(|e| anyhow!("轮换会话失败: {e}"))?;
+    session
+        .insert("user_id", user_id)
+        .await
+        .map_err(|e| anyhow!("写入会话失败: {e}"))?;
+    Ok(())
+}
+
 #[derive(Deserialize)]
 struct RegisterRequest {
     code: String,
@@ -215,8 +297,14 @@ struct RegisterResponse {
 
 async fn register(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Json(req): Json<RegisterRequest>,
 ) -> ApiResult<Json<RegisterResponse>> {
+    // 注册要求邀请码，但邀请码是 16 字节随机值、不需要被爆破；这里限的是
+    // 「拿到一个码之后批量建号占用户名」以及凭空造 flow 行。
+    let ip = client_ip(&state, &headers, peer);
+    limited(&state, &format!("register:ip:{ip}"), REGISTER_PER_IP)?;
     validate_username(&req.username)?;
     if req.display_name.trim().is_empty() || req.display_name.chars().count() > 64 {
         api_bail!("显示名称需为 1-64 个字符");
@@ -279,10 +367,7 @@ async fn finish_registration(
     let user = service::find_user_by_id(&state.pool, user_id)
         .await?
         .context("用户不存在")?;
-    session
-        .insert("user_id", user_id)
-        .await
-        .map_err(|e| anyhow!("写入会话失败: {e}"))?;
+    establish_session(&session, user_id).await?;
     Ok(Json(user))
 }
 
@@ -299,15 +384,30 @@ struct LoginStartResponse {
 
 async fn login_start(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Json(req): Json<LoginStartRequest>,
 ) -> ApiResult<Json<LoginStartResponse>> {
-    let user = service::find_user_by_username(&state.pool, &req.username)
-        .await?
-        .context("用户名或凭证无效")?;
+    // 每次发起都会往 auth_flows 插一行，所以必须先限流再查库。
+    let ip = client_ip(&state, &headers, peer);
+    limited(&state, &format!("login-start:ip:{ip}"), LOGIN_START_PER_IP)?;
+    limited(
+        &state,
+        &format!("login-start:user:{}", req.username.to_ascii_lowercase()),
+        LOGIN_START_PER_USER,
+    )?;
+
+    let Some(user) = service::find_user_by_username(&state.pool, &req.username).await? else {
+        return Err(login_failed("用户名不存在"));
+    };
     if user.disabled {
-        api_bail!("账号已被禁用");
+        return Err(login_failed("账号已被禁用"));
     }
-    let (options, flow_id) = state.auth.start_authentication(&state.pool, &user).await?;
+    let (options, flow_id) = state
+        .auth
+        .start_authentication(&state.pool, &user)
+        .await
+        .map_err(|e| login_failed(format!("无法发起 Passkey 登录: {e:#}")))?;
     Ok(Json(LoginStartResponse { flow_id, options }))
 }
 
@@ -325,17 +425,15 @@ async fn login_finish(
     let user_id = state
         .auth
         .finish_authentication(&state.pool, req.flow_id, &req.credential)
-        .await?;
+        .await
+        .map_err(|e| login_failed(format!("Passkey 登录校验失败: {e:#}")))?;
     let user = service::find_user_by_id(&state.pool, user_id)
         .await?
         .context("用户不存在")?;
     if user.disabled {
-        api_bail!("账号已被禁用");
+        return Err(login_failed("账号已被禁用"));
     }
-    session
-        .insert("user_id", user_id)
-        .await
-        .map_err(|e| anyhow!("写入会话失败: {e}"))?;
+    establish_session(&session, user_id).await?;
     Ok(Json(user))
 }
 
@@ -348,21 +446,33 @@ struct TotpLoginRequest {
 async fn totp_login(
     State(state): State<AppState>,
     session: Session,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Json(req): Json<TotpLoginRequest>,
 ) -> ApiResult<Json<User>> {
-    let user = service::find_user_by_username(&state.pool, &req.username)
-        .await?
-        .context("用户名或验证码错误")?;
+    // 验证码只有 6 位，不限流就是给在线爆破开门。
+    // 按用户名的额度就是「每账号 15 分钟 5 次」，成功的登录会把计数清掉。
+    //
+    // 权衡要说清楚：固定窗口意味着有人故意拿错的验证码刷某个用户名，就能让这个人
+    // 15 分钟内用不了 TOTP（Passkey 登录不受影响，计数也会自己滚掉，不会永久锁死）。
+    // 只靠 TOTP 登录的账号如果在意这点，把额度放宽到 10 次/15 分钟，
+    // 或者按「同一 IP 至少成功过一次」再放宽，都是可以的；这里先取保守值。
+    let ip = client_ip(&state, &headers, peer);
+    let user_key = format!("totp:user:{}", req.username.to_ascii_lowercase());
+    limited(&state, &format!("totp:ip:{ip}"), TOTP_LOGIN_PER_IP)?;
+    limited(&state, &user_key, TOTP_ATTEMPTS_PER_USER)?;
+
+    let Some(user) = service::find_user_by_username(&state.pool, &req.username).await? else {
+        return Err(login_failed("TOTP 登录：用户名不存在"));
+    };
     if user.disabled {
-        api_bail!("账号已被禁用");
+        return Err(login_failed("TOTP 登录：账号已被禁用"));
     }
     if !auth::totp_verify(&state.pool, &user, &req.code).await? {
-        api_bail!("用户名或验证码错误");
+        return Err(login_failed("TOTP 登录：验证码错误"));
     }
-    session
-        .insert("user_id", user.id)
-        .await
-        .map_err(|e| anyhow!("写入会话失败: {e}"))?;
+    state.limits.reset(&user_key);
+    establish_session(&session, user.id).await?;
     Ok(Json(user))
 }
 
@@ -542,6 +652,11 @@ async fn create_invite(
     if req.max_uses < 1 || req.max_uses > 100 {
         api_bail!("使用次数需在 1-100 之间");
     }
+    // 只卡上界：不卡的话 `Utc::now() + Duration::days(i64)` 会因超出 DateTime 范围直接 panic。
+    // 下界保留原来的语义，0 或负数表示不过期。
+    if req.expires_in_days > 3650 {
+        api_bail!("有效期最多 3650 天（0 或负数表示不过期）");
+    }
     let expires_at = if req.expires_in_days <= 0 {
         None
     } else {
@@ -689,12 +804,15 @@ async fn avatar(State(state): State<AppState>, Path(id): Path<Uuid>) -> ApiResul
 pub async fn serve(cfg: Config) -> Result<()> {
     let pool = crate::db::connect(&cfg.database_url).await?;
     crate::db::migrate(&pool).await?;
+    spawn_flow_pruner(pool.clone());
 
     let auth = Arc::new(Auth::new(&cfg.rp_id, &cfg.rp_origin)?);
     let state = AppState {
         pool,
         auth,
         site_url: cfg.site_url.clone(),
+        limits: RateLimiter::default(),
+        trust_proxy_headers: cfg.trust_proxy_headers,
     };
 
     let admin_origin: HeaderValue = cfg
@@ -703,9 +821,13 @@ pub async fn serve(cfg: Config) -> Result<()> {
         .context("ADMIN_ORIGIN 不是合法 origin")?;
     let cors = CorsLayer::new()
         .allow_origin(admin_origin)
+        // PUT 必须在列出的方法里：`/api/settings` 用的就是 PUT，而管理端与 API
+        // 不同源、请求又带 application/json，一定触发预检。之前漏掉它，
+        // 生产环境保存站点设置会被浏览器拦死，本地因为走 vite 代理（同源）测不出来。
         .allow_methods([
             Method::GET,
             Method::POST,
+            Method::PUT,
             Method::PATCH,
             Method::DELETE,
             Method::OPTIONS,
@@ -713,8 +835,21 @@ pub async fn serve(cfg: Config) -> Result<()> {
         .allow_headers([header::CONTENT_TYPE, header::COOKIE, header::ACCEPT])
         .allow_credentials(true);
 
+    // 会话属性全部写出来，不吃库的默认值：默认虽然是 HttpOnly=true、
+    // SameSite=Strict、Secure=true，但有效期是两周且不显式配置的话，
+    // 一旦换 store 或升级依赖就会悄悄变松。
+    //
+    // SameSite 选 Strict 不影响管理端调 API：`admin.kych.net` 与 `api.kych.net`
+    // 同属 kych.net，属于同站请求，Strict 照样带 Cookie；它只挡住跨站的导航与请求。
+    //
+    // 已知遗留问题：MemoryStore 的 `load` 会过滤过期记录但从不删除，
+    // 也没有实现 ExpiredDeletion，所以过期会话仍会留在内存里；
+    // 进程重启丢登录态、多实例不共享也还是老样子。要长期跑得换 Postgres/Redis store。
     let session_layer = SessionManagerLayer::new(MemoryStore::default())
-        .with_secure(cfg.rp_origin.starts_with("https"));
+        .with_secure(cfg.rp_origin.starts_with("https"))
+        .with_http_only(true)
+        .with_same_site(SameSite::Strict)
+        .with_expiry(Expiry::OnInactivity(SESSION_TTL));
 
     let origin_policy = OriginPolicy {
         admin_origin: cfg.admin_origin.clone(),
@@ -753,8 +888,29 @@ pub async fn serve(cfg: Config) -> Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&cfg.bind).await?;
     tracing::info!("API 监听 {}", cfg.bind);
-    axum::serve(listener, app).await?;
+    // 限流要按客户端 IP 计数，所以要把对端地址注入请求扩展。
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+        .await?;
     Ok(())
+}
+
+/// 定期清理过期的认证流程。
+///
+/// `login_start` 是匿名可调的，每调一次就往 `auth_flows` 插一行，而过去的代码
+/// 只在流程被正常走完时才删除——放弃登录的人和试探登录的脚本都能让表单调增长。
+fn spawn_flow_pruner(pool: PgPool) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            match service::prune_auth_flows(&pool).await {
+                Ok(0) => {}
+                Ok(removed) => tracing::info!("清理过期认证流程 {removed} 条"),
+                Err(e) => tracing::warn!("清理过期认证流程失败: {e:#}"),
+            }
+        }
+    });
 }
 
 #[cfg(test)]
