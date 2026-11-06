@@ -9,7 +9,40 @@ pub struct User {
     pub username: String,
     pub display_name: String,
     pub disabled: bool,
+    pub is_admin: bool,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NavLink {
+    pub label: String,
+    pub href: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SiteSettings {
+    pub site_name: String,
+    pub logo_url: String,
+    pub nav: Vec<NavLink>,
+}
+
+impl Default for SiteSettings {
+    fn default() -> Self {
+        Self {
+            site_name: "KychNet".into(),
+            logo_url: String::new(),
+            nav: vec![
+                NavLink {
+                    label: "文章".into(),
+                    href: "/".into(),
+                },
+                NavLink {
+                    label: "关于".into(),
+                    href: "/about".into(),
+                },
+            ],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, FromRow)]

@@ -1,56 +1,214 @@
-:root {
-  color: #1f2328;
-  background: #f6f7f9;
-  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
-  line-height: 1.6;
+:root,
+[data-theme="light"] {
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --text: #1f2328;
+  --muted: #656d76;
+  --border: #e1e4e8;
+  --accent: #1f6feb;
+  --accent-text: #ffffff;
+  --error-bg: #ffebe9;
+  --error-border: #ffcecb;
+  --error-text: #cf222e;
+  --notice-bg: #dafbe1;
+  --notice-border: #aceebb;
+  --notice-text: #116329;
+}
+
+[data-theme="dark"] {
+  --bg: #0d1117;
+  --panel: #161b22;
+  --text: #e6edf3;
+  --muted: #8b949e;
+  --border: #30363d;
+  --accent: #388bfd;
+  --accent-text: #ffffff;
+  --error-bg: #3d1418;
+  --error-border: #6e2b30;
+  --error-text: #ff9a9a;
+  --notice-bg: #12261a;
+  --notice-border: #2b5c3a;
+  --notice-text: #8ee6a8;
 }
 
 * {
   box-sizing: border-box;
 }
 
+html,
 body {
   margin: 0;
-  padding: 2rem 1rem;
+  background: var(--bg);
+  color: var(--text);
 }
 
-.dashboard,
-.auth {
+body {
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  line-height: 1.6;
+}
+
+.shell {
+  min-height: 100vh;
+}
+
+.shell .appbar {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  padding: 0.6rem 1.5rem;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  color: var(--text);
+  text-decoration: none;
+}
+
+.brand img {
+  height: 2rem;
+  width: auto;
+}
+
+.brand-mark {
+  width: 2rem;
+  height: 2rem;
+  border-radius: 8px;
+  display: grid;
+  place-items: center;
+  background: var(--accent);
+  color: var(--accent-text);
+  font-weight: 700;
+  font-size: 0.9rem;
+}
+
+.appnav {
+  display: flex;
+  gap: 0.25rem;
+  flex: 1;
+  justify-content: center;
+}
+
+.appnav button {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  padding: 0.4rem 0.7rem;
+  border-radius: 6px;
+  font: inherit;
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+
+.appnav button:hover {
+  color: var(--text);
+  background: var(--bg);
+}
+
+.appnav button.active {
+  color: var(--text);
+  background: var(--bg);
+  font-weight: 600;
+}
+
+.appactions {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.theme-button {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  border-radius: 6px;
+  padding: 0.3rem 0.7rem;
+  font: inherit;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.avatar-wrap {
+  position: relative;
+}
+
+.avatar {
+  width: 2.1rem;
+  height: 2.1rem;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--accent);
+  color: var(--accent-text);
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.avatar-menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 0.4rem);
+  min-width: 10rem;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+  padding: 0.35rem;
+  display: flex;
+  flex-direction: column;
+}
+
+.avatar-menu button,
+.avatar-menu a {
+  text-align: left;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  padding: 0.45rem 0.6rem;
+  border-radius: 6px;
+  font: inherit;
+  font-size: 0.88rem;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.avatar-menu button:hover,
+.avatar-menu a:hover {
+  background: var(--bg);
+}
+
+.appmain {
   max-width: 60rem;
   margin: 0 auto;
-  background: #fff;
-  border: 1px solid #e1e4e8;
+  padding: 1.5rem 1.5rem 4rem;
+}
+
+.appmain section {
+  background: var(--panel);
+  border: 1px solid var(--border);
   border-radius: 10px;
   padding: 1.5rem;
 }
 
-.dashboard header {
-  display: flex;
-  align-items: center;
-  gap: 1rem;
-  border-bottom: 1px solid #e1e4e8;
-  padding-bottom: 1rem;
-}
-
-.dashboard header h1 {
-  flex: 1;
-  margin: 0;
-  font-size: 1.3rem;
-}
-
-section {
-  margin-top: 2rem;
-}
-
 section h2 {
   font-size: 1.1rem;
-  margin-bottom: 0.75rem;
+  margin: 0 0 1rem;
+}
+
+section h3 {
+  font-size: 0.95rem;
+  margin: 1.75rem 0 0.5rem;
 }
 
 label {
   display: block;
   margin-bottom: 0.75rem;
   font-size: 0.9rem;
+  color: var(--muted);
 }
 
 label input,
@@ -63,10 +221,11 @@ textarea {
   width: 100%;
   margin-top: 0.25rem;
   padding: 0.5rem;
-  border: 1px solid #d0d7de;
+  border: 1px solid var(--border);
   border-radius: 6px;
   font: inherit;
-  background: #fff;
+  color: var(--text);
+  background: var(--panel);
 }
 
 textarea {
@@ -74,10 +233,17 @@ textarea {
   font-size: 0.85rem;
 }
 
+input:disabled {
+  color: var(--muted);
+  background: var(--bg);
+}
+
 .checkbox {
   display: flex;
   align-items: center;
   gap: 0.5rem;
+  color: var(--text);
+  margin-bottom: 0;
 }
 
 .checkbox input {
@@ -87,18 +253,19 @@ textarea {
 
 button {
   padding: 0.45rem 0.9rem;
-  border: 1px solid #d0d7de;
+  border: 1px solid var(--border);
   border-radius: 6px;
-  background: #f6f8fa;
+  background: var(--panel);
+  color: var(--text);
   font: inherit;
   cursor: pointer;
 }
 
 button[type="submit"],
 button.active {
-  background: #1f6feb;
-  border-color: #1f6feb;
-  color: #fff;
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-text);
 }
 
 button:disabled {
@@ -106,40 +273,37 @@ button:disabled {
   cursor: not-allowed;
 }
 
-.inline {
+.row {
   display: flex;
   gap: 1rem;
-  align-items: flex-end;
   flex-wrap: wrap;
-  margin-bottom: 1rem;
 }
 
-.inline label {
-  margin-bottom: 0;
+.row > label {
+  flex: 1;
+  min-width: 12rem;
 }
 
-.tabs {
-  display: flex;
-  gap: 0.5rem;
-  margin-bottom: 1rem;
+.row.align {
+  align-items: flex-end;
 }
 
-.tabs.small button {
-  padding: 0.3rem 0.7rem;
-  font-size: 0.85rem;
+.row.align > button {
+  margin-bottom: 0.75rem;
 }
 
 table {
   width: 100%;
   border-collapse: collapse;
   font-size: 0.9rem;
+  margin-top: 1rem;
 }
 
 th,
 td {
   text-align: left;
   padding: 0.45rem 0.5rem;
-  border-bottom: 1px solid #e1e4e8;
+  border-bottom: 1px solid var(--border);
 }
 
 td button {
@@ -156,22 +320,57 @@ td button {
 }
 
 .error {
-  color: #cf222e;
-  background: #ffebe9;
-  border: 1px solid #ffcecb;
+  color: var(--error-text);
+  background: var(--error-bg);
+  border: 1px solid var(--error-border);
   border-radius: 6px;
   padding: 0.5rem 0.75rem;
 }
 
 .notice {
-  color: #116329;
-  background: #dafbe1;
-  border: 1px solid #aceebb;
+  color: var(--notice-text);
+  background: var(--notice-bg);
+  border: 1px solid var(--notice-border);
   border-radius: 6px;
   padding: 0.5rem 0.75rem;
 }
 
 .hint {
-  color: #656d76;
+  color: var(--muted);
   font-size: 0.85rem;
+}
+
+.auth {
+  max-width: 26rem;
+  margin: 4rem auto;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1.75rem;
+}
+
+.auth h1 {
+  font-size: 1.4rem;
+  margin: 0 0 1rem;
+}
+
+.tabs {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+.tabs button {
+  flex: 1;
+}
+
+.tabs.small button {
+  padding: 0.3rem 0.7rem;
+  font-size: 0.85rem;
+}
+
+.tabs button.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-text);
 }

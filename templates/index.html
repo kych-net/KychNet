@@ -1,12 +1,15 @@
 {% extends "layout.html" %}
-{% block title %}KychNet{% endblock %}
+
+{% block title %}{{ site.site_name }}{% endblock %}
+
 {% block content %}
-<h1>KychNet</h1>
-<ul>
+<h1 class="page-title">{{ site.site_name }}</h1>
+<ul class="post-list">
   {% for post in posts %}
-  <li><a href="{{ post.href }}">{{ post.title }}</a></li>
-  {% else %}
-  <li>暂无内容</li>
+  <li>
+    <a href="{{ post.href }}">{{ post.title }}</a>
+    <time>{{ post.date }}</time>
+  </li>
   {% endfor %}
 </ul>
 {% endblock %}

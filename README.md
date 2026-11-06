@@ -25,6 +25,13 @@
 
 三种格式均不做内容限制.内容作者均为邀请注册的可信用户,因此允许存储型 XSS 是预期内的取舍;通过子域隔离降低影响面(内容站 `www`、管理端 `admin`、API `api`,Cookie 仅作用于 `admin` 与 `api`).
 
+## 界面
+
+- 内容端顶栏:左侧站点图标,中间为可编辑导航链接(管理端「站点设置」维护),右侧为主题切换与管理端入口.
+- 管理端顶栏:左侧站点图标,中间为功能导航(内容/邀请码/用户/站点设置),右侧为头像菜单(用户设置/网站管理/前往内容端)与主题切换.
+- 两端共用浅色、深色两套主题,基于 CSS 变量实现,选择持久化在 localStorage.
+
+
 ## 技术栈
 
 | 层 | 选型 |
@@ -67,7 +74,8 @@ kychnet invite create --uses 1 --expires 7d
 kychnet invite list
 kychnet invite revoke <code>
 
-kychnet user create
+kychnet user create --admin          # 创建管理员并输出 TOTP 密钥
+kychnet user create                  # 创建普通成员
 kychnet user list
 kychnet user disable <user>
 kychnet passkey reset <user>
@@ -75,8 +83,10 @@ kychnet passkey reset <user>
 
 ## 注册与登录
 
-- 注册必须持有有效邀请码.邀请码可由 CLI 或管理前端生成,支持设置使用次数与有效期.
+- 注册必须持有有效邀请码.邀请码可由 CLI 或管理员在管理前端生成,支持设置使用次数与有效期.
 - 邀请码由 CSPRNG 生成、Base32 编码,长度不少于 16 字符(约 80 bit 熵).
+- 注册用户默认为普通成员;管理员通过 `kychnet user create --admin` 创建.
+- 普通成员可管理内容与个人设置;邀请码、用户管理、站点设置仅管理员可见.
 - 登录支持通行密钥(Passkey)与 TOTP 动态验证码,用户注册后可绑定任一或全部.
 - 会话存放于 HttpOnly + Secure + SameSite Cookie,不落地到前端存储.
 
@@ -105,6 +115,7 @@ cd admin && pnpm install && pnpm dev
 ## 约定
 
 - 内容以数据库为唯一事实源,构建直接读库,不调用线上 API.
+- 站点名称、图标与顶栏导航存于 `site_settings`,由管理端编辑,构建时读取.
 - 模板与 API 共用同一套领域模型,避免两端口径漂移.
 - Typst 编译在断网容器内执行,并用 `--root` 限定输入目录,避免内容作者访问构建机文件系统.
 - Typst 产物按内容哈希缓存,避免每次构建全量重编译.

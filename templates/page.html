@@ -1,12 +1,16 @@
 {% extends "layout.html" %}
-{% block title %}{{ title }}{% endblock %}
+
+{% block title %}{{ title }} · {{ site.site_name }}{% endblock %}
+
 {% block content %}
-<article>
+<article class="post">
   <h1>{{ title }}</h1>
-  {{ content|safe }}
-  {% if !pdf_url.is_empty() %}
-  <p><a href="{{ pdf_url }}">下载 PDF</a></p>
-  {% endif %}
-  <p><a href="/">返回首页</a></p>
+  <div class="post-meta">
+    <time>{{ date }}</time>
+    {% if !pdf_url.is_empty() %}
+    <a href="{{ pdf_url }}">下载 PDF</a>
+    {% endif %}
+  </div>
+  <div class="content">{{ content|safe }}</div>
 </article>
 {% endblock %}

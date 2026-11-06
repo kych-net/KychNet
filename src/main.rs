@@ -78,6 +78,9 @@ enum UserCommand {
         username: String,
         #[arg(long)]
         display: Option<String>,
+        /// 授予管理员权限
+        #[arg(long)]
+        admin: bool,
     },
     List,
     Disable {
@@ -146,9 +149,13 @@ async fn main() -> Result<()> {
         Command::User { command } => {
             let pool = db::connect(&cfg.database_url).await?;
             match command {
-                UserCommand::Create { username, display } => {
+                UserCommand::Create {
+                    username,
+                    display,
+                    admin,
+                } => {
                     let display = display.unwrap_or_else(|| username.clone());
-                    let user = service::create_user(&pool, &username, &display).await?;
+                    let user = service::create_user(&pool, &username, &display, admin).await?;
                     let (url, secret) =
                         auth::provision_totp(&pool, user.id, &user.username).await?;
                     println!("{}", serde_json::to_string_pretty(&user)?);
