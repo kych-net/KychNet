@@ -17,11 +17,18 @@ pub fn parse_expiry(spec: &str) -> Result<Option<DateTime<Utc>>> {
     if spec == "never" || spec.is_empty() {
         return Ok(None);
     }
-    let (num, unit) = spec.split_at(spec.len().saturating_sub(1));
-    let value: i64 = num.parse().context("有效期格式应为 7d / 24h")?;
+    // 按 char 取末位而不是按字节 split_at：多字节字符（如 `7天`）结尾时
+    // 字节切分会因不在 char 边界直接 panic。
+    let mut chars = spec.chars();
+    let unit = chars.next_back().context("有效期不能为空")?;
+    let value: i64 = chars
+        .as_str()
+        .trim()
+        .parse()
+        .context("有效期格式应为 7d / 24h")?;
     let duration = match unit {
-        "d" => Duration::days(value),
-        "h" => Duration::hours(value),
+        'd' => Duration::days(value),
+        'h' => Duration::hours(value),
         _ => bail!("有效期单位只支持 d 或 h"),
     };
     Ok(Some(Utc::now() + duration))
@@ -405,7 +412,22 @@ pub async fn upsert_content(
 
 #[cfg(test)]
 mod tests {
-    use super::valid_slug;
+    use super::{parse_expiry, valid_slug};
+
+    #[test]
+    fn parses_expiry_specs() {
+        assert!(parse_expiry("7d").is_ok());
+        assert!(parse_expiry("24h").is_ok());
+        assert!(parse_expiry("never").unwrap().is_none());
+        assert!(parse_expiry("").unwrap().is_none());
+    }
+
+    #[test]
+    fn rejects_multibyte_unit_without_panicking() {
+        // 旧实现按字节切，`7天` 会因不在 char 边界直接 panic。
+        assert!(parse_expiry("7天").is_err());
+        assert!(parse_expiry("天").is_err());
+    }
 
     #[test]
     fn allows_unicode_letters_and_digits() {
