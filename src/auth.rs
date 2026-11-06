@@ -1,5 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{Duration, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -9,6 +10,28 @@ use uuid::Uuid;
 use webauthn_rs::prelude::*;
 
 use crate::models::{PasskeyRow, User};
+use crate::service;
+
+/// 一次没走完的用户注册：用户还不存在，资料暂存在认证流程里。
+///
+/// `code` 只在校验凭证成功后才拿去占用邀请码，所以中途放弃不消耗名额。
+#[derive(Serialize, Deserialize)]
+struct PendingRegistration {
+    user_id: Uuid,
+    username: String,
+    display_name: String,
+    code: String,
+    registration: Value,
+}
+
+/// webauthn-rs 的 credential ID 是字节数组，库里按小写十六进制文本存。
+fn hex_cred_id(passkey: &Passkey) -> String {
+    passkey
+        .cred_id()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
+}
 
 pub struct Auth {
     pub webauthn: Arc<Webauthn>,
@@ -31,7 +54,7 @@ impl Auth {
     async fn save_flow(
         &self,
         pool: &PgPool,
-        user_id: Uuid,
+        user_id: Option<Uuid>,
         kind: &str,
         state: Value,
     ) -> Result<Uuid> {
@@ -50,12 +73,17 @@ impl Auth {
         Ok(id)
     }
 
-    async fn take_flow(&self, pool: &PgPool, id: Uuid, expected: &str) -> Result<(Uuid, Value)> {
+    async fn take_flow(
+        &self,
+        pool: &PgPool,
+        id: Uuid,
+        expected: &str,
+    ) -> Result<(Option<Uuid>, Value)> {
         // 先在同一事务里加锁读取并校验，通过后再删除。
         // 旧实现是「DELETE ... RETURNING」先消费再校验：只要攻击者拿到 flow_id
         // 并用错误的 kind / 过期流程去请求，就能把别人的认证流程消耗掉（拒绝服务）。
         let mut tx = pool.begin().await?;
-        let row = sqlx::query_as::<_, (String, Uuid, Value, chrono::DateTime<Utc>)>(
+        let row = sqlx::query_as::<_, (String, Option<Uuid>, Value, chrono::DateTime<Utc>)>(
             "SELECT kind, user_id, state, expires_at FROM auth_flows WHERE id = $1 FOR UPDATE",
         )
         .bind(id)
@@ -81,9 +109,9 @@ impl Auth {
 
     /// 生成一份 Passkey 注册挑战（纯内存，不访问数据库）。
     ///
-    /// 新用户没有任何已注册凭证，所以 exclude 传空。返回的 state 交给调用方
-    /// 与「占用邀请码 + 创建用户」放进同一事务落库，保证注册流程原子。
-    /// 注意 `user.id` 必须与实际落库的用户 ID 一致，它是 WebAuthn 的 user handle。
+    /// 新用户没有任何已注册凭证，所以 exclude 传空。返回的 state 交给
+    /// `start_pending_registration` 暂存，等浏览器真正把凭证做出来才建用户。
+    /// 注意 `user.id` 必须与最终落库的用户 ID 一致，它是 WebAuthn 的 user handle。
     pub fn create_registration_challenge(
         &self,
         user: &User,
@@ -93,6 +121,61 @@ impl Auth {
             .start_passkey_registration(user.id, &user.username, &user.display_name, None)
             .map_err(|e| anyhow!("无法开始 Passkey 注册: {e}"))?;
         Ok((options, serde_json::to_value(state)?))
+    }
+
+    /// 为「还没落库的新用户」保存注册流程。
+    ///
+    /// 用户资料与邀请码一起塞进 flow 的 state 里，`auth_flows.user_id` 留空：
+    /// 这样浏览器放弃认证（关掉弹窗、超时、换设备）时数据库里什么都不剩，
+    /// 邀请码也不会被一次没走完的仪式消耗掉。
+    pub async fn start_pending_registration(
+        &self,
+        pool: &PgPool,
+        user: &User,
+        code: &str,
+        registration: Value,
+    ) -> Result<Uuid> {
+        let pending = PendingRegistration {
+            user_id: user.id,
+            username: user.username.clone(),
+            display_name: user.display_name.clone(),
+            code: code.to_owned(),
+            registration,
+        };
+        self.save_flow(pool, None, "register", serde_json::to_value(pending)?)
+            .await
+    }
+
+    /// 走完新用户的注册：先验证凭证，再在一个事务里占用邀请码、建用户、存凭证。
+    ///
+    /// 顺序很重要——凭证校验是纯内存的，放在前面才能保证「失败的仪式不烧码」。
+    pub async fn finish_pending_registration(
+        &self,
+        pool: &PgPool,
+        flow_id: Uuid,
+        credential: &RegisterPublicKeyCredential,
+    ) -> Result<User> {
+        let (user_id, state) = self.take_flow(pool, flow_id, "register").await?;
+        if user_id.is_some() {
+            bail!("这是已有用户的通行密钥绑定流程，请改用绑定接口");
+        }
+        let pending: PendingRegistration = serde_json::from_value(state)?;
+        let registration: PasskeyRegistration = serde_json::from_value(pending.registration)?;
+        let passkey = self
+            .webauthn
+            .finish_passkey_registration(credential, &registration)
+            .map_err(|e| anyhow!("Passkey 注册校验失败: {e}"))?;
+
+        service::complete_registration(
+            pool,
+            pending.user_id,
+            &pending.code,
+            &pending.username,
+            &pending.display_name,
+            &hex_cred_id(&passkey),
+            &serde_json::to_value(&passkey)?,
+        )
+        .await
     }
 
     pub async fn start_registration(
@@ -111,7 +194,7 @@ impl Auth {
             .start_passkey_registration(user.id, &user.username, &user.display_name, exclude)
             .map_err(|e| anyhow!("无法开始 Passkey 注册: {e}"))?;
         let flow_id = self
-            .save_flow(pool, user.id, "register", serde_json::to_value(state)?)
+            .save_flow(pool, Some(user.id), "register", serde_json::to_value(state)?)
             .await?;
         Ok((options, flow_id))
     }
@@ -123,17 +206,15 @@ impl Auth {
         credential: &RegisterPublicKeyCredential,
     ) -> Result<Uuid> {
         let (user_id, state) = self.take_flow(pool, flow_id, "register").await?;
+        // 已登录用户加通行密钥：流程必须绑着具体用户，否则会走到注册那条路。
+        let user_id = user_id.context("认证流程缺少用户，请重新发起绑定")?;
         let state: PasskeyRegistration = serde_json::from_value(state)?;
         let passkey = self
             .webauthn
             .finish_passkey_registration(credential, &state)
             .map_err(|e| anyhow!("Passkey 注册校验失败: {e}"))?;
 
-        let credential_id = passkey
-            .cred_id()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>();
+        let credential_id = hex_cred_id(&passkey);
         sqlx::query(
             "INSERT INTO passkey_credentials (id, user_id, credential_id, passkey)
              VALUES ($1, $2, $3, $4)",
@@ -161,7 +242,7 @@ impl Auth {
             .start_passkey_authentication(&passkeys)
             .map_err(|e| anyhow!("无法开始 Passkey 登录: {e}"))?;
         let flow_id = self
-            .save_flow(pool, user.id, "login", serde_json::to_value(state)?)
+            .save_flow(pool, Some(user.id), "login", serde_json::to_value(state)?)
             .await?;
         Ok((options, flow_id))
     }
@@ -173,6 +254,7 @@ impl Auth {
         credential: &PublicKeyCredential,
     ) -> Result<Uuid> {
         let (user_id, state) = self.take_flow(pool, flow_id, "login").await?;
+        let user_id = user_id.context("登录流程缺少用户")?;
         let state: PasskeyAuthentication = serde_json::from_value(state)?;
         let result = self
             .webauthn
