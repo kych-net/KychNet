@@ -17,11 +17,18 @@ pub fn parse_expiry(spec: &str) -> Result<Option<DateTime<Utc>>> {
     if spec == "never" || spec.is_empty() {
         return Ok(None);
     }
-    let (num, unit) = spec.split_at(spec.len().saturating_sub(1));
-    let value: i64 = num.parse().context("有效期格式应为 7d / 24h")?;
+    // 按 char 取末位而不是按字节 split_at：多字节字符（如 `7天`）结尾时
+    // 字节切分会因不在 char 边界直接 panic。
+    let mut chars = spec.chars();
+    let unit = chars.next_back().context("有效期不能为空")?;
+    let value: i64 = chars
+        .as_str()
+        .trim()
+        .parse()
+        .context("有效期格式应为 7d / 24h")?;
     let duration = match unit {
-        "d" => Duration::days(value),
-        "h" => Duration::hours(value),
+        'd' => Duration::days(value),
+        'h' => Duration::hours(value),
         _ => bail!("有效期单位只支持 d 或 h"),
     };
     Ok(Some(Utc::now() + duration))
@@ -128,7 +135,6 @@ pub async fn complete_registration(
     user_id: Uuid,
     code: &str,
     username: &str,
-    display_name: &str,
     credential_id: &str,
     passkey: &serde_json::Value,
 ) -> Result<User> {
@@ -142,12 +148,11 @@ pub async fn complete_registration(
     check_invite(&invite)?;
 
     let user = match sqlx::query_as::<_, User>(
-        "INSERT INTO users (id, username, display_name, is_admin)
-         VALUES ($1, $2, $3, FALSE) RETURNING *",
+        "INSERT INTO users (id, username, is_admin)
+         VALUES ($1, $2, FALSE) RETURNING *",
     )
     .bind(user_id)
     .bind(username)
-    .bind(display_name)
     .fetch_one(&mut *tx)
     .await
     {
@@ -179,31 +184,14 @@ pub async fn complete_registration(
     Ok(user)
 }
 
-pub async fn create_user(
-    pool: &PgPool,
-    username: &str,
-    display_name: &str,
-    is_admin: bool,
-) -> Result<User> {
+pub async fn create_user(pool: &PgPool, username: &str, is_admin: bool) -> Result<User> {
     let user = sqlx::query_as::<_, User>(
-        "INSERT INTO users (id, username, display_name, is_admin)
-         VALUES ($1, $2, $3, $4) RETURNING *",
+        "INSERT INTO users (id, username, is_admin)
+         VALUES ($1, $2, $3) RETURNING *",
     )
     .bind(Uuid::new_v4())
     .bind(username)
-    .bind(display_name)
     .bind(is_admin)
-    .fetch_one(pool)
-    .await?;
-    Ok(user)
-}
-
-pub async fn update_display_name(pool: &PgPool, id: Uuid, display_name: &str) -> Result<User> {
-    let user = sqlx::query_as::<_, User>(
-        "UPDATE users SET display_name = $2 WHERE id = $1 RETURNING *",
-    )
-    .bind(id)
-    .bind(display_name)
     .fetch_one(pool)
     .await?;
     Ok(user)
@@ -405,7 +393,22 @@ pub async fn upsert_content(
 
 #[cfg(test)]
 mod tests {
-    use super::valid_slug;
+    use super::{parse_expiry, valid_slug};
+
+    #[test]
+    fn parses_expiry_specs() {
+        assert!(parse_expiry("7d").is_ok());
+        assert!(parse_expiry("24h").is_ok());
+        assert!(parse_expiry("never").unwrap().is_none());
+        assert!(parse_expiry("").unwrap().is_none());
+    }
+
+    #[test]
+    fn rejects_multibyte_unit_without_panicking() {
+        // 旧实现按字节切，`7天` 会因不在 char 边界直接 panic。
+        assert!(parse_expiry("7天").is_err());
+        assert!(parse_expiry("天").is_err());
+    }
 
     #[test]
     fn allows_unicode_letters_and_digits() {
