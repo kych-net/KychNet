@@ -21,7 +21,7 @@
 | --- | --- |
 | markdown | pulldown-cmark,保留 raw HTML 透传 |
 | html | 原样注入模板,不做转义与过滤 |
-| typst | typst 编译为 HTML |
+| typst | typst 编译为 HTML,并同时输出 PDF 供下载 |
 
 三种格式均不做内容限制.内容作者均为邀请注册的可信用户,因此允许存储型 XSS 是预期内的取舍;通过子域隔离降低影响面(内容站 `www`、管理端 `admin`、API `api`,Cookie 仅作用于 `admin` 与 `api`).
 
@@ -33,12 +33,12 @@
 | 静态生成 | Askama 模板 + `build` 子命令 |
 | 内容渲染 | pulldown-cmark / typst |
 | 数据库 | PostgreSQL + SQLx |
-| 认证 | webauthn-rs(Passkey) + totp-rs(TOTP) + qrcode |
+| 认证 | webauthn-rs(Passkey) + totp-rs(TOTP) |
 | 会话 | tower-sessions + HttpOnly/Secure/SameSite Cookie |
 | 命令行 | clap |
 | 管理前端 | React + TypeScript + Vite |
-| 数据与表单 | TanStack Query + React Hook Form + Zod |
-| 样式 | Tailwind CSS + shadcn/ui |
+| 数据与表单 | 原生 fetch + React state |
+| 样式 | 原生 CSS |
 | 部署 | Cloudflare Pages + EdgeOne Pages |
 
 ## 目录结构
@@ -55,8 +55,6 @@
 │   └── db/              # SQLx 查询与迁移
 └── admin/               # 管理前端(独立工程)
 ```
-
-当前仓库尚未包含实现代码,以上为规划结构.
 
 ## 命令行
 
@@ -86,7 +84,7 @@ kychnet passkey reset <user>
 
 ```bash
 # 后端
-cp .env.example .env        # DATABASE_URL / SESSION_SECRET / WEBAUTHN_RP_ID / WEBAUTHN_ORIGIN
+cp .env.example .env        # DATABASE_URL / ADMIN_ORIGIN / WEBAUTHN_RP_ID / WEBAUTHN_ORIGIN
 cargo run -- db migrate
 cargo run -- serve
 
@@ -99,7 +97,7 @@ cd admin && pnpm install && pnpm dev
 
 ## 构建与部署
 
-1. CI 执行 `kychnet build --out dist`,生成静态产物.
+1. CI 执行 `kychnet build --out dist`,生成静态产物;Typst 页面同时产出 `.pdf`.
 2. `dist/` 同时发布到 Cloudflare Pages 与 EdgeOne Pages.
 3. 管理前端构建为静态产物,单独发布.
 4. 媒体资源放在单一对象存储源,由两家 CDN 回源同一份.
