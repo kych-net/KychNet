@@ -48,7 +48,9 @@ export function ProfileView({ user, avatarVersion, onUserChange, onAvatarChange 
     setError("");
     try {
       const started = await api.passkeySetup();
-      const credential = await startRegistration({ optionsJSON: started.options });
+      // webauthn-rs 返回 { publicKey: {...} }，SimpleWebAuthn 需要里面的 publicKey 对象
+      const options = started.options.publicKey ?? started.options;
+      const credential = await startRegistration({ optionsJSON: options });
       await api.passkeySetupFinish(started.flow_id, credential);
       setNotice("通行密钥已绑定");
     } catch (e) {
