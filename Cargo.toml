@@ -28,7 +28,8 @@ time = "0.3"
 tokio = { version = "1", features = ["full"] }
 totp-rs = { version = "5", features = ["gen_secret", "otpauth"] }
 tower-http = { version = "0.6", features = ["trace", "cors", "compression-gzip"] }
-tower-sessions = "0.14"
+tower-sessions = { version = "0.14", default-features = false, features = ["axum-core"] }
+tower-sessions-sqlx-store = { version = "0.15", default-features = false, features = ["postgres"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 typst = "0.13"
