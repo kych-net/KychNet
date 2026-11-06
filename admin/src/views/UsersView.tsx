@@ -34,7 +34,6 @@ export function UsersView() {
         <thead>
           <tr>
             <th>用户名</th>
-            <th>显示名称</th>
             <th>角色</th>
             <th>状态</th>
             <th />
@@ -44,7 +43,6 @@ export function UsersView() {
           {items.map((item) => (
             <tr key={item.id}>
               <td>{item.username}</td>
-              <td>{item.display_name}</td>
               <td>{item.is_admin ? "管理员" : "成员"}</td>
               <td>{item.disabled ? "已禁用" : "正常"}</td>
               <td>

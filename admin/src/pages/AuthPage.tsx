@@ -10,7 +10,6 @@ export function AuthPage({ onLogin }: Props) {
   const [mode, setMode] = useState<"login" | "register">("login");
   const [method, setMethod] = useState<"passkey" | "totp">("passkey");
   const [username, setUsername] = useState("");
-  const [displayName, setDisplayName] = useState("");
   const [code, setCode] = useState("");
   const [invite, setInvite] = useState("");
   const [busy, setBusy] = useState(false);
@@ -40,7 +39,7 @@ export function AuthPage({ onLogin }: Props) {
     setError("");
     setBusy(true);
     try {
-      const started = await api.register(invite, username, displayName || username);
+      const started = await api.register(invite, username);
       const credential = await startRegistration({ optionsJSON: started.options });
       onLogin(await api.finishRegister(started.flow_id, credential));
     } catch (e) {
@@ -111,13 +110,10 @@ export function AuthPage({ onLogin }: Props) {
             <input
               value={username}
               onChange={(e) => setUsername(e.target.value)}
-              pattern="[A-Za-z0-9_-]{3,32}"
+              minLength={3}
+              maxLength={32}
               required
             />
-          </label>
-          <label>
-            显示名称
-            <input value={displayName} onChange={(e) => setDisplayName(e.target.value)} />
           </label>
           <p className="hint">注册后将立即创建通行密钥。</p>
           <button type="submit" disabled={busy}>
