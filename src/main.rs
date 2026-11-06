@@ -78,8 +78,6 @@ enum InviteCommand {
 enum UserCommand {
     Create {
         username: String,
-        #[arg(long)]
-        display: Option<String>,
         /// 授予管理员权限
         #[arg(long)]
         admin: bool,
@@ -151,13 +149,8 @@ async fn main() -> Result<()> {
         Command::User { command } => {
             let pool = db::connect(&cfg.database_url).await?;
             match command {
-                UserCommand::Create {
-                    username,
-                    display,
-                    admin,
-                } => {
-                    let display = display.unwrap_or_else(|| username.clone());
-                    let user = service::create_user(&pool, &username, &display, admin).await?;
+                UserCommand::Create { username, admin } => {
+                    let user = service::create_user(&pool, &username, admin).await?;
                     let (url, secret) =
                         auth::provision_totp(&pool, user.id, &user.username).await?;
                     println!("{}", serde_json::to_string_pretty(&user)?);
@@ -167,10 +160,7 @@ async fn main() -> Result<()> {
                 }
                 UserCommand::List => {
                     for user in service::list_users(&pool).await? {
-                        println!(
-                            "{}\t{}\t{}\t{}",
-                            user.id, user.username, user.display_name, user.disabled
-                        );
+                        println!("{}\t{}\t{}", user.id, user.username, user.disabled);
                     }
                     Ok(())
                 }

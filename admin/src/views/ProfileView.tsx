@@ -10,7 +10,6 @@ type Props = {
 };
 
 export function ProfileView({ user, avatarVersion, onUserChange, onAvatarChange }: Props) {
-  const [displayName, setDisplayName] = useState(user.display_name);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
 
@@ -21,19 +20,7 @@ export function ProfileView({ user, avatarVersion, onUserChange, onAvatarChange 
   const [totpUrl, setTotpUrl] = useState("");
   const [totpCode, setTotpCode] = useState("");
 
-  const initial = (user.display_name || user.username).slice(0, 1).toUpperCase();
-
-  async function saveProfile(event: React.FormEvent) {
-    event.preventDefault();
-    setError("");
-    try {
-      const updated = await api.updateProfile(displayName);
-      onUserChange(updated);
-      setNotice("用户设置已保存");
-    } catch (e) {
-      setError((e as Error).message);
-    }
-  }
+  const initial = user.username.slice(0, 1).toUpperCase();
 
   async function uploadAvatar(event: React.ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
@@ -127,17 +114,10 @@ export function ProfileView({ user, avatarVersion, onUserChange, onAvatarChange 
         </div>
       </div>
 
-      <form onSubmit={saveProfile}>
-        <label>
-          用户名
-          <input value={user.username} disabled />
-        </label>
-        <label>
-          显示名称
-          <input value={displayName} onChange={(e) => setDisplayName(e.target.value)} required />
-        </label>
-        <button type="submit">保存</button>
-      </form>
+      <label>
+        用户名
+        <input value={user.username} disabled />
+      </label>
 
       <h3>通行密钥</h3>
       <button onClick={bindPasskey}>绑定新通行密钥</button>

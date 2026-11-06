@@ -2,7 +2,6 @@
 CREATE TABLE IF NOT EXISTS users (
     id UUID PRIMARY KEY,
     username TEXT NOT NULL UNIQUE,
-    display_name TEXT NOT NULL,
     disabled BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );

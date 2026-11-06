@@ -6,8 +6,8 @@
 //! 中文命令按中文语序书写，并且**连写、不加空格**：
 //!
 //!   创建邀请码可用三次有效期七天
-//!   创建管理员alice
-//!   重置alice的通行密钥
+//!   创建用户爱丽丝设为管理员
+//!   重置爱丽丝的通行密钥
 //!
 //! 中文不像英文靠空格分词，因此解析时先去掉所有空白，再按中文短语切出命令名、
 //! 数量、时长、所属与位置参数。解析结果直接交给同一个 `kychnet` 执行，与英文 CLI
@@ -120,8 +120,8 @@ const CMDS: &[Cmd] = &[
         aliases: &["新建用户", "添加用户"],
         en: "user create",
         group: "用户",
-        usage: "创建用户<用户名>名为<显示名>设为管理员",
-        desc: "创建用户并输出 TOTP 密钥",
+        usage: "创建用户<用户名>设为管理员",
+        desc: "创建用户并输出 TOTP 密钥（用户名支持中文）",
     },
     Cmd {
         kind: Kind::UserCreateAdmin,
@@ -242,9 +242,6 @@ fn keys_for(k: Kind) -> &'static [&'static str] {
         Kind::Build => &["输出到", "保存到", "到"],
         Kind::InviteCreate => &["可用", "有效期"],
         Kind::UserCreate | Kind::UserCreateAdmin => &[
-            "名为",
-            "叫作",
-            "显示名",
             "设为管理员",
             "并设为管理员",
             "作为管理员",
@@ -299,7 +296,6 @@ fn parse_cn(cmd: &'static Cmd, rest: &str) -> Result<Vec<String>, String> {
     let mut uses = "1".to_string();
     let mut expires = "7d".to_string();
     let mut out = "dist".to_string();
-    let mut display: Option<String> = None;
     let mut admin = cmd.kind == Kind::UserCreateAdmin;
     let mut has_de = false;
 
@@ -329,17 +325,22 @@ fn parse_cn(cmd: &'static Cmd, rest: &str) -> Result<Vec<String>, String> {
                 }
                 out = value;
             }
-            "名为" | "叫作" | "显示名" => {
-                if value.is_empty() {
-                    return Err("「名为」后面缺少显示名。".into());
-                }
-                display = Some(value);
-            }
             "设为管理员" | "并设为管理员" | "作为管理员" | "授予管理员权限" => admin = true,
             "的通行密钥" | "的密钥" => has_de = true,
             _ => unreachable!(),
         }
         s = next;
+    }
+
+    if matches!(cmd.kind, Kind::UserCreate | Kind::UserCreateAdmin)
+        && ["名为", "叫作", "显示名"]
+            .iter()
+            .any(|k| positional.contains(k))
+    {
+        return Err(
+            "用户名直接用中文即可，不需要「名为」这类显示名。\n例如：创建用户爱丽丝设为管理员"
+                .into(),
+        );
     }
 
     match cmd.kind {
@@ -349,9 +350,6 @@ fn parse_cn(cmd: &'static Cmd, rest: &str) -> Result<Vec<String>, String> {
             options.push(format!("--expires={}", expires));
         }
         Kind::UserCreate | Kind::UserCreateAdmin => {
-            if let Some(d) = display {
-                options.push(format!("--display={}", d));
-            }
             if admin {
                 options.push("--admin".into());
             }
@@ -528,9 +526,9 @@ fn print_help() {
     println!("    {} 生成静态站到public", NAME);
     println!("    {} 创建邀请码可用三次有效期七天", NAME);
     println!("    {} 作废邀请码ABCD1234", NAME);
-    println!("    {} 创建管理员alice", NAME);
-    println!("    {} 创建用户alice名为爱丽丝设为管理员", NAME);
-    println!("    {} 重置alice的通行密钥", NAME);
+    println!("    {} 创建用户爱丽丝设为管理员", NAME);
+    println!("    {} 创建管理员爱丽丝", NAME);
+    println!("    {} 重置爱丽丝的通行密钥", NAME);
     println!("\n  {}", title("中文别名（服务器环境变量）"));
     println!("    二进制名固定为 {}；在服务器的 shell 环境文件里设置别名即可：", NAME);
     println!("      /etc/profile.d/kychnet-alias.sh → alias 跨越晨昏='{}'", NAME);
@@ -688,11 +686,11 @@ mod tests {
     fn 用户命令与定语前置() {
         assert_eq!(ok(&["创建管理员alice"]), words(&["user", "create", "alice", "--admin"]));
         assert_eq!(ok(&["创建用户alice设为管理员"]), words(&["user", "create", "alice", "--admin"]));
-        assert_eq!(
-            ok(&["创建用户alice名为爱丽丝设为管理员"]),
-            words(&["user", "create", "alice", "--display=爱丽丝", "--admin"])
-        );
+        assert_eq!(ok(&["创建用户爱丽丝设为管理员"]), words(&["user", "create", "爱丽丝", "--admin"]));
+        assert_eq!(ok(&["创建管理员爱丽丝"]), words(&["user", "create", "爱丽丝", "--admin"]));
+        assert!(argv(&["创建用户alice名为爱丽丝"]).unwrap_err().contains("不需要"));
         assert_eq!(ok(&["创建用户alice"]), words(&["user", "create", "alice"]));
+        assert_eq!(ok(&["创建用户爱丽丝"]), words(&["user", "create", "爱丽丝"]));
         assert_eq!(ok(&["列出用户"]), words(&["user", "list"]));
         assert_eq!(ok(&["停用用户alice"]), words(&["user", "disable", "alice"]));
         assert_eq!(ok(&["启用用户alice"]), words(&["user", "enable", "alice"]));

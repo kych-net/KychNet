@@ -19,7 +19,6 @@ use crate::service;
 struct PendingRegistration {
     user_id: Uuid,
     username: String,
-    display_name: String,
     code: String,
     registration: Value,
 }
@@ -118,7 +117,7 @@ impl Auth {
     ) -> Result<(CreationChallengeResponse, Value)> {
         let (options, state) = self
             .webauthn
-            .start_passkey_registration(user.id, &user.username, &user.display_name, None)
+            .start_passkey_registration(user.id, &user.username, &user.username, None)
             .map_err(|e| anyhow!("无法开始 Passkey 注册: {e}"))?;
         Ok((options, serde_json::to_value(state)?))
     }
@@ -138,7 +137,6 @@ impl Auth {
         let pending = PendingRegistration {
             user_id: user.id,
             username: user.username.clone(),
-            display_name: user.display_name.clone(),
             code: code.to_owned(),
             registration,
         };
@@ -171,7 +169,6 @@ impl Auth {
             pending.user_id,
             &pending.code,
             &pending.username,
-            &pending.display_name,
             &hex_cred_id(&passkey),
             &serde_json::to_value(&passkey)?,
         )
@@ -191,7 +188,7 @@ impl Auth {
         };
         let (options, state) = self
             .webauthn
-            .start_passkey_registration(user.id, &user.username, &user.display_name, exclude)
+            .start_passkey_registration(user.id, &user.username, &user.username, exclude)
             .map_err(|e| anyhow!("无法开始 Passkey 注册: {e}"))?;
         let flow_id = self
             .save_flow(pool, Some(user.id), "register", serde_json::to_value(state)?)
