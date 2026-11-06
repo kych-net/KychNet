@@ -1,11 +1,22 @@
 import { useEffect, useState } from "react";
-import { api, User } from "./api";
+import { api, SiteSettings, User } from "./api";
 import { AuthPage } from "./pages/AuthPage";
-import { Dashboard } from "./pages/Dashboard";
+import { Shell } from "./components/Shell";
+import { applyTheme, readTheme, Theme } from "./theme";
+
+const defaultSite: SiteSettings = { site_name: "KychNet", logo_url: "", nav: [] };
 
 export function App() {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
+  const [siteUrl, setSiteUrl] = useState("https://www.kych.net");
+  const [site, setSite] = useState<SiteSettings>(defaultSite);
+  const [theme, setTheme] = useState<Theme>(() => readTheme());
+  const [avatarVersion, setAvatarVersion] = useState(0);
+
+  useEffect(() => {
+    applyTheme(theme);
+  }, [theme]);
 
   useEffect(() => {
     api
@@ -13,6 +24,13 @@ export function App() {
       .then(setUser)
       .catch(() => setUser(null))
       .finally(() => setLoading(false));
+    api
+      .getSettings()
+      .then((result) => {
+        setSiteUrl(result.site_url);
+        setSite(result.site);
+      })
+      .catch(() => undefined);
   }, []);
 
   if (loading) {
@@ -21,5 +39,17 @@ export function App() {
   if (!user) {
     return <AuthPage onLogin={setUser} />;
   }
-  return <Dashboard user={user} onLogout={() => setUser(null)} />;
+  return (
+    <Shell
+      user={user}
+      site={site}
+      siteUrl={siteUrl}
+      theme={theme}
+      avatarVersion={avatarVersion}
+      onThemeChange={setTheme}
+      onUserChange={setUser}
+      onAvatarChange={() => setAvatarVersion((value) => value + 1)}
+      onLogout={() => setUser(null)}
+    />
+  );
 }
