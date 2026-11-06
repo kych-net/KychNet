@@ -27,6 +27,46 @@ pub fn parse_expiry(spec: &str) -> Result<Option<DateTime<Utc>>> {
     Ok(Some(Utc::now() + duration))
 }
 
+/// 校验 slug 是否可作为静态页面的文件名与 URL 路径段。
+///
+/// 规则：**允许任意 Unicode 字母与数字**（中文、日文、西里尔字母等）外加 `-` 与 `_`，
+/// 除此之外一律视为特殊字符并拒绝。被拒绝的包括：路径分隔符 `/` `\`、点号 `.`
+/// （`.` / `..` 会造成路径穿越）、空白与控制字符、以及 URL 里有特殊含义的
+/// `?` `#` `%` `:` `&` `=` `<` `>` `|` `*` `"` 等。这样既能用中文 slug，
+/// 又保证 slug 拼进 `dist/posts/<slug>.html` 时不会越出目录或生成非法 URL。
+///
+/// 长度按 UTF-8 字节计，上限 180：中文一个字占 3 字节，拼上 `.html` / `.pdf`
+/// 后缀后仍落在常见文件系统 255 字节的文件名限制内。
+///
+/// 这条规则必须在「写入 API」与「构建」两处共用：如果只在构建时校验，
+/// 一条含 `/` 或 `..` 的脏数据就会让整站构建永久失败。
+///
+/// 注意：`char::is_alphanumeric()` 不接受组合音标（如 `e` + U+0301），
+/// 因此带变音符号的文字请使用 NFC 预组合形式（如 `é`）。
+pub fn valid_slug(slug: &str) -> bool {
+    !slug.is_empty()
+        && slug.len() <= 180
+        && slug
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+}
+
+/// 邀请码可用性校验，抽成纯函数供独立调用与注册事务共用。
+fn check_invite(invite: &Invite) -> Result<()> {
+    if invite.revoked_at.is_some() {
+        bail!("邀请码已作废");
+    }
+    if let Some(expires_at) = invite.expires_at {
+        if expires_at < Utc::now() {
+            bail!("邀请码已过期");
+        }
+    }
+    if invite.used_count >= invite.max_uses {
+        bail!("邀请码已用尽");
+    }
+    Ok(())
+}
+
 pub async fn create_invite(
     pool: &PgPool,
     created_by: Option<Uuid>,
@@ -66,33 +106,56 @@ pub async fn revoke_invite(pool: &PgPool, code: &str) -> Result<()> {
     Ok(())
 }
 
-/// 校验并占用一次邀请码。整体在事务内完成,并发下不会超发。
-pub async fn consume_invite(pool: &PgPool, code: &str) -> Result<()> {
+/// 注册用户：把「校验并占用邀请码 → 创建用户 → 保存 Passkey 注册流程」放在单个事务内。
+///
+/// 之前这三步各自独立提交，只要后两步任一步失败，就会留下「邀请码已扣但账号没建成」
+/// 或「建了孤立用户却没有认证流程」的坏数据。事务化后任一步失败整体回滚。
+/// `user_id` 由调用方提前生成，必须与 WebAuthn 挑战里的 user handle 完全一致。
+pub async fn register_user(
+    pool: &PgPool,
+    user_id: Uuid,
+    code: &str,
+    username: &str,
+    display_name: &str,
+    flow_id: Uuid,
+    flow_state: serde_json::Value,
+) -> Result<User> {
     let mut tx = pool.begin().await?;
+
     let invite = sqlx::query_as::<_, Invite>("SELECT * FROM invites WHERE code = $1 FOR UPDATE")
         .bind(code)
         .fetch_optional(&mut *tx)
         .await?
         .context("邀请码无效")?;
-
-    if invite.revoked_at.is_some() {
-        bail!("邀请码已作废");
-    }
-    if let Some(expires_at) = invite.expires_at {
-        if expires_at < Utc::now() {
-            bail!("邀请码已过期");
-        }
-    }
-    if invite.used_count >= invite.max_uses {
-        bail!("邀请码已用尽");
-    }
-
+    check_invite(&invite)?;
     sqlx::query("UPDATE invites SET used_count = used_count + 1 WHERE code = $1")
         .bind(code)
         .execute(&mut *tx)
         .await?;
+
+    let user = sqlx::query_as::<_, User>(
+        "INSERT INTO users (id, username, display_name, is_admin)
+         VALUES ($1, $2, $3, FALSE) RETURNING *",
+    )
+    .bind(user_id)
+    .bind(username)
+    .bind(display_name)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO auth_flows (id, user_id, kind, state, expires_at)
+         VALUES ($1, $2, 'register', $3, $4)",
+    )
+    .bind(flow_id)
+    .bind(user.id)
+    .bind(flow_state)
+    .bind(Utc::now() + Duration::minutes(5))
+    .execute(&mut *tx)
+    .await?;
+
     tx.commit().await?;
-    Ok(())
+    Ok(user)
 }
 
 pub async fn create_user(
@@ -257,4 +320,60 @@ pub async fn upsert_content(
     .fetch_one(pool)
     .await?;
     Ok(content)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_slug;
+
+    #[test]
+    fn allows_unicode_letters_and_digits() {
+        for slug in [
+            "hello",
+            "a-b_c123",
+            "你好世界",
+            "日本語_2026",
+            "Русский",
+            "café-notes",
+            "２０２６",
+        ] {
+            assert!(valid_slug(slug), "应当允许: {slug:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_special_characters() {
+        for slug in [
+            "",
+            "a/b",
+            "a\\b",
+            "..",
+            "a.b",
+            "a b",
+            "a?b=1",
+            "a#b",
+            "a%20b",
+            "a:b",
+            "a<b>",
+            "a|b",
+            "a*b",
+            "a\"b",
+            "a&b",
+            "a\nb",
+            "a\tb",
+            "a\0b",
+            "😀",
+            "a/b/../../etc",
+        ] {
+            assert!(!valid_slug(slug), "应当拒绝: {slug:?}");
+        }
+    }
+
+    #[test]
+    fn enforces_byte_length_limit() {
+        assert!(valid_slug(&"a".repeat(180)));
+        assert!(!valid_slug(&"a".repeat(181)));
+        assert!(valid_slug(&"中".repeat(60))); // 正好 180 字节
+        assert!(!valid_slug(&"中".repeat(61))); // 183 字节,超限
+    }
 }

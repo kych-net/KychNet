@@ -1,7 +1,8 @@
 use anyhow::{anyhow, Context, Result};
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
@@ -30,16 +31,41 @@ struct AppState {
     site_url: String,
 }
 
-struct ApiError(anyhow::Error);
+struct ApiError {
+    error: anyhow::Error,
+    /// 显式指定的状态码；None 时业务错误按 400 处理。
+    status: Option<StatusCode>,
+}
+
+impl ApiError {
+    fn with_status(code: StatusCode, message: impl std::fmt::Display) -> Self {
+        Self {
+            error: anyhow!("{message}"),
+            status: Some(code),
+        }
+    }
+}
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        tracing::warn!("API 错误: {:#}", self.0);
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": self.0.to_string() })),
-        )
-            .into_response()
+        // 数据库、文件系统等底层错误可能携带约束名、列名、绝对路径等内部细节，
+        // 不能回显给客户端；只记日志并返回统一的 500。
+        let internal = self
+            .error
+            .chain()
+            .any(|cause| cause.is::<sqlx::Error>() || cause.is::<std::io::Error>());
+        let (status, message) = if internal {
+            tracing::error!("API 内部错误: {:#}", self.error);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "服务器内部错误".to_string(),
+            )
+        } else {
+            let status = self.status.unwrap_or(StatusCode::BAD_REQUEST);
+            tracing::warn!("API 请求被拒绝({status}): {}", self.error);
+            (status, self.error.to_string())
+        };
+        (status, Json(json!({ "error": message }))).into_response()
     }
 }
 
@@ -48,7 +74,10 @@ where
     E: Into<anyhow::Error>,
 {
     fn from(error: E) -> Self {
-        Self(error.into())
+        Self {
+            error: error.into(),
+            status: None,
+        }
     }
 }
 
@@ -56,21 +85,74 @@ type ApiResult<T> = Result<T, ApiError>;
 
 macro_rules! api_bail {
     ($($arg:tt)*) => {
-        return Err(ApiError(anyhow!($($arg)*)))
+        return Err(ApiError::from(anyhow!($($arg)*)))
     };
 }
 
+/// 带明确状态码的拒绝，用于 401 / 403 等语义错误。
+macro_rules! api_reject {
+    ($code:expr, $($arg:tt)*) => {
+        return Err(ApiError::with_status($code, format!($($arg)*)))
+    };
+}
+
+#[derive(Clone)]
+struct OriginPolicy {
+    admin_origin: String,
+}
+
+/// 拒绝来自管理端以外 Origin 的状态变更请求。
+///
+/// 内容站 `www` 与 API 属于同一 eTLD+1（同站），`SameSite` 不会阻止同站跨源请求，
+/// CORS 也只阻止读取响应、不阻止带凭据的写请求被发出。因此内容站一旦出现 XSS，
+/// 就能用 `fetch(credentials:'include')` 冒用管理员会话调用写接口。
+/// 这里显式校验 Origin，是「子域隔离」真正生效所必需的一环。
+/// 没有 Origin 头的请求（curl、服务端调用）保持放行，不影响 CLI 与非浏览器客户端。
+async fn guard_origin(
+    State(policy): State<OriginPolicy>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let method = req.method().clone();
+    let is_write = method == Method::POST
+        || method == Method::PUT
+        || method == Method::PATCH
+        || method == Method::DELETE;
+    if !is_write {
+        return next.run(req).await;
+    }
+
+    let Some(origin) = req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return next.run(req).await;
+    };
+
+    if origin.trim_end_matches('/') == policy.admin_origin.trim_end_matches('/') {
+        return next.run(req).await;
+    }
+
+    tracing::warn!("拒绝来自非管理端 Origin 的写请求: {origin}");
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({ "error": "请求来源不被允许" })),
+    )
+        .into_response()
+}
+
 async fn current_user(state: &AppState, session: &Session) -> ApiResult<User> {
-    let id: Uuid = session
-        .get("user_id")
-        .await
-        .map_err(|e| anyhow!("读取会话失败: {e}"))?
-        .context("未登录")?;
+    let id: Uuid = match session.get("user_id").await {
+        Ok(Some(id)) => id,
+        Ok(None) => api_reject!(StatusCode::UNAUTHORIZED, "未登录"),
+        Err(e) => api_bail!("读取会话失败: {e}"),
+    };
     let user = service::find_user_by_id(&state.pool, id)
         .await?
-        .context("用户不存在")?;
+        .context("会话对应的用户不存在")?;
     if user.disabled {
-        api_bail!("账号已被禁用");
+        api_reject!(StatusCode::FORBIDDEN, "账号已被禁用");
     }
     Ok(user)
 }
@@ -78,7 +160,7 @@ async fn current_user(state: &AppState, session: &Session) -> ApiResult<User> {
 async fn current_admin(state: &AppState, session: &Session) -> ApiResult<User> {
     let user = current_user(state, session).await?;
     if !user.is_admin {
-        api_bail!("需要管理员权限");
+        api_reject!(StatusCode::FORBIDDEN, "需要管理员权限");
     }
     Ok(user)
 }
@@ -92,6 +174,22 @@ fn validate_username(username: &str) -> ApiResult<()> {
         api_bail!("用户名需为 3-32 位字母、数字、下划线或连字符");
     }
     Ok(())
+}
+
+/// 拒绝 `javascript:` / `data:` / `vbscript:` 等危险协议。
+/// 浏览器解析 URL 时会忽略其中的 tab、换行、回车与空格，必须先剔除再比较，
+/// 否则 `java\nscript:` 这类写法可以绕过前缀判断。
+/// 站点图标与导航链接会原样写进模板的 src / href，属于管理员可控的输入面。
+fn safe_url(value: &str) -> bool {
+    let normalized: String = value
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r' | '\0' | ' '))
+        .collect();
+    !(normalized.starts_with("javascript:")
+        || normalized.starts_with("data:")
+        || normalized.starts_with("vbscript:"))
 }
 
 #[derive(Deserialize)]
@@ -113,6 +211,9 @@ async fn register(
     Json(req): Json<RegisterRequest>,
 ) -> ApiResult<Json<RegisterResponse>> {
     validate_username(&req.username)?;
+    if req.display_name.trim().is_empty() || req.display_name.chars().count() > 64 {
+        api_bail!("显示名称需为 1-64 个字符");
+    }
     if service::find_user_by_username(&state.pool, &req.username)
         .await?
         .is_some()
@@ -120,10 +221,32 @@ async fn register(
         api_bail!("用户名已被占用");
     }
 
-    service::consume_invite(&state.pool, &req.code).await?;
-    let user =
-        service::create_user(&state.pool, &req.username, &req.display_name, false).await?;
-    let (options, flow_id) = state.auth.start_registration(&state.pool, &user).await?;
+    // user_id 提前生成：它同时是 WebAuthn 的 user handle，必须与最终落库的
+    // 用户 ID 完全一致，否则后续 Passkey 登录会找不到对应用户。
+    let user_id = Uuid::new_v4();
+    let pending_user = User {
+        id: user_id,
+        username: req.username.clone(),
+        display_name: req.display_name.clone(),
+        disabled: false,
+        is_admin: false,
+        created_at: Utc::now(),
+    };
+    let (options, flow_state) = state.auth.create_registration_challenge(&pending_user)?;
+    let flow_id = Uuid::new_v4();
+
+    // 占用邀请码、创建用户、保存认证流程在同一个事务里完成，任一步失败整体回滚。
+    let user = service::register_user(
+        &state.pool,
+        user_id,
+        &req.code,
+        &req.username,
+        &req.display_name,
+        flow_id,
+        flow_state,
+    )
+    .await?;
+
     Ok(Json(RegisterResponse {
         user,
         flow_id,
@@ -345,6 +468,14 @@ async fn save_content(
     if crate::models::ContentFormat::parse(&req.format).is_none() {
         api_bail!("format 只能是 markdown、html 或 typst");
     }
+    // slug 直接拼进 dist/posts/<slug>.html，必须在写入时就校验。
+    // 过去只在 build 阶段 bail，一条 `a/b` 就会让整站永久构建失败。
+    if !service::valid_slug(&req.slug) {
+        api_bail!("slug 只能包含 Unicode 字母/数字、- 和 _,不能含空格、标点、路径分隔符等特殊字符,且不超过 180 字节");
+    }
+    if req.title.trim().is_empty() || req.title.chars().count() > 200 {
+        api_bail!("标题需为 1-200 个字符");
+    }
     let content = service::upsert_content(
         &state.pool,
         &req.slug,
@@ -473,6 +604,9 @@ async fn put_settings(
     {
         api_bail!("导航链接的标签与地址不能为空");
     }
+    if !safe_url(&site.logo_url) || site.nav.iter().any(|link| !safe_url(&link.href)) {
+        api_bail!("站点图标与导航链接不能是脚本或数据协议");
+    }
     service::save_settings(&state.pool, &site).await?;
     Ok(Json(json!({ "site": site })))
 }
@@ -534,6 +668,11 @@ async fn avatar(State(state): State<AppState>, Path(id): Path<Uuid>) -> ApiResul
                 axum::http::HeaderName::from_static("content-security-policy"),
                 HeaderValue::from_static("default-src 'none'; style-src 'unsafe-inline'"),
             );
+            // 防止浏览器把 SVG 嗅探成 HTML 后执行其中的内容。
+            headers.insert(
+                header::X_CONTENT_TYPE_OPTIONS,
+                HeaderValue::from_static("nosniff"),
+            );
             Ok(response)
         }
         None => Ok(StatusCode::NOT_FOUND.into_response()),
@@ -570,6 +709,10 @@ pub async fn serve(cfg: Config) -> Result<()> {
     let session_layer = SessionManagerLayer::new(MemoryStore::default())
         .with_secure(cfg.rp_origin.starts_with("https"));
 
+    let origin_policy = OriginPolicy {
+        admin_origin: cfg.admin_origin.clone(),
+    };
+
     let app = Router::new()
         .route("/api/health", get(|| async { Json(json!({"ok": true})) }))
         .route("/api/auth/register", post(register))
@@ -595,6 +738,10 @@ pub async fn serve(cfg: Config) -> Result<()> {
         .with_state(state)
         .layer(session_layer)
         .layer(cors)
+        .layer(middleware::from_fn_with_state(
+            origin_policy,
+            guard_origin,
+        ))
         .layer(TraceLayer::new_for_http());
 
     let listener = tokio::net::TcpListener::bind(&cfg.bind).await?;
