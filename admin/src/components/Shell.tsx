@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api, SiteSettings, User } from "../api";
 import { Theme } from "../theme";
 import { ContentsView } from "../views/ContentsView";
@@ -14,17 +14,34 @@ type Props = {
   site: SiteSettings;
   siteUrl: string;
   theme: Theme;
+  avatarVersion: number;
   onThemeChange: (theme: Theme) => void;
   onUserChange: (user: User) => void;
+  onAvatarChange: () => void;
   onLogout: () => void;
 };
 
 const adminViews: View[] = ["invites", "users", "settings"];
 
-export function Shell({ user, site, siteUrl, theme, onThemeChange, onUserChange, onLogout }: Props) {
+export function Shell({
+  user,
+  site,
+  siteUrl,
+  theme,
+  avatarVersion,
+  onThemeChange,
+  onUserChange,
+  onAvatarChange,
+  onLogout,
+}: Props) {
   const [view, setView] = useState<View>("contents");
   const [menuOpen, setMenuOpen] = useState(false);
+  const [avatarFailed, setAvatarFailed] = useState(false);
   const initial = (user.display_name || user.username).slice(0, 1).toUpperCase();
+
+  useEffect(() => {
+    setAvatarFailed(false);
+  }, [avatarVersion, user.id]);
 
   function go(next: View) {
     setView(next);
@@ -78,7 +95,16 @@ export function Shell({ user, site, siteUrl, theme, onThemeChange, onUserChange,
               onClick={() => setMenuOpen((open) => !open)}
               aria-label="用户菜单"
             >
-              {initial}
+              {avatarFailed ? (
+                initial
+              ) : (
+                <img
+                  className="avatar-img"
+                  src={`/api/avatar/${user.id}?v=${avatarVersion}`}
+                  alt=""
+                  onError={() => setAvatarFailed(true)}
+                />
+              )}
             </button>
             {menuOpen && (
               <div className="avatar-menu">
@@ -106,7 +132,14 @@ export function Shell({ user, site, siteUrl, theme, onThemeChange, onUserChange,
         {view === "invites" && user.is_admin && <InvitesView />}
         {view === "users" && user.is_admin && <UsersView />}
         {view === "settings" && user.is_admin && <SettingsView />}
-        {view === "profile" && <ProfileView user={user} onUserChange={onUserChange} />}
+        {view === "profile" && (
+          <ProfileView
+            user={user}
+            avatarVersion={avatarVersion}
+            onUserChange={onUserChange}
+            onAvatarChange={onAvatarChange}
+          />
+        )}
       </main>
     </div>
   );

@@ -4,17 +4,24 @@ import { api, User } from "../api";
 
 type Props = {
   user: User;
+  avatarVersion: number;
   onUserChange: (user: User) => void;
+  onAvatarChange: () => void;
 };
 
-export function ProfileView({ user, onUserChange }: Props) {
+export function ProfileView({ user, avatarVersion, onUserChange, onAvatarChange }: Props) {
   const [displayName, setDisplayName] = useState(user.display_name);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
 
+  const [avatarPreview, setAvatarPreview] = useState("");
+  const [avatarFailed, setAvatarFailed] = useState(false);
+
   const [totpSecret, setTotpSecret] = useState("");
   const [totpUrl, setTotpUrl] = useState("");
   const [totpCode, setTotpCode] = useState("");
+
+  const initial = (user.display_name || user.username).slice(0, 1).toUpperCase();
 
   async function saveProfile(event: React.FormEvent) {
     event.preventDefault();
@@ -23,6 +30,28 @@ export function ProfileView({ user, onUserChange }: Props) {
       const updated = await api.updateProfile(displayName);
       onUserChange(updated);
       setNotice("用户设置已保存");
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
+  async function uploadAvatar(event: React.ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    if (!file) {
+      return;
+    }
+    setError("");
+    if (file.size > 256 * 1024) {
+      setError("SVG 不能超过 256 KB");
+      return;
+    }
+    try {
+      const updated = await api.uploadAvatar(file);
+      onUserChange(updated);
+      setAvatarPreview(URL.createObjectURL(file));
+      setAvatarFailed(false);
+      onAvatarChange();
+      setNotice("头像已更新");
     } catch (e) {
       setError((e as Error).message);
     }
@@ -71,6 +100,32 @@ export function ProfileView({ user, onUserChange }: Props) {
       <h2>用户设置</h2>
       {error && <p className="error">{error}</p>}
       {notice && <p className="notice">{notice}</p>}
+
+      <div className="avatar-preview">
+        <div className="avatar avatar-large">
+          {avatarFailed ? (
+            initial
+          ) : (
+            <img
+              className="avatar-img"
+              src={avatarPreview || `/api/avatar/${user.id}?v=${avatarVersion}`}
+              alt=""
+              onError={() => {
+                if (!avatarPreview) {
+                  setAvatarFailed(true);
+                }
+              }}
+            />
+          )}
+        </div>
+        <div>
+          <label className="upload">
+            上传 SVG 头像
+            <input type="file" accept=".svg,image/svg+xml" onChange={uploadAvatar} />
+          </label>
+          <p className="hint">仅接受纯矢量 SVG,不能包含位图、脚本或外部资源。</p>
+        </div>
+      </div>
 
       <form onSubmit={saveProfile}>
         <label>

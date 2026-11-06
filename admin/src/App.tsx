@@ -12,6 +12,7 @@ export function App() {
   const [siteUrl, setSiteUrl] = useState("https://www.kych.net");
   const [site, setSite] = useState<SiteSettings>(defaultSite);
   const [theme, setTheme] = useState<Theme>(() => readTheme());
+  const [avatarVersion, setAvatarVersion] = useState(0);
 
   useEffect(() => {
     applyTheme(theme);
@@ -44,8 +45,10 @@ export function App() {
       site={site}
       siteUrl={siteUrl}
       theme={theme}
+      avatarVersion={avatarVersion}
       onThemeChange={setTheme}
       onUserChange={setUser}
+      onAvatarChange={() => setAvatarVersion((value) => value + 1)}
       onLogout={() => setUser(null)}
     />
   );
