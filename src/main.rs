@@ -4,6 +4,7 @@ mod build;
 mod config;
 mod db;
 mod models;
+mod rate;
 mod render;
 mod service;
 mod svg;
