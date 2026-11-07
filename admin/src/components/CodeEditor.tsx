@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
 import { basicSetup } from "codemirror";
 import { Compartment, EditorState } from "@codemirror/state";
-import { EditorView } from "@codemirror/view";
+import { EditorView, keymap } from "@codemirror/view";
 import {
   HighlightStyle,
   StreamLanguage,
@@ -9,6 +9,7 @@ import {
   type StreamParser,
 } from "@codemirror/language";
 import { tags as t } from "@lezer/highlight";
+import { indentWithTab } from "@codemirror/commands";
 import { markdown } from "@codemirror/lang-markdown";
 import { html } from "@codemirror/lang-html";
 import { css } from "@codemirror/lang-css";
@@ -177,6 +178,7 @@ export function CodeEditor({ value, format, onChange }: Props) {
       doc: value,
       extensions: [
         basicSetup,
+        keymap.of([indentWithTab]),
         languageCompartment.of(languageFor(format)),
         syntaxHighlighting(highlightStyle),
         editorTheme,
