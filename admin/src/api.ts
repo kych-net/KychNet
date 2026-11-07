@@ -166,6 +166,11 @@ export const api = {
       body: JSON.stringify(payload),
     }),
   deleteContent: (id: string) => request<void>(`/contents/${id}`, { method: "DELETE" }),
+  previewContent: (format: ContentFormat, body: string) =>
+    request<{ html: string }>("/preview", {
+      method: "POST",
+      body: JSON.stringify({ format, body }),
+    }),
 
   invites: () => request<{ items: Invite[] }>("/invites"),
   createInvite: (maxUses: number, expiresInDays: number) =>
