@@ -186,7 +186,7 @@ fn match_command(line: &str) -> Option<(&'static Cmd, usize)> {
     best
 }
 
-fn is_english_command(s: &str) -> bool {
+pub(crate) fn is_english_command(s: &str) -> bool {
     matches!(s, "serve" | "build" | "db" | "invite" | "user" | "passkey")
 }
 

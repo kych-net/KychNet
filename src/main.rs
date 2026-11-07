@@ -119,6 +119,13 @@ fn translate_args(raw: &[String]) -> Result<cli_cn::Dispatch, String> {
         return Ok(cli_cn::Dispatch::FullHelp);
     }
 
+    // 英文命令即使带中文参数（用户名、输出目录等）也必须原样交给 clap，
+    // 不能被 has_cjk 误判成中文命令。
+    if cli_cn::is_english_command(&raw[0]) {
+        argv.extend(raw.iter().cloned());
+        return Ok(cli_cn::Dispatch::Argv(argv));
+    }
+
     // 纯英文调用原样透传，保留 clap 自己的子命令帮助与报错行为。
     // 顶层 `--help` / `-h` 走合并帮助，子命令级帮助仍交给 clap。
     if !cli_cn::has_cjk(raw) {
@@ -259,6 +266,22 @@ async fn main() -> Result<()> {
                     service::delete_passkeys(&pool, user.id).await
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn english_command_with_chinese_args_passes_through() {
+        let raw = vec!["user".to_string(), "create".to_string(), "爱丽丝".to_string()];
+        match translate_args(&raw).unwrap() {
+            cli_cn::Dispatch::Argv(argv) => {
+                assert_eq!(argv, ["kych-net", "user", "create", "爱丽丝"]);
+            }
+            _ => panic!("英文命令带中文参数应原样透传"),
         }
     }
 }
