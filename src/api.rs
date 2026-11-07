@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
@@ -110,6 +110,67 @@ impl BuildCtl {
             // 兜底名与二进制名一致：拿不到自身路径时，重建子进程仍能起得来。
             exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("kych-net")),
         }
+    }
+
+    /// 管理端保存内容后自动编译这一页。
+    ///
+    /// 仍走独立子进程，避免 Typst 渲染污染常驻进程；`old` 是改路径前的旧 slug，
+    /// 子进程会顺手删掉旧产物。返回失败时内容已经落库，前端会提示重新整站构建。
+    async fn build_page(&self, slug: &str, old: Option<&str>) -> Result<()> {
+        if self.running.swap(true, Ordering::SeqCst) {
+            bail!("已有构建在进行，请稍后重试或执行整站重建");
+        }
+
+        let mut command = tokio::process::Command::new(&self.exe);
+        command
+            .arg("build")
+            .arg("--out")
+            .arg(&self.out_dir)
+            .arg("--only")
+            .arg(slug)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(old) = old {
+            if old != slug {
+                command.arg("--remove").arg(old);
+            }
+        }
+
+        let output = command.output().await;
+        let (exit_code, tail) = match output {
+            Ok(out) => {
+                let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+                text.push_str(&String::from_utf8_lossy(&out.stderr));
+                let cut = text.len().saturating_sub(BUILD_TAIL_BYTES);
+                let tail = if cut > 0 {
+                    let start = (cut..=text.len())
+                        .find(|&i| text.is_char_boundary(i))
+                        .unwrap_or(text.len());
+                    format!("…{}", &text[start..])
+                } else {
+                    text
+                };
+                (Some(out.status.code().unwrap_or(-1)), tail)
+            }
+            Err(error) => (None, format!("编译进程启动失败: {error}")),
+        };
+
+        {
+            let mut last = self.last.lock().await;
+            *last = Some(BuildRecord {
+                started_at: Utc::now().timestamp(),
+                finished_at: Some(Utc::now().timestamp()),
+                exit_code,
+                tail: tail.clone(),
+            });
+        }
+        self.running.store(false, Ordering::SeqCst);
+
+        if exit_code != Some(0) {
+            bail!("{}", if tail.is_empty() { "自动编译失败".to_string() } else { tail });
+        }
+        Ok(())
     }
 }
 
@@ -774,13 +835,21 @@ async fn save_content(
     if req.title.trim().is_empty() || req.title.chars().count() > 200 {
         api_bail!("标题需为 1-200 个字符");
     }
-    let content = if let Some(id) = req.id {
-        let existing = service::find_content_by_id(&state.pool, id)
-            .await?
-            .context("内容不存在")?;
+    let existing = if let Some(id) = req.id {
+        Some(
+            service::find_content_by_id(&state.pool, id)
+                .await?
+                .context("内容不存在")?,
+        )
+    } else {
+        None
+    };
+    if let Some(existing) = &existing {
         if existing.slug == service::HOME_SLUG && slug != service::HOME_SLUG {
             api_reject!(StatusCode::FORBIDDEN, "网站主页路径不能修改");
         }
+    }
+    let content = if let Some(id) = req.id {
         service::update_content(
             &state.pool,
             id,
@@ -802,6 +871,15 @@ async fn save_content(
         )
         .await?
     };
+
+    // 保存后立即编译当前页；若改过路径，顺带删除旧路径产物。
+    let old_slug = existing.as_ref().map(|content| content.slug.as_str());
+    if let Err(error) = state.build_ctl.build_page(&content.slug, old_slug).await {
+        return Err(ApiError::with_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("内容已保存，但自动编译失败：{error}"),
+        ));
+    }
     Ok(Json(json!({ "item": content })))
 }
 
@@ -822,6 +900,14 @@ async fn delete_content(
         .bind(id)
         .execute(&state.pool)
         .await?;
+    if let Some(slug) = slug {
+        if let Err(error) = state.build_ctl.build_page(&slug, None).await {
+            return Err(ApiError::with_status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("内容已删除，但清理产物失败：{error}"),
+            ));
+        }
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
