@@ -561,18 +561,21 @@ async fn v2_fetch(
     )
     .await?;
 
-    out.extend(proto::pkt_str("acknowledgments\n"));
-    if common_known {
-        for oid in common.iter().filter(|oid| !oid.is_zero()) {
-            out.extend(proto::pkt_str(&format!("ACK {}\n", oid.to_hex())));
-        }
-        if !request.done {
+    if !request.done {
+        out.extend(proto::pkt_str("acknowledgments\n"));
+        if common_known {
+            for oid in common.iter().filter(|oid| !oid.is_zero()) {
+                out.extend(proto::pkt_str(&format!("ACK {}\n", oid.to_hex())));
+            }
             out.extend(proto::pkt_str("ready\n"));
+        } else {
+            out.extend(proto::pkt_str("NAK\n"));
         }
-    } else {
-        out.extend(proto::pkt_str("NAK\n"));
+        out.extend(proto::flush());
+        return Ok(out);
     }
-    out.extend(proto::delim());
+
+    // done 之后不再回 acknowledgments；客户端已经在等 packfile 段。
     if !boundaries.is_empty() || !unshallow.is_empty() {
         out.extend(proto::pkt_str("shallow-info\n"));
         for oid in &boundaries {
