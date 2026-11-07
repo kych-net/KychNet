@@ -25,6 +25,7 @@ openssl = { version = "0.10", optional = true }
 pulldown-cmark = "0.12"
 # MCP（Model Context Protocol）官方 Rust SDK：/mcp 只读内容接口
 rmcp = { version = "3.9", features = ["transport-streamable-http-server"] }
+schemars = "1"
 rand = "0.8"
 roxmltree = "0.20"
 serde = { version = "1", features = ["derive"] }
