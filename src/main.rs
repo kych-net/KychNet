@@ -1,6 +1,7 @@
 mod api;
 mod auth;
 mod build;
+mod cli_cn;
 mod config;
 mod db;
 mod models;
@@ -10,14 +11,18 @@ mod service;
 mod svg;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
 use config::Config;
 
+/// 站点后端与管理命令行的唯一入口。
+///
+/// 中文命令先经 `cli_cn` 翻译成英文参数，再交给同一个 clap 解析器，
+/// 因此中英文共用同一条执行路径与同一个 service 层。
 #[derive(Parser)]
-#[command(name = "kychnet", version, about = "KychNet 站点后端与管理 CLI")]
+#[command(name = "kych-net", version, about = "KychNet 站点后端与管理 CLI")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -97,13 +102,79 @@ enum PasskeyCommand {
     Reset { username: String },
 }
 
+/// 把原始命令行参数翻译成 clap 能吃的参数列表。
+///
+/// 纯英文调用原样透传（保留 clap 自己的 `--help` / `--version` 行为）；
+/// 带中文的调用交给 `cli_cn` 翻译。返回值第一个元素是程序名，clap 靠它拼 usage。
+fn translate_args(raw: &[String]) -> Result<cli_cn::Dispatch, String> {
+    // 彩色输出在任何分支之前定好，避免英文路径下帮助文本没有颜色。
+    cli_cn::setup_color(raw);
+
+    // clap 的 parse_from 把第一个元素当程序名，所以参数表必须以它开头。
+    let mut argv = Vec::with_capacity(raw.len() + 1);
+    argv.push("kych-net".to_string());
+
+    // 没有任何参数：打印中英合并的完整帮助。
+    if raw.is_empty() {
+        return Ok(cli_cn::Dispatch::FullHelp);
+    }
+
+    // 纯英文调用原样透传，保留 clap 自己的子命令帮助与报错行为。
+    // 顶层 `--help` / `-h` 走合并帮助，子命令级帮助仍交给 clap。
+    if !cli_cn::has_cjk(raw) {
+        let is_top_help = raw.len() == 1 && matches!(raw[0].as_str(), "--help" | "-h");
+        if is_top_help {
+            return Ok(cli_cn::Dispatch::FullHelp);
+        }
+        argv.extend(raw.iter().cloned());
+        return Ok(cli_cn::Dispatch::Argv(argv));
+    }
+
+    match cli_cn::dispatch(raw)? {
+        // 翻译结果不含程序名，补上再交给 clap。
+        cli_cn::Dispatch::Argv(translated) => {
+            argv.extend(translated);
+            Ok(cli_cn::Dispatch::Argv(argv))
+        }
+        other => Ok(other),
+    }
+}
+
+/// 完整帮助：clap 的英文子命令列表 + 中文命令一览。
+///
+/// 英文部分直接取自 clap 自己的命令树，中文部分由 `cli_cn` 提供，
+/// 两边共用同一份子命令定义，不会各说各话。
+fn print_full_help() {
+    let mut cmd = Cli::command();
+    cmd = cmd.after_long_help(cli_cn::help_text());
+    print!("{}", cmd.render_long_help());
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
 
-    let cli = Cli::parse();
+    // 中文命令连写、不加空格，先翻译成英文参数再交给 clap。
+    // 纯英文调用原样透传，行为与改动前一致。
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    let cli = match translate_args(&raw) {
+        Ok(cli_cn::Dispatch::Argv(argv)) => Cli::parse_from(argv),
+        Ok(cli_cn::Dispatch::Print(text)) => {
+            println!("{text}");
+            return Ok(());
+        }
+        Ok(cli_cn::Dispatch::FullHelp) => {
+            print_full_help();
+            return Ok(());
+        }
+        Err(msg) => {
+            eprintln!("{}", cli_cn::error_text(&msg));
+            std::process::exit(1);
+        }
+    };
+
     let cfg = Config::from_env()?;
 
     match cli.command {

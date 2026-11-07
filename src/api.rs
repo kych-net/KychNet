@@ -107,7 +107,8 @@ impl BuildCtl {
             running: AtomicBool::new(false),
             last: tokio::sync::Mutex::new(None),
             out_dir,
-            exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("kychnet")),
+            // 兜底名与二进制名一致：拿不到自身路径时，重建子进程仍能起得来。
+            exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("kych-net")),
         }
     }
 }
@@ -998,7 +999,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
     // SameSite=Strict、Secure=true，但有效期是两周且不显式配置的话，
     // 升级依赖就会悄悄变松。
     //
-    // SameSite 选 Strict 不影响管理端调 API：`admin.kych.net` 与 `api.kych.net`
+    // SameSite 选 Strict 不影响管理端调 API：`m.kych.net` 与 `api.kych.net`
     // 同属 kych.net，属于同站请求，Strict 照样带 Cookie；它只挡住跨站的导航与请求。
     //
     // 会话改放 Postgres（schema `tower_sessions`、表 `session`，由 store 自己建）：
