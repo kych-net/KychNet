@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use askama::Template;
 use sqlx::PgPool;
 use std::collections::{BTreeMap, HashMap};
@@ -332,6 +332,137 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 编译单个内容页；管理端保存后调用。
+///
+/// 不清理整站，只写/删这一页。目录树会按当前全部已发布内容重建，
+/// 因此这一页上的树是最新的；其它页面的树要等整站重建刷新。
+pub async fn run_one(
+    pool: &PgPool,
+    cfg: &Config,
+    out: &Path,
+    only: &str,
+    remove: Option<&str>,
+) -> Result<()> {
+    if !service::valid_content_slug(only) {
+        bail!("非法内容路径: {only}");
+    }
+    if let Some(old) = remove {
+        if old != only && service::valid_content_slug(old) {
+            remove_output(out, old)?;
+        }
+    }
+
+    let settings = service::get_settings(pool).await?;
+    let all = service::list_published(pool).await?;
+    let contents: Vec<Content> = all
+        .into_iter()
+        .filter(|content| service::valid_content_slug(&content.slug))
+        .collect();
+
+    let mut tree = TreeNode::default();
+    let mut wikidot_includes = HashMap::new();
+    for content in &contents {
+        tree.insert(&content.slug, content);
+        if content.format() == ContentFormat::Wikidot {
+            let stem = content.slug.strip_suffix(".html").unwrap_or(&content.slug);
+            let page = stem.replace('/', ":");
+            wikidot_includes.insert(page.clone(), content.body.clone());
+            let normalized = PageRef::page_only(&page).page;
+            wikidot_includes.insert(normalized, content.body.clone());
+        }
+    }
+    tree.sort();
+    let tree_html = tree.render();
+
+    let Some(content) = contents.iter().find(|content| content.slug == only) else {
+        remove_output(out, only)?;
+        return Ok(());
+    };
+
+    let page = content
+        .slug
+        .strip_suffix(".html")
+        .unwrap_or(&content.slug)
+        .replace('/', ":");
+    let ctx = render::DocContext {
+        page: &page,
+        title: &content.title,
+        includes: &wikidot_includes,
+    };
+    let rendered = render::render_doc(content.format(), &content.body, &cfg.content_root, &ctx)
+        .with_context(|| format!("渲染 {} 失败", content.slug))?;
+    let date = content.updated_at.format("%Y-%m-%d").to_string();
+    let pdf_url = if rendered.pdf.is_some() {
+        format!("/{}", encode_path(&pdf_path(&content.slug)))
+    } else {
+        String::new()
+    };
+    let html = PageTemplate {
+        site: settings.clone(),
+        admin_url: cfg.admin_origin.clone(),
+        title: content.title.clone(),
+        date,
+        content: rendered.html,
+        pdf_url,
+        tree: tree_html,
+    }
+    .render()?;
+
+    std::fs::create_dir_all(out)?;
+    make_public(out, true)?;
+    let target = out.join(&content.slug);
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+        make_parent_dirs_public(out, parent)?;
+    }
+    std::fs::write(&target, html)?;
+    make_public(&target, false)?;
+    if let Some(pdf) = rendered.pdf {
+        let pdf_target = out.join(pdf_path(&content.slug));
+        if let Some(parent) = pdf_target.parent() {
+            std::fs::create_dir_all(parent)?;
+            make_parent_dirs_public(out, parent)?;
+        }
+        std::fs::write(&pdf_target, pdf)?;
+        make_public(&pdf_target, false)?;
+    }
+    Ok(())
+}
+
+/// 删除单页产物，并清掉因此变空的目录。
+fn remove_output(out: &Path, slug: &str) -> Result<()> {
+    if !service::valid_content_slug(slug) {
+        return Ok(());
+    }
+    let html = out.join(slug);
+    let pdf = out.join(pdf_path(slug));
+    for path in [&html, &pdf] {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let mut current = html.parent();
+    while let Some(dir) = current {
+        if dir == out || !dir.starts_with(out) {
+            break;
+        }
+        match std::fs::read_dir(dir).and_then(|mut entries| entries.next().transpose()) {
+            Ok(None) => {
+                std::fs::remove_dir(dir)?;
+                current = dir.parent();
+            }
+            Ok(Some(_)) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                current = dir.parent();
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
 /// 删除 dist 下旧的 HTML/PDF 产物，并移除因此变空的目录；其它资源保留。
 fn clean_generated(root: &Path) -> Result<()> {
     fn clean_dir(dir: &Path) -> Result<bool> {
@@ -470,6 +601,20 @@ mod tests {
         make_public(&base.join("nested/page.html"), false).unwrap();
         assert_eq!(std::fs::metadata(base.join("nested")).unwrap().permissions().mode() & 0o777, 0o755);
         assert_eq!(std::fs::metadata(base.join("nested/page.html")).unwrap().permissions().mode() & 0o777, 0o644);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn remove_output_removes_page_and_empty_dirs() {
+        let base = std::env::temp_dir().join(format!("kych-net-remove-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("a/b")).unwrap();
+        std::fs::write(base.join("a/b/page.html"), "x").unwrap();
+        std::fs::write(base.join("a/b/page.pdf"), "x").unwrap();
+        remove_output(&base, "a/b/page.html").unwrap();
+        assert!(!base.join("a/b/page.html").exists());
+        assert!(!base.join("a/b/page.pdf").exists());
+        assert!(!base.join("a").exists());
         std::fs::remove_dir_all(&base).ok();
     }
 }

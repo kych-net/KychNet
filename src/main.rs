@@ -36,6 +36,12 @@ enum Command {
     Build {
         #[arg(long, default_value = "dist")]
         out: PathBuf,
+        /// 只编译这一页（输出路径，例如 xef/index.html）
+        #[arg(long)]
+        only: Option<String>,
+        /// 同时删除这个旧路径的产物（改路径时使用）
+        #[arg(long)]
+        remove: Option<String>,
     },
     /// 数据库操作
     Db {
@@ -186,9 +192,12 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Serve => api::serve(cfg).await,
-        Command::Build { out } => {
+        Command::Build { out, only, remove } => {
             let pool = db::connect(&cfg.database_url).await?;
-            build::run(&pool, &cfg, &out).await
+            match only {
+                Some(only) => build::run_one(&pool, &cfg, &out, &only, remove.as_deref()).await,
+                None => build::run(&pool, &cfg, &out).await,
+            }
         }
         Command::Db { command } => {
             let pool = db::connect(&cfg.database_url).await?;

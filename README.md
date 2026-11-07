@@ -78,6 +78,7 @@
 ```text
 kych-net serve                          # 启动 HTTP 服务
 kych-net build --out dist               # 生成静态站
+kych-net build --only xef/index.html    # 只编译一页(管理端保存时调用)
 kych-net db migrate                     # 执行迁移
 
 kych-net invite create --uses 1 --expires 7d
@@ -179,7 +180,7 @@ cd admin && pnpm install && cp .env.example .env && pnpm dev
 1. [.github/workflows/build.yml](.github/workflows/build.yml) 在 push、PR 和手动触发时运行测试,并编译 Linux 二进制;推送 `v*` 标签时自动创建 Release.
    - `x86_64-unknown-linux-gnu`:依赖系统 glibc,在 Ubuntu 22.04 上构建.
    - `x86_64-unknown-linux-musl`:静态链接,启用 `vendored-openssl` 特性,适配 Alpine 与老版本发行版.
-2. 先执行 `kych-net db migrate`,再执行 `kych-net build --out dist`,生成静态产物;Typst 页面同时产出 `.pdf`.构建会先渲染到内存,全部成功后才清理旧的 `.html/.pdf` 并写入新路径(不再统一放 `posts/`),中途失败不会破坏现有站点.
+2. 管理端保存内容后会自动编译当前页(改路径时同时删除旧产物);「站点设置 → 整站重建」或 `kych-net build --out dist` 重建全站.Typst 页面同时产出 `.pdf`.构建会先渲染到内存,全部成功后才清理旧的 `.html/.pdf` 并写入新路径(不再统一放 `posts/`),中途失败不会破坏现有站点.
 3. `dist/` 同时发布到 Cloudflare Pages 与 EdgeOne Pages.
 4. 管理前端构建为静态产物,单独发布.
 5. 媒体资源放在单一对象存储源,由两家 CDN 回源同一份.

@@ -60,7 +60,7 @@ export function ContentsView({ editContentId, onEditHandled }: Props) {
       // 服务端会把 /xef/、/eoe/index.md 归一化成输出路径，这里回显源文件路径。
       setContentId(result.item.id);
       setSlug(editorPath(result.item));
-      setNotice("内容已保存");
+      setNotice(published ? "内容已保存，并已自动编译当前页" : "内容已保存（草稿，暂不生成页面）");
       await refresh();
     } catch (e) {
       setError((e as Error).message);
