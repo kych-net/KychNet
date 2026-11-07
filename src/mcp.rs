@@ -27,7 +27,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::schemars::JsonSchema;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
-use rmcp::transport::streamable_http_server::StreamableHttpService;
+use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
 use serde::Deserialize;
 use serde_json::json;
@@ -347,10 +347,19 @@ async fn mcp_guard(
 pub fn router(state: KychMcp, token: String, limits: RateLimiter, trust_proxy_headers: bool) -> Router {
     // 无状态模式（config 默认即 stateless 的新版本语义按 Default 走）：
     // 每个请求独立处理，不做会话亲和，单实例足够。
+    // rmcp 默认只允许 localhost 的 Host 头；线上经 nginx 反代后 Host 是
+    // api.kych.net / kych.net，必须显式放行，否则会得到 "Host header is not allowed"。
+    let config = StreamableHttpServerConfig::default().with_allowed_hosts([
+        "api.kych.net",
+        "kych.net",
+        "localhost",
+        "127.0.0.1",
+        "::1",
+    ]);
     let service = StreamableHttpService::new(
         move || Ok(state.clone()),
         LocalSessionManager::default().into(),
-        Default::default(),
+        config,
     );
 
     let guard = McpGuard {
