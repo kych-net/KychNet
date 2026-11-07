@@ -192,7 +192,7 @@ export type DiscussionDetail = Discussion & {
 };
 
 // API 基址：开发环境留空，请求走 vite 的 /api 代理（见 vite.config.ts）；
-// 生产环境把 VITE_API_BASE_URL 设为 API 服务的完整 origin（如 https://api.kych.net）。
+// 生产环境把 VITE_API_BASE_URL 设为 API 服务的完整 origin（如 https://kych.net）。
 // 管理前端是独立发布的静态站，本身没有同源 /api 可以转发，必须显式指向 API 子域。
 const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/+$/, "");
 
