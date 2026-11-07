@@ -6,12 +6,24 @@
 
 前后端分离,后端使用最高性能的方式.
 
-前端部署在 edgeone 和 cloudflare 上,分为内容前端和管理前端:
+前端分为内容前端和管理前端:
 
-- 内容前端是纯静态站,由后端编译输出 html.
-- 管理前端是动态的,以 SPA 形式通过 JSON API 读写内容.
+- 内容前端是纯静态站,由后端编译输出 html,通过 EdgeOne 发布.
+- 管理前端是 React SPA,通过 EdgeOne Pages 发布,以 JSON API 读写内容.
 
-后端为单一二进制 `kych-net`,同时提供 HTTP 服务与命令行管理能力,两者共用同一套 service 层.中英文命令行是同一个二进制的两个入口:中文命令先被翻译成英文参数,再交给同一个 clap 解析器.
+后端为单一二进制 `kych-net`,同时提供 HTTP 服务、Git smart HTTP、MCP 和命令行管理能力,共用同一套 service 层.中英文命令行是同一个二进制的两个入口:中文命令先被翻译成英文参数,再交给同一个 clap 解析器.
+
+## 域名与入口
+
+| 地址 | 用途 |
+| --- | --- |
+| `kych.net` | 公网 API:`/api/*`、`/git/*`、`/mcp`;裸域其余路径 301 到内容站 |
+| `api.kych.net` | **仅 EdgeOne 回源 Host / 静态源站**,不是给客户端使用的 API 地址 |
+| `c.kych.net` | 内容站公开入口,EdgeOne 加速回源 |
+| `m.kych.net` | 管理端,EdgeOne Pages |
+| `origin.kych.net`、`src.kych.net` | 静态源站/实验入口,不作为 API 地址 |
+
+管理端的 `VITE_API_BASE_URL` 必须是 `https://kych.net`,不能写 `api.kych.net`.
 
 ## 内容格式
 
@@ -27,13 +39,15 @@
 
 这些格式均不做内容限制,内容作者均为邀请注册的可信用户,因此允许存储型 XSS 是项目明确的取舍。
 
-必须注意:**子域隔离本身并不能阻止攻击**。`c`(内容站) / `m`(管理端) / `api` 同属一个 eTLD+1(同站),`SameSite` Cookie 不会阻止同站跨源请求,CORS 也只阻止读取响应、不阻止带凭据的写请求被发出。因此后端对所有写接口增加了 Origin 白名单校验(仅放行管理端 origin),挡住内容站 XSS 冒用管理员会话发起写操作。这层防护仍以「内容作者可信」为前提;若要允许不可信作者,需要让 `api` 使用完全独立的站点(不同 eTLD+1)并对内容页加 CSP,而不是只靠子域划分。
+必须注意:**子域隔离本身并不能阻止攻击**。`c`(内容站) / `m`(管理端) / `kych.net`(API) 同属一个 eTLD+1(同站),`SameSite` Cookie 不会阻止同站跨源请求,CORS 也只阻止读取响应、不阻止带凭据的写请求被发出。因此后端对所有写接口增加了 Origin 白名单校验(仅放行管理端 origin),挡住内容站 XSS 冒用管理员会话发起写操作。这层防护仍以「内容作者可信」为前提;若要允许不可信作者,需要让 `api` 使用完全独立的站点(不同 eTLD+1)并对内容页加 CSP,而不是只靠子域划分。
 
 ## 界面
 
 - 内容端顶栏:左侧站点图标,图标右侧为目录树按钮,中间为可编辑导航链接(管理端「站点设置」维护),右侧为主题切换与管理端入口.
 - 管理端顶栏:左侧站点图标,图标右侧为目录树按钮,中间为功能导航(内容/邀请码/用户/站点设置),右侧为头像菜单(用户设置/网站管理/前往内容端)与主题切换.
 - 两端共用浅色、深色两套主题,基于 CSS 变量实现,选择持久化在 localStorage.
+- 内容站正文使用自托管的 `LXGW WenKai Screen`;管理端编辑器使用 CodeMirror 6,按格式高亮.
+- 管理端 Markdown/HTML 预览在浏览器端渲染,Wikidot 预览走服务端 ftml,统一放进无脚本 sandbox iframe.
 - 用户头像为上传的 SVG 文件,由服务端校验确为纯矢量:必须是合法 XML 且根元素为 `svg`,至少包含一个矢量图形,禁止内嵌/外链位图、`<script>`、`<foreignObject>`、事件属性、DTD 与实体声明、`<animate>`/`<set>` 等属性动画元素,`href` 只允许指向文档内图元(`#xxx`);内容上限 256 KB,传输上限 257 KB.
 
 
@@ -51,7 +65,8 @@
 | 管理前端 | React + TypeScript + Vite |
 | 数据与表单 | 原生 fetch + React state |
 | 样式 | 原生 CSS |
-| 部署 | Cloudflare Pages + EdgeOne Pages |
+| 部署 | EdgeOne（内容 CDN）+ EdgeOne Pages（管理端） |
+| 项目/Git | PostgreSQL Git 对象 + Git smart HTTP + LFS |
 
 ## 目录结构
 
@@ -68,9 +83,13 @@
 │   ├── svg.rs           # 上传头像的 SVG 校验
 │   ├── rate.rs          # 登录/注册接口的有界内存限流
 │   ├── api.rs           # Axum 路由、会话、CORS、Origin 校验
-│   └── build.rs         # 静态站生成
+│   ├── build.rs         # 静态站生成
+│   ├── mcp.rs           # MCP Streamable HTTP 只读服务器
+│   ├── project.rs       # 项目管理
+│   ├── collab.rs        # 分支/PR/讨论协作
+│   └── git/             # PostgreSQL Git、LFS、smart HTTP
 ├── templates/           # Askama 模板(layout / index / page)
-├── migrations/          # SQLx 迁移
+├── migrations/          # SQLx 迁移(当前 0001–0010)
 └── admin/               # 管理前端(独立 Vite 工程)
 ```
 
@@ -92,6 +111,8 @@ kych-net user list
 kych-net user disable <user>
 kych-net user enable <user>
 kych-net passkey reset <user>
+
+kych-net gc --project <项目名>   # 清理不可达 Git 对象与孤立 LFS 文件
 ```
 
 ## 中文命令行
@@ -155,13 +176,15 @@ export PATH=/usr/local/bin:$PATH            # 通常已默认包含
 - `login/start` 与 `totp/login` 的失败响应统一成同一条消息:这两个接口匿名可调,"用户不存在""账号已禁用""没绑定通行密钥"如果是可区分的,就等于在向外枚举用户名和每个人的 2FA 配置.真实原因只进日志.
 - 过期的 `auth_flows` 由 `serve` 内的后台任务每 60 秒清理一次;`login_start` 每次调用都会插一行,不清理就会被匿名请求撑爆.
 - 注册改为「凭证通过才落库」:`/api/auth/register` 只读校验邀请码并把用户资料暂存在认证流程里,`/api/auth/register/finish` 校验 Passkey 成功后才在一个事务内扣邀请码、建用户、存凭证.浏览器取消仪式不再消耗邀请名额,也不会留下没有凭证的孤立用户;撞用户名由唯一约束兜底.
-- 修改凭证需要 step-up:`totp/setup`、`totp/confirm` 之外的 `passkey/setup`、`passkey/setup/finish` 要求会话在最近一次真实认证的 5 分钟内,否则返回 403.只拿到旧 cookie 或只读到 `/api/me` 的攻击者无法把受害者的二次验证换绑到自己设备上.`totp/confirm` 不要求 step-up(pending 密钥只能由已 step-up 的 setup 产生),但每账号限 5 次/15 分钟.
+- 修改凭证需要 step-up:`totp/setup`、`passkey/setup`、`passkey/setup/finish` 要求会话在最近一次真实认证的 5 分钟内;过期后管理端会弹窗要求输入 TOTP 或使用通行密钥重新确认,验证成功后自动重试原操作.只拿到旧 cookie 或只读到 `/api/me` 的攻击者无法把受害者的二次验证换绑到自己设备上.`totp/confirm` 不要求 step-up(pending 密钥只能由已 step-up 的 setup 产生),但每账号限 5 次/15 分钟.
 - 管理员启停账号有护栏:不能禁用自己的账号,也不能禁用最后一个可用管理员(同一事务内锁行判断,并发互关时后提交者失败).`kych-net user` CLI 不受此限制,保留为应急入口.
 - 请求体上限显式声明:全局 2 MiB,头像 257 KB,不再依赖框架默认值.
 
 ## MCP 服务器
 
 设置 `MCP_TOKEN` 后,`serve` 会在同一个二进制上挂载 `/mcp`(Streamable HTTP,基于官方 Rust SDK `rmcp`),让 AI 客户端(Claude、Cursor 等)以 MCP 协议只读查询站点内容;未设置时整个路由不存在,不新增攻击面.
+
+公网地址是 **`https://kych.net/mcp`**;`api.kych.net` 只是回源 Host,不能作为 MCP 或 Git 的客户端地址.
 
 - 工具:`list_pages`(枚举已发布页面)、`get_page`(按路径读正文)、`search_content`(标题与正文全文搜索)、`site_info`(站点概况).全部只读,不暴露任何写操作.
 - 鉴权:`Authorization: Bearer <MCP_TOKEN>`,比较走常量时间;失败统一返回同一条消息,不区分「没带」与「带错」.
@@ -181,6 +204,15 @@ export PATH=/usr/local/bin:$PATH            # 通常已默认包含
 }
 ```
 
+## 项目与 Git
+
+- 项目管理在管理端「项目」页,数据落在 PostgreSQL 的 Git 表和 `LFS_ROOT` 文件目录;
+- 仓库地址:`https://kych.net/git/<项目 slug>.git`;
+- Git smart HTTP 和 LFS 都通过 `kych.net` 的 nginx `/git/` 反代;
+- 匿名可以 clone 公开仓库,写操作使用 Git token;
+- 迁移 `0009_projects` / `0010_lfs` 创建项目、对象、refs、commits、PR、讨论与 LFS 索引;
+- `kych-net gc --project <slug>` 清理不可达对象。
+
 ## 开发
 
 ```bash
@@ -196,7 +228,7 @@ cargo run -- build --out dist
 cd admin && pnpm install && cp .env.example .env && pnpm dev
 ```
 
-开发时 `VITE_API_BASE_URL` 留空,`/api` 由 vite 代理转发到后端。生产构建前必须把它设为 API 服务的完整 origin(例如 `https://api.kych.net`),因为管理前端是独立静态站,没有同源 `/api` 可转发;后端 CORS 与写接口 Origin 白名单均以 `ADMIN_ORIGIN` 为准。
+开发时 `VITE_API_BASE_URL` 留空,`/api` 由 vite 代理转发到后端。生产构建前必须把它设为 API 服务的完整 origin(例如 `https://kych.net`),因为管理前端是独立静态站,没有同源 `/api` 可转发;后端 CORS 与写接口 Origin 白名单均以 `ADMIN_ORIGIN` 为准。
 
 ## 构建与部署
 
@@ -204,9 +236,9 @@ cd admin && pnpm install && cp .env.example .env && pnpm dev
    - `x86_64-unknown-linux-gnu`:依赖系统 glibc,在 Ubuntu 22.04 上构建.
    - `x86_64-unknown-linux-musl`:静态链接,启用 `vendored-openssl` 特性,适配 Alpine 与老版本发行版.
 2. 管理端保存内容后会自动编译当前页(改路径时同时删除旧产物);「站点设置 → 整站重建」或 `kych-net build --out dist` 重建全站.Typst 页面同时产出 `.pdf`.构建会先渲染到内存,全部成功后才清理旧的 `.html/.pdf` 并写入新路径(不再统一放 `posts/`),中途失败不会破坏现有站点.
-3. `dist/` 同时发布到 Cloudflare Pages 与 EdgeOne Pages.
-4. 管理前端构建为静态产物,单独发布.
-5. 媒体资源放在单一对象存储源,由两家 CDN 回源同一份.
+3. 内容站 `dist/` 由 EdgeOne 加速;管理前端构建为独立静态产物,由 EdgeOne Pages 发布.
+4. 服务器 nginx 只把 `/api/`、`/git/`、`/mcp` 等后端路径反代到 `127.0.0.1:8080`;`api.kych.net` 只作为回源 Host.
+5. 项目 Git 对象存 PostgreSQL,LFS 文件存 `LFS_ROOT`;systemd 需要该目录的写权限.
 
 ## 约定
 
