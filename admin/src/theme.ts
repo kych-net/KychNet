@@ -1,6 +1,6 @@
 export type Theme = "light" | "dark";
 
-const STORAGE_KEY = "kychnet-admin-theme";
+const STORAGE_KEY = "kych-net-admin-theme";
 
 export function readTheme(): Theme {
   const saved = localStorage.getItem(STORAGE_KEY);

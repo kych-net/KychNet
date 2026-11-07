@@ -9,7 +9,9 @@ const defaultSite: SiteSettings = { site_name: "KychNet", logo_url: "", nav: [] 
 export function App() {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
-  const [siteUrl, setSiteUrl] = useState("https://www.kych.net");
+  // 内容站地址以 API 返回的 SITE_URL 为准；这里只是首帧渲染前的兜底，
+  // 取不到时宁可不显示「前往内容端」链接，也不要指向一个错的域名。
+  const [siteUrl, setSiteUrl] = useState("");
   const [site, setSite] = useState<SiteSettings>(defaultSite);
   const [theme, setTheme] = useState<Theme>(() => readTheme());
   const [avatarVersion, setAvatarVersion] = useState(0);

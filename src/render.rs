@@ -230,7 +230,7 @@ mod tests {
         use std::os::unix::fs::symlink;
         use typst::diag::FileError;
 
-        let base = std::env::temp_dir().join(format!("kychnet-symlink-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("kych-net-symlink-{}", std::process::id()));
         let content = base.join("content");
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&content).expect("创建临时目录");
