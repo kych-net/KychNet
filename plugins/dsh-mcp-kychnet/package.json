@@ -1,0 +1,37 @@
+{
+  "name": "dsh-mcp-kychnet",
+  "version": "0.1.0",
+  "description": "KychNet 站点 MCP 接入插件：复用 dsh-mcp-oauth-client 完成 OAuth 2.1 授权，把内容与项目工具带进 DeepSeek Harness。",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "mcp",
+    "oauth",
+    "kychnet"
+  ],
+  "license": "AGPL-3.0-or-later",
+  "type": "module",
+  "exports": {
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "dsh-mcp-oauth-client": ">=0.3.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

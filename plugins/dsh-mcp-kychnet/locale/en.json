@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "KychNet site",
+    "description": "Connects to the kych.net MCP server over OAuth 2.1 to read and write site content and project files."
+  }
+}

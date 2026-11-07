@@ -295,43 +295,40 @@ Trae 目前不原生执行 MCP OAuth，直接填远程 `url` 会得到 401。用
 
 #### DSH / DeepSeek Harness
 
-DSH 的 MCP 客户端支持 stdio 和 Streamable HTTP，但原生 HTTP 连接不带 MCP OAuth。推荐同样用 `mcp-remote` stdio 桥接。
-
-方式一：安装 MCP Center 插件，用设置页添加（推荐）：
+DSH 直接用本仓库自带的插件 `dsh-mcp-kychnet`（见 `plugins/dsh-mcp-kychnet/`）接入。
+插件本身只是配置 bundle，OAuth 2.1 的全部流程交给
+[`dsh-mcp-oauth-client`](https://github.com/fangzaozao/dsh-mcp-oauth-client) 完成，
+因此是原生的 Streamable HTTP 连接，不需要 `mcp-remote` 之类的 stdio 桥接。
 
 ```bash
-dsh plugin --profile web add dsh-mcp-center
+dsh plugin --profile <profile> add /absolute/path/to/plugins/dsh-mcp-kychnet
 ```
 
-重启 `dsh web`，打开 **设置 → MCP Center → ＋ 添加 MCP 服务器**：
+重启 `dsh web` 后，**设置 → 插件** 里会出现「KychNet 站点」，**设置 → MCP** 里会出现
+`mcp-kychnet`。首次调用 `mcp__kych-net__*` 工具时会打开授权页；工具与上面的「工具」
+一节一一对应。
 
-- 名称：`kych-net`
-- 类型：`stdio`
-- 命令：`npx`
-- 参数：`-y mcp-remote https://kych.net/mcp`
-
-保存后首次连接会在浏览器打开 KychNet 授权页。
-
-方式二：直接写 Cordis overlay。把下面的 `insert` 合并到 `$DSH_HOME/profiles/<name>/cordis.patch.yml`（只对该 profile 生效），或 `$DSH_HOME/cordis.patch.yml`（本机所有 profile 生效）：
+不使用插件、直接写 Cordis overlay 时，把下面的 `insert` 合并到
+`$DSH_HOME/profiles/<name>/cordis.patch.yml`（只对该 profile 生效），或
+`$DSH_HOME/cordis.patch.yml`（本机所有 profile 生效）：
 
 ```yaml
 - insert:
-    - id: kych-net
-      name: '@deepseek-ai/dsh-mcp-client'
+    - id: mcp-kychnet
+      name: dsh-mcp-oauth-client
       config:
+        entryId: mcp-kychnet
+        manager: false
         serverName: kych-net
-        transport: stdio
-        command: npx
-        args:
-          - '-y'
-          - mcp-remote
-          - 'https://kych.net/mcp'
-        env: {}
+        transport: streamable-http
+        resourceUrl: https://kych.net/mcp
+        authType: oauth
+        scope: content:read content:write project:read project:write
 ```
 
-重启 DSH 后，工具会以 `mcp__kych-net__*` 出现。首次调用会触发 OAuth 授权。
-
-> DSH 和 Trae 的桥接依赖 `mcp-remote` 和 Node.js。桥接只解决 OAuth，不改变 KychNet 的权限模型；登录用户仍然是 Git 提交身份。
+> 老版本 DSH 如果既没有 bundle 支持也没有带 OAuth 的 MCP 客户端，才需要退回
+> `npx -y mcp-remote https://kych.net/mcp` 的 stdio 桥接。桥接只解决 OAuth，不改变
+> KychNet 的权限模型；登录用户仍然是 Git 提交身份。
 
 ### 自检
 

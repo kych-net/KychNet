@@ -1,0 +1,20 @@
+# KychNet MCP bundle。
+#
+# 只做一件事：把 https://kych.net/mcp 这个 Streamable HTTP MCP 服务登记给
+# dsh-mcp-oauth-client，由它完成 401 发现、动态注册、授权码 + PKCE 和令牌刷新。
+# 这里不保存任何凭据，也不添加静态 Authorization 头。
+#
+# id 同时用作 entryId，因此在 MCP 设置页里这条服务的标识是 mcp-kychnet。
+- insert:
+    - id: mcp-kychnet
+      name: dsh-mcp-oauth-client
+      config:
+        entryId: mcp-kychnet
+        manager: false
+        serverName: kych-net
+        transport: streamable-http
+        resourceUrl: https://kych.net/mcp
+        authType: oauth
+        # 与站点 OAuth 授权页展示的四项权限一致；全部申请，便于读写内容与项目。
+        scope: content:read content:write project:read project:write
+        toolCallTimeoutMs: 60000
