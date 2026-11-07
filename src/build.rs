@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
 use askama::Template;
 use sqlx::PgPool;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+
+use ftml::data::PageRef;
 
 use crate::models::{Content, ContentFormat, SiteSettings};
 use crate::{config::Config, render, service};
@@ -187,8 +189,16 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
         .collect();
 
     let mut tree = TreeNode::default();
+    let mut wikidot_includes = HashMap::new();
     for content in &contents {
         tree.insert(&content.slug, content);
+        if content.format() == ContentFormat::Wikidot {
+            let stem = content.slug.strip_suffix(".html").unwrap_or(&content.slug);
+            let page = stem.replace('/', ":");
+            wikidot_includes.insert(page.clone(), content.body.clone());
+            let normalized = PageRef::page_only(&page).page;
+            wikidot_includes.insert(normalized, content.body.clone());
+        }
     }
     tree.sort();
     let tree_html = tree.render();
@@ -196,7 +206,17 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
     // 先把所有页面渲染到内存。任何一篇 Typst 编译失败都不会触碰磁盘。
     let mut pages = Vec::new();
     for content in &contents {
-        let rendered = render::render(content.format(), &content.body, &cfg.content_root)
+        let page = content
+            .slug
+            .strip_suffix(".html")
+            .unwrap_or(&content.slug)
+            .replace('/', ":");
+        let ctx = render::DocContext {
+            page: &page,
+            title: &content.title,
+            includes: &wikidot_includes,
+        };
+        let rendered = render::render_doc(content.format(), &content.body, &cfg.content_root, &ctx)
             .with_context(|| format!("渲染 {} 失败", content.slug))?;
 
         let date = content.updated_at.format("%Y-%m-%d").to_string();

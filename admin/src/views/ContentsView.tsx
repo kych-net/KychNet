@@ -7,7 +7,7 @@ type Props = {
 };
 
 function extensionFor(format: ContentFormat): string {
-  return format === "markdown" ? ".md" : format === "typst" ? ".typ" : ".html";
+  return format === "markdown" ? ".md" : format === "typst" ? ".typ" : format === "wikidot" ? ".wj" : ".html";
 }
 
 export function ContentsView({ editContentId, onEditHandled }: Props) {
@@ -128,12 +128,13 @@ export function ContentsView({ editContentId, onEditHandled }: Props) {
               <option value="markdown">Markdown</option>
               <option value="html">HTML</option>
               <option value="typst">Typst</option>
+              <option value="wikidot">Wikidot</option>
             </select>
           </label>
         </div>
         <p className="hint">
           目录主页用 <code>/eoe/</code>；页面用 <code>/reff/93df/l.html</code>。
-          <code>.html/.md/.typ</code> 最终都输出同一个 <code>.html</code>，同一路径只保留一条内容。
+          <code>.html/.md/.typ/.wj</code> 最终都输出同一个 <code>.html</code>，同一路径只保留一条内容。
           <code>/api</code> 是保留路径；<code>/index.html</code> 是主页，只能编辑不能删除。
         </p>
         <label>

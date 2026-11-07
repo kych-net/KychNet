@@ -1,5 +1,14 @@
 use anyhow::Result;
+use ftml::data::{PageInfo, PageRef, ScoreValue};
+use ftml::includes::{FetchedPage, IncludeRef, Includer};
+use ftml::layout::Layout;
+use ftml::render::html::HtmlRender;
+use ftml::render::Render;
+use ftml::settings::{WikitextMode, WikitextSettings};
 use pulldown_cmark::{html, Options, Parser};
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use typst::diag::{FileError, FileResult};
 use typst::foundations::{Bytes, Datetime};
@@ -17,7 +26,39 @@ pub struct Rendered {
     pub pdf: Option<Vec<u8>>,
 }
 
+/// 渲染一页 Wikidot 所需的上下文。
+///
+/// `includes` 是构建时从数据库预取的 Wikidot 页面，key 是 ftml 归一化后的页面名
+/// （例如 `component:header`），这样 include 阶段不需要同步查库。
+pub struct DocContext<'a> {
+    pub page: &'a str,
+    pub title: &'a str,
+    pub includes: &'a HashMap<String, String>,
+}
+
+impl DocContext<'_> {
+    fn empty() -> Self {
+        Self {
+            page: "page",
+            title: "",
+            includes: &EMPTY_INCLUDES,
+        }
+    }
+}
+
+static EMPTY_INCLUDES: std::sync::LazyLock<HashMap<String, String>> =
+    std::sync::LazyLock::new(HashMap::new);
+
 pub fn render(format: ContentFormat, body: &str, root: &Path) -> Result<Rendered> {
+    render_doc(format, body, root, &DocContext::empty())
+}
+
+pub fn render_doc(
+    format: ContentFormat,
+    body: &str,
+    root: &Path,
+    ctx: &DocContext,
+) -> Result<Rendered> {
     match format {
         ContentFormat::Markdown => Ok(Rendered {
             html: render_markdown(body),
@@ -28,7 +69,90 @@ pub fn render(format: ContentFormat, body: &str, root: &Path) -> Result<Rendered
             pdf: None,
         }),
         ContentFormat::Typst => render_typst(body, root),
+        ContentFormat::Wikidot => render_wikidot(body, ctx),
     }
+}
+
+struct MapIncluder<'a> {
+    pages: &'a HashMap<String, String>,
+}
+
+impl<'t> Includer<'t> for MapIncluder<'_> {
+    type Error = Infallible;
+
+    fn include_pages(
+        &mut self,
+        includes: &[IncludeRef<'t>],
+    ) -> Result<Vec<FetchedPage<'t>>, Self::Error> {
+        Ok(includes
+            .iter()
+            .map(|include| {
+                let page_ref = include.page_ref().clone();
+                let content = self
+                    .pages
+                    .get(page_ref.page())
+                    .map(|body| Cow::Owned(body.clone()));
+                FetchedPage { page_ref, content }
+            })
+            .collect())
+    }
+
+    fn no_such_include(
+        &mut self,
+        page_ref: &PageRef,
+    ) -> Result<Cow<'t, str>, Self::Error> {
+        Ok(Cow::Owned(format!(
+            "<div class=\"wiki-error\">include 不存在: {}</div>",
+            page_ref.page()
+        )))
+    }
+}
+
+fn render_wikidot(body: &str, ctx: &DocContext) -> Result<Rendered> {
+    let mut text = body.to_string();
+    let mut settings = WikitextSettings::from_mode(WikitextMode::Page, Layout::Wikidot);
+    settings.use_true_ids = false;
+    settings.isolate_user_ids = true;
+    settings.allow_local_paths = false;
+
+    // 支持 include 的递归展开，同时限制深度，避免 A include B、B include A 时无限增长。
+    for _ in 0..8 {
+        let (next, _pages) = ftml::include(
+            &text,
+            &settings,
+            MapIncluder {
+                pages: ctx.includes,
+            },
+            || -> Infallible { unreachable!("ftml include 不会返回这个错误") },
+        )?;
+        if next == text {
+            break;
+        }
+        text = next;
+    }
+
+    ftml::preprocess(&mut text);
+    let page = PageRef::page_only(ctx.page.replace('/', ":")).page;
+    let info = PageInfo {
+        page: Cow::Owned(page),
+        category: None,
+        site: Cow::Borrowed("kych.net"),
+        title: Cow::Owned(ctx.title.to_string()),
+        alt_title: None,
+        score: ScoreValue::Integer(0),
+        tags: vec![],
+        language: Cow::Borrowed("zh-CN"),
+    };
+    let tokenization = ftml::tokenize(&text);
+    let parsed = ftml::parse(&tokenization, &info, &settings);
+    if !parsed.errors().is_empty() {
+        tracing::warn!(errors = ?parsed.errors(), "Wikidot 解析警告");
+    }
+    let output = HtmlRender.render(parsed.value(), &info, &settings);
+    Ok(Rendered {
+        html: output.body,
+        pdf: None,
+    })
 }
 
 fn render_markdown(body: &str) -> String {
@@ -221,6 +345,35 @@ mod tests {
         let body = "# Hi\n\n<script>alert(1)</script>";
         let out = render(ContentFormat::Markdown, body, Path::new(".")).unwrap();
         assert!(out.html.contains("<script>alert(1)</script>"));
+    }
+
+    #[test]
+    fn wikidot_renders_bold() {
+        let out = render(ContentFormat::Wikidot, "**bold**", Path::new(".")).unwrap();
+        assert!(out.html.contains("<strong>bold</strong>"), "{}", out.html);
+    }
+
+    #[test]
+    fn wikidot_include_uses_prefetched_pages() {
+        let mut includes = HashMap::new();
+        includes.insert(
+            "component:header".to_string(),
+            "included **text**".to_string(),
+        );
+        let ctx = DocContext {
+            page: "test",
+            title: "Test",
+            includes: &includes,
+        };
+        let out = render_doc(
+            ContentFormat::Wikidot,
+            "[[include component:header]]\n\nafter",
+            Path::new("."),
+            &ctx,
+        )
+        .unwrap();
+        assert!(out.html.contains("included"), "{}", out.html);
+        assert!(out.html.contains("after"), "{}", out.html);
     }
 
     /// 内容目录里的符号链接不能成为读取 root 之外文件的口子。
