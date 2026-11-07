@@ -1309,6 +1309,11 @@ pub async fn serve(cfg: Config) -> Result<()> {
         admin_origin: cfg.admin_origin.clone(),
     };
 
+    // MCP 路由需要的共享资源先克隆出来：state 在 with_state 时会被 move，
+    // 而挂载判断要等 layer 链拼完之后才能做。
+    let state_pool_for_mcp = state.pool.clone();
+    let state_limits_for_mcp = state.limits.clone();
+
     let app = Router::new()
         .route("/api/health", get(|| async { Json(json!({"ok": true})) }))
         .route("/api/auth/register", post(register))
@@ -1420,6 +1425,25 @@ pub async fn serve(cfg: Config) -> Result<()> {
             guard_origin,
         ))
         .layer(TraceLayer::new_for_http());
+
+    // MCP 只读内容接口：设置 MCP_TOKEN 才挂载。merge 放在主应用 layer 链之后，
+    // /mcp 不沾会话、CORS、Origin 白名单这些浏览器侧的层，鉴权与限流由
+    // mcp::router 自带（Bearer token + 按 IP 限流），口径与 client_ip 一致。
+    let app = if let Some(token) = cfg.mcp_token.clone() {
+        let mcp_state = crate::mcp::KychMcp::new(
+            state_pool_for_mcp.clone(),
+            cfg.content_root.clone(),
+            cfg.site_url.clone(),
+        );
+        app.merge(crate::mcp::router(
+            mcp_state,
+            token,
+            state_limits_for_mcp,
+            cfg.trust_proxy_headers,
+        ))
+    } else {
+        app
+    };
 
     let listener = tokio::net::TcpListener::bind(&cfg.bind).await?;
     tracing::info!("API 监听 {}", cfg.bind);

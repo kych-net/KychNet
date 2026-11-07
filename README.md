@@ -159,6 +159,28 @@ export PATH=/usr/local/bin:$PATH            # 通常已默认包含
 - 管理员启停账号有护栏:不能禁用自己的账号,也不能禁用最后一个可用管理员(同一事务内锁行判断,并发互关时后提交者失败).`kych-net user` CLI 不受此限制,保留为应急入口.
 - 请求体上限显式声明:全局 2 MiB,头像 257 KB,不再依赖框架默认值.
 
+## MCP 服务器
+
+设置 `MCP_TOKEN` 后,`serve` 会在同一个二进制上挂载 `/mcp`(Streamable HTTP,基于官方 Rust SDK `rmcp`),让 AI 客户端(Claude、Cursor 等)以 MCP 协议只读查询站点内容;未设置时整个路由不存在,不新增攻击面.
+
+- 工具:`list_pages`(枚举已发布页面)、`get_page`(按路径读正文)、`search_content`(标题与正文全文搜索)、`site_info`(站点概况).全部只读,不暴露任何写操作.
+- 鉴权:`Authorization: Bearer <MCP_TOKEN>`,比较走常量时间;失败统一返回同一条消息,不区分「没带」与「带错」.
+- 限流:按客户端 IP 每分钟 120 次,复用 `rate.rs` 的进程内限流器;IP 来源口径与 `client_ip` 一致(`TRUST_PROXY_HEADERS`).
+- 层隔离:`/mcp` merge 在主应用 layer 链之后,不沾会话、CORS、Origin 白名单这些浏览器侧的层;鉴权与限流由 `src/mcp.rs` 自带.
+
+客户端配置示例(Claude Desktop / Cursor 等):
+
+```json
+{
+  "mcpServers": {
+    "kych-net": {
+      "url": "https://api.kych.net/mcp",
+      "headers": { "Authorization": "Bearer <MCP_TOKEN>" }
+    }
+  }
+}
+```
+
 ## 开发
 
 ```bash
