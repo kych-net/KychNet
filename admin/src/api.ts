@@ -10,6 +10,7 @@ export type NavLink = { label: string; href: string };
 
 export type SiteSettings = {
   site_name: string;
+  description: string;
   logo_url: string;
   nav: NavLink[];
 };

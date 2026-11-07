@@ -1,10 +1,12 @@
-import { useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { api, SiteSettings, User } from "./api";
 import { AuthPage } from "./pages/AuthPage";
-import { Shell } from "./components/Shell";
 import { applyTheme, readTheme, Theme } from "./theme";
 
-const defaultSite: SiteSettings = { site_name: "KychNet", logo_url: "", nav: [] };
+// 登录后再加载管理端 Shell，避免把 CodeMirror 等重依赖塞进首屏。
+const Shell = lazy(() => import("./components/Shell").then((module) => ({ default: module.Shell })));
+
+const defaultSite: SiteSettings = { site_name: "KychNet", description: "", logo_url: "", nav: [] };
 
 export function App() {
   const [user, setUser] = useState<User | null>(null);
@@ -42,16 +44,18 @@ export function App() {
     return <AuthPage onLogin={setUser} />;
   }
   return (
-    <Shell
-      user={user}
-      site={site}
-      siteUrl={siteUrl}
-      theme={theme}
-      avatarVersion={avatarVersion}
-      onThemeChange={setTheme}
-      onUserChange={setUser}
-      onAvatarChange={() => setAvatarVersion((value) => value + 1)}
-      onLogout={() => setUser(null)}
-    />
+    <Suspense fallback={<p className="hint">加载管理端…</p>}>
+      <Shell
+        user={user}
+        site={site}
+        siteUrl={siteUrl}
+        theme={theme}
+        avatarVersion={avatarVersion}
+        onThemeChange={setTheme}
+        onUserChange={setUser}
+        onAvatarChange={() => setAvatarVersion((value) => value + 1)}
+        onLogout={() => setUser(null)}
+      />
+    </Suspense>
   );
 }

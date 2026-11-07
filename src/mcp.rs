@@ -61,7 +61,10 @@ pub struct KychMcp {
 /// 由 MCP 鉴权层写入 HTTP request extensions，再通过 rmcp 的
 /// `Extension<Parts>` 传给工具；项目提交使用当前登录用户。
 #[derive(Clone)]
-pub struct McpUser(pub User);
+pub struct McpUser {
+    pub user: User,
+    pub scope: String,
+}
 
 /// 单条搜索结果（SQL 查询 + 摘要截取共用）。
 #[derive(Debug, sqlx::FromRow)]
@@ -138,9 +141,13 @@ impl KychMcp {
     }
 
     #[tool(
-        description = "列出站点所有已发布页面：输出路径（slug）、标题、格式与更新时间。返回 JSON 数组，slug 可直接用于 get_page。"
+        description = "列出站点所有已发布页面：输出路径（slug）、源文件名、格式与更新时间。返回 JSON 数组，slug 可直接用于 get_page。"
     )]
-    async fn list_pages(&self) -> Result<CallToolResult, McpError> {
+    async fn list_pages(
+        &self,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        require_scope(&parts, "content:read")?;
         let pages = service::list_published(&self.pool)
             .await
             .map_err(internal_error)?;
@@ -159,12 +166,14 @@ impl KychMcp {
     }
 
     #[tool(
-        description = "按路径读取一篇已发布页面的源内容。路径参数接受 xef/index、/xef/index 或 xef/index.html 三种写法。返回标题、格式（markdown/html/typst/wikidot）与正文源码。"
+        description = "按路径读取一篇已发布页面的源内容。路径参数接受 xef/index、/xef/index 或 xef/index.html 三种写法。返回源文件名、格式（markdown/html/typst/wikidot）与正文源码。"
     )]
     async fn get_page(
         &self,
+        Extension(parts): Extension<Parts>,
         Parameters(GetPageParams { slug }): Parameters<GetPageParams>,
     ) -> Result<CallToolResult, McpError> {
+        require_scope(&parts, "content:read")?;
         let normalized = Self::normalize_slug(&slug);
         let page = sqlx::query_as::<_, crate::models::Content>(
             "SELECT * FROM contents WHERE slug = $1 AND published = TRUE",
@@ -190,12 +199,14 @@ impl KychMcp {
     }
 
     #[tool(
-        description = "全文搜索已发布页面的标题与正文（大小写不敏感的子串匹配）。返回每条结果的路径、标题、格式与命中位置附近的一段摘要。"
+        description = "全文搜索已发布页面的正文（大小写不敏感的子串匹配）。返回每条结果的路径、源文件名、格式与命中位置附近的一段摘要。"
     )]
     async fn search_content(
         &self,
+        Extension(parts): Extension<Parts>,
         Parameters(SearchParams { query }): Parameters<SearchParams>,
     ) -> Result<CallToolResult, McpError> {
+        require_scope(&parts, "content:read")?;
         let query = query.trim();
         if query.is_empty() {
             return Err(McpError::invalid_params("搜索词不能为空", None));
@@ -233,7 +244,11 @@ impl KychMcp {
     #[tool(
         description = "获取站点基本信息：站点名称、导航、logo、页面总数与 API 地址。调用其他工具前可先用它了解站点概况。"
     )]
-    async fn site_info(&self) -> Result<CallToolResult, McpError> {
+    async fn site_info(
+        &self,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        require_scope(&parts, "content:read")?;
         let settings: SiteSettings = service::get_settings(&self.pool)
             .await
             .map_err(internal_error)?;
@@ -261,8 +276,10 @@ impl KychMcp {
     )]
     async fn save_content(
         &self,
+        Extension(parts): Extension<Parts>,
         Parameters(params): Parameters<SaveContentParams>,
     ) -> Result<CallToolResult, McpError> {
+        require_scope(&parts, "content:write")?;
         let requested = ContentFormat::parse(params.format.trim().to_ascii_lowercase().as_str())
             .ok_or_else(|| McpError::invalid_params(format!("未知格式: {}", params.format), None))?;
         let (slug, format) = service::normalize_content_path(&params.slug, requested)
@@ -283,8 +300,10 @@ impl KychMcp {
     #[tool(description = "删除一篇内容并清理静态产物；网站主页 index.html 不允许删除。")]
     async fn delete_content(
         &self,
+        Extension(parts): Extension<Parts>,
         Parameters(params): Parameters<DeleteContentParams>,
     ) -> Result<CallToolResult, McpError> {
+        require_scope(&parts, "content:write")?;
         let (slug, _) = service::normalize_content_path(&params.slug, ContentFormat::Html)
             .map_err(|e| McpError::invalid_params(format!("路径非法: {e}"), None))?;
         if slug == service::HOME_SLUG {
@@ -308,8 +327,12 @@ impl KychMcp {
         Ok(text_result(json!({ "deleted": slug }).to_string()))
     }
 
-    #[tool(description = "列出所有项目（slug、标题、默认分支、更新时间）。")]
-    async fn list_projects(&self) -> Result<CallToolResult, McpError> {
+    #[tool(description = "列出所有项目（slug、项目标题、默认分支、更新时间）。")]
+    async fn list_projects(
+        &self,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        require_scope(&parts, "project:read")?;
         let projects = project::list_projects(&self.pool)
             .await
             .map_err(internal_error)?;
@@ -319,8 +342,10 @@ impl KychMcp {
     #[tool(description = "列出项目某个目录下的文件；branch 省略时用默认分支，path 省略表示根目录。")]
     async fn list_project_files(
         &self,
+        Extension(parts): Extension<Parts>,
         Parameters(params): Parameters<ProjectListParams>,
     ) -> Result<CallToolResult, McpError> {
+        require_scope(&parts, "project:read")?;
         let p = self.find_project(&params.project).await?;
         let branch = params.branch.unwrap_or_else(|| p.default_branch.clone());
         let path = params.path.unwrap_or_default();
@@ -333,8 +358,10 @@ impl KychMcp {
     #[tool(description = "读取项目中的单个 UTF-8 文件内容。")]
     async fn read_project_file(
         &self,
+        Extension(parts): Extension<Parts>,
         Parameters(params): Parameters<ProjectReadParams>,
     ) -> Result<CallToolResult, McpError> {
+        require_scope(&parts, "project:read")?;
         let p = self.find_project(&params.project).await?;
         let branch = params.branch.unwrap_or_else(|| p.default_branch.clone());
         let item = project::read_file(&self.pool, p.id, &branch, &params.path)
@@ -350,6 +377,7 @@ impl KychMcp {
         Extension(parts): Extension<Parts>,
         Parameters(params): Parameters<ProjectWriteParams>,
     ) -> Result<CallToolResult, McpError> {
+        require_scope(&parts, "project:write")?;
         let p = self.find_project(&params.project).await?;
         let branch = params.branch.unwrap_or_else(|| p.default_branch.clone());
         let actor = mcp_actor(&parts)?;
@@ -377,6 +405,7 @@ impl KychMcp {
         Extension(parts): Extension<Parts>,
         Parameters(params): Parameters<ProjectDeleteParams>,
     ) -> Result<CallToolResult, McpError> {
+        require_scope(&parts, "project:write")?;
         let p = self.find_project(&params.project).await?;
         let branch = params.branch.unwrap_or_else(|| p.default_branch.clone());
         let actor = mcp_actor(&parts)?;
@@ -466,8 +495,24 @@ fn mcp_actor(parts: &Parts) -> Result<&User, McpError> {
     parts
         .extensions
         .get::<McpUser>()
-        .map(|user| &user.0)
+        .map(|user| &user.user)
         .ok_or_else(|| McpError::internal_error("缺少 MCP 登录用户", None))
+}
+
+fn require_scope(parts: &Parts, needed: &str) -> Result<(), McpError> {
+    let allowed = parts
+        .extensions
+        .get::<McpUser>()
+        .map(|user| user.scope.split_whitespace().any(|scope| scope == needed))
+        .unwrap_or(false);
+    if allowed {
+        Ok(())
+    } else {
+        Err(McpError::invalid_params(
+            format!("当前授权缺少权限: {needed}"),
+            None,
+        ))
+    }
 }
 
 fn mcp_filename(slug: &str, format: &str) -> String {
@@ -582,8 +627,8 @@ async fn mcp_guard(
         return unauthorized();
     };
     let hash = Sha256::digest(token.as_bytes()).to_vec();
-    let row: Option<(Uuid, String)> = sqlx::query_as(
-        "SELECT user_id, resource FROM oauth_tokens
+    let row: Option<(Uuid, String, String)> = sqlx::query_as(
+        "SELECT user_id, scope, resource FROM oauth_tokens
          WHERE access_hash = $1 AND revoked_at IS NULL AND access_expires_at > now()",
     )
     .bind(hash)
@@ -591,7 +636,7 @@ async fn mcp_guard(
     .await
     .ok()
     .flatten();
-    let Some((user_id, resource)) = row else {
+    let Some((user_id, scope, resource)) = row else {
         return unauthorized();
     };
     if resource != crate::oauth::MCP_RESOURCE {
@@ -609,7 +654,7 @@ async fn mcp_guard(
         return unauthorized();
     };
     let mut req = req;
-    req.extensions_mut().insert(McpUser(user));
+    req.extensions_mut().insert(McpUser { user, scope });
     next.run(req).await
 }
 

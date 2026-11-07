@@ -1,13 +1,13 @@
-import { useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { api, avatarUrl, Content, SiteSettings, User } from "../api";
 import { DirTree } from "./DirTree";
 import { Theme } from "../theme";
-import { ContentsView } from "../views/ContentsView";
-import { InvitesView } from "../views/InvitesView";
-import { ProfileView } from "../views/ProfileView";
-import { ProjectsView } from "../views/ProjectsView";
-import { SettingsView } from "../views/SettingsView";
-import { UsersView } from "../views/UsersView";
+const ContentsView = lazy(() => import("../views/ContentsView").then((module) => ({ default: module.ContentsView })));
+const InvitesView = lazy(() => import("../views/InvitesView").then((module) => ({ default: module.InvitesView })));
+const ProfileView = lazy(() => import("../views/ProfileView").then((module) => ({ default: module.ProfileView })));
+const ProjectsView = lazy(() => import("../views/ProjectsView").then((module) => ({ default: module.ProjectsView })));
+const SettingsView = lazy(() => import("../views/SettingsView").then((module) => ({ default: module.SettingsView })));
+const UsersView = lazy(() => import("../views/UsersView").then((module) => ({ default: module.UsersView })));
 
 type View = "contents" | "projects" | "invites" | "users" | "settings" | "profile";
 
@@ -175,6 +175,7 @@ export function Shell({
       </header>
 
       <main className="appmain">
+        <Suspense fallback={<p className="hint">加载视图…</p>}>
         {view === "contents" && (
           <ContentsView
             editContentId={editContentId}
@@ -193,6 +194,7 @@ export function Shell({
             onAvatarChange={onAvatarChange}
           />
         )}
+        </Suspense>
       </main>
     </div>
   );
