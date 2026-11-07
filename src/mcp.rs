@@ -17,14 +17,14 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use axum::Router;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::schemars::JsonSchema;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::StreamableHttpService;
@@ -207,7 +207,7 @@ impl KychMcp {
 
 #[tool_handler(
     name = "kych-net",
-    version = env!("CARGO_PKG_VERSION"),
+    version = "0.3.0",
     instructions = "KychNet 个人站点的内容只读接口。查询内容用 search_content 定位页面，再用 get_page 读全文；list_pages 可枚举全部已发布页面。"
 )]
 impl ServerHandler for KychMcp {}
@@ -225,10 +225,10 @@ struct SearchParams {
 }
 
 fn text_result(payload: String) -> CallToolResult {
-    CallToolResult::success(vec![Content::text(payload)])
+    CallToolResult::success(vec![ContentBlock::text(payload)])
 }
 
-fn internal_error(error: anyhow::Error) -> McpError {
+fn internal_error(error: impl std::fmt::Display) -> McpError {
     tracing::warn!(%error, "MCP 工具执行失败");
     McpError::internal_error("内部错误", None)
 }
@@ -242,7 +242,7 @@ fn excerpt(body: &str, needle: &str, context: usize) -> String {
     let lower_needle = needle.to_lowercase();
     let Some(byte_pos) = lower_body.find(&lower_needle) else {
         // 没命中（比如命中来自 title）就返回开头一段当摘要。
-        let head: String = body.chars().take(context * 2).collect();
+        let head: String = body.chars().take(context * 2 + 2).collect();
         return head.replace(['\n', '\r'], " ");
     };
 
