@@ -1,28 +1,29 @@
-//! MCP（Model Context Protocol）服务器：把站点内容以只读工具的形式暴露给 AI 客户端。
+//! MCP（Model Context Protocol）服务器：把站点内容与项目文件暴露给 AI 客户端。
 //!
 //! 设计要点：
 //! - **同进程挂载**：`rmcp` 的 Streamable HTTP 服务是一个 Tower service，
 //!   直接 `nest_service` 到 axum 子路由后 merge 进主 Router，不新增部署单元；
-//! - **读写**：内容与项目文件写入需要 MCP_TOKEN；项目提交身份取第一个可用管理员。
+//! - **读写**：内容与项目文件写入需要 MCP OAuth 登录；项目 Git 提交身份取当前 token 对应用户。
 //!   写操作仍走 service/project 层的路径校验，并在写入后触发构建；
-//! - **鉴权**：`MCP_TOKEN` 未设置时整个 `/mcp` 路由不存在（而不是返回 404），
-//!   设置后要求 `Authorization: Bearer <token>`。比较走常量时间，避免时序侧信道；
+//! - **鉴权**：标准 MCP OAuth 2.1，`src/oauth.rs` 提供发现、动态注册、授权码 + PKCE；
+//!   access token 存 SHA-256 哈希，短过期，refresh token 轮换；
 //! - **限流**：复用 `rate::RateLimiter`，按客户端 IP 独立计数，
 //!   防止 AI 批量拉取打爆数据库连接池；
 //! - **不复用主应用的层**：会话（Cookie）、CORS、Origin 白名单都是给浏览器
-//!   和管理端设计的，MCP 客户端不是浏览器，merge 放在主应用 layer 之后，
-//!   天然绕开这些不相关的层（含 `guard_origin`：MCP 的 POST 没有 Origin 头，
-//!   即便走主应用层也不会被拦，但分开挂更清晰）。
+//!   和管理端设计的，MCP 客户端不是浏览器，merge 放在主应用 layer 之后；
+//!   鉴权由 MCP 自己完成。
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use axum::extract::{ConnectInfo, Request, State};
+use axum::http::request::Parts;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use axum::Router;
+use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::schemars::JsonSchema;
@@ -31,7 +32,9 @@ use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, Stream
 use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
 use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use uuid::Uuid;
 
 use crate::models::{ContentFormat, SiteSettings, User};
 use crate::project;
@@ -51,11 +54,14 @@ pub struct KychMcp {
     pool: PgPool,
     content_root: PathBuf,
     site_url: String,
-    /// 写项目文件时作为 Git 提交身份；没有管理员时项目写工具不可用。
-    actor: Option<User>,
     build_out_dir: PathBuf,
     exe: PathBuf,
 }
+
+/// 由 MCP 鉴权层写入 HTTP request extensions，再通过 rmcp 的
+/// `Extension<Parts>` 传给工具；项目提交使用当前登录用户。
+#[derive(Clone)]
+pub struct McpUser(pub User);
 
 /// 单条搜索结果（SQL 查询 + 摘要截取共用）。
 #[derive(Debug, sqlx::FromRow)]
@@ -71,7 +77,6 @@ impl KychMcp {
         pool: PgPool,
         content_root: PathBuf,
         site_url: String,
-        actor: Option<User>,
         build_out_dir: PathBuf,
         exe: PathBuf,
     ) -> Self {
@@ -79,16 +84,9 @@ impl KychMcp {
             pool,
             content_root,
             site_url,
-            actor,
             build_out_dir,
             exe,
         }
-    }
-
-    fn actor(&self) -> Result<&User, McpError> {
-        self.actor
-            .as_ref()
-            .ok_or_else(|| McpError::internal_error("MCP 没有可用于写入的管理员账号", None))
     }
 
     async fn run_build(&self, only: Option<&str>) -> Result<(), McpError> {
@@ -349,13 +347,15 @@ impl KychMcp {
     #[tool(description = "新增或更新项目文件并提交；默认分支的修改会自动触发整站构建。")]
     async fn write_project_file(
         &self,
+        Extension(parts): Extension<Parts>,
         Parameters(params): Parameters<ProjectWriteParams>,
     ) -> Result<CallToolResult, McpError> {
         let p = self.find_project(&params.project).await?;
         let branch = params.branch.unwrap_or_else(|| p.default_branch.clone());
+        let actor = mcp_actor(&parts)?;
         let result = project::write_file(
             &self.pool,
-            self.actor()?,
+            actor,
             p.id,
             &branch,
             &params.path,
@@ -374,13 +374,15 @@ impl KychMcp {
     #[tool(description = "删除项目文件并提交；默认分支的修改会自动触发整站构建。")]
     async fn delete_project_file(
         &self,
+        Extension(parts): Extension<Parts>,
         Parameters(params): Parameters<ProjectDeleteParams>,
     ) -> Result<CallToolResult, McpError> {
         let p = self.find_project(&params.project).await?;
         let branch = params.branch.unwrap_or_else(|| p.default_branch.clone());
+        let actor = mcp_actor(&parts)?;
         let result = project::delete_file(
             &self.pool,
-            self.actor()?,
+            actor,
             p.id,
             &branch,
             &params.path,
@@ -460,6 +462,14 @@ struct ProjectDeleteParams {
     message: Option<String>,
 }
 
+fn mcp_actor(parts: &Parts) -> Result<&User, McpError> {
+    parts
+        .extensions
+        .get::<McpUser>()
+        .map(|user| &user.0)
+        .ok_or_else(|| McpError::internal_error("缺少 MCP 登录用户", None))
+}
+
 fn mcp_filename(slug: &str, format: &str) -> String {
     let name = slug.rsplit('/').next().unwrap_or(slug);
     let ext = match format {
@@ -511,19 +521,11 @@ fn excerpt(body: &str, needle: &str, context: usize) -> String {
 ///
 /// 先各自 SHA-256 折叠成等长摘要再逐字节异或累积，比较耗时与内容无关；
 /// 顺手也把「长度不同提前返回」这条短路径藏进了哈希里。
-fn token_matches(provided: &str, expected: &str) -> bool {
-    use sha2::{Digest, Sha256};
-    let (a, b) = (Sha256::digest(provided.as_bytes()), Sha256::digest(expected.as_bytes()));
-    a.iter()
-        .zip(b.iter())
-        .fold(0u8, |diff, (x, y)| diff | (x ^ y))
-        == 0
-}
 
 /// `/mcp` 的鉴权 + 限流中间件状态。
 #[derive(Clone)]
 struct McpGuard {
-    token: String,
+    pool: PgPool,
     limits: RateLimiter,
     trust_proxy_headers: bool,
 }
@@ -572,31 +574,67 @@ async fn mcp_guard(
             .into_response();
     }
 
-    // 失败响应统一成同一条消息，不区分「没带 token」「带错 token」，
-    // 避免给试探者任何可区分的信号。
     let provided = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "));
-    let authorized = provided.is_some_and(|token| token_matches(token, &guard.token));
-    if !authorized {
-        tracing::warn!(%ip, "MCP 鉴权失败");
-        return (
-            StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, "Bearer")],
-            Json(json!({ "error": "未授权" })),
-        )
-            .into_response();
+    let Some(token) = provided else {
+        return unauthorized();
+    };
+    let hash = Sha256::digest(token.as_bytes()).to_vec();
+    let row: Option<(Uuid, String)> = sqlx::query_as(
+        "SELECT user_id, resource FROM oauth_tokens
+         WHERE access_hash = $1 AND revoked_at IS NULL AND access_expires_at > now()",
+    )
+    .bind(hash)
+    .fetch_optional(&guard.pool)
+    .await
+    .ok()
+    .flatten();
+    let Some((user_id, resource)) = row else {
+        return unauthorized();
+    };
+    if resource != crate::oauth::MCP_RESOURCE {
+        return unauthorized();
     }
-
+    let user: Option<User> = sqlx::query_as(
+        "SELECT * FROM users WHERE id = $1 AND NOT disabled",
+    )
+    .bind(user_id)
+    .fetch_optional(&guard.pool)
+    .await
+    .ok()
+    .flatten();
+    let Some(user) = user else {
+        return unauthorized();
+    };
+    let mut req = req;
+    req.extensions_mut().insert(McpUser(user));
     next.run(req).await
+}
+
+fn unauthorized() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [(
+            header::WWW_AUTHENTICATE,
+            "Bearer resource_metadata=\"https://kych.net/.well-known/oauth-protected-resource\"",
+        )],
+        Json(json!({ "error": "未授权" })),
+    )
+        .into_response()
 }
 
 /// 构建挂在 `/mcp` 上的 MCP 子路由。
 ///
 /// 返回的 Router 自带鉴权与限流层，应 merge 到主应用 layer 链之后，
 /// 避免沾上会话、CORS、Origin 白名单这些浏览器侧的层。
-pub fn router(state: KychMcp, token: String, limits: RateLimiter, trust_proxy_headers: bool) -> Router {
+pub fn router(
+    state: KychMcp,
+    pool: PgPool,
+    limits: RateLimiter,
+    trust_proxy_headers: bool,
+) -> Router {
     // 无状态模式（config 默认即 stateless 的新版本语义按 Default 走）：
     // 每个请求独立处理，不做会话亲和，单实例足够。
     // rmcp 默认只允许 localhost 的 Host 头；线上经 nginx 反代后 Host 是
@@ -615,7 +653,7 @@ pub fn router(state: KychMcp, token: String, limits: RateLimiter, trust_proxy_he
     );
 
     let guard = McpGuard {
-        token,
+        pool,
         limits,
         trust_proxy_headers,
     };
@@ -667,14 +705,6 @@ mod tests {
         let out = excerpt(body, "目标词", 5);
         assert!(out.contains("目标词"));
         assert!(out.contains("其后"));
-    }
-
-    #[test]
-    fn token_comparison_is_exact() {
-        assert!(token_matches("secret", "secret"));
-        assert!(!token_matches("secret", "secreT"));
-        assert!(!token_matches("", "secret"));
-        assert!(!token_matches("secret", ""));
     }
 
     #[test]

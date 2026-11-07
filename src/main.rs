@@ -8,6 +8,7 @@ mod db;
 mod git;
 mod mcp;
 mod models;
+mod oauth;
 mod project;
 mod rate;
 mod render;

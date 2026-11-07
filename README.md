@@ -184,82 +184,85 @@ export PATH=/usr/local/bin:$PATH            # 通常已默认包含
 
 ## MCP 服务器
 
-设置 `MCP_TOKEN` 后,`serve` 会在同一个二进制上挂载 `/mcp`(Streamable HTTP,基于官方 Rust SDK `rmcp`),让 AI 客户端(Claude、Cursor 等)查询和写入站点内容、读写项目文件;未设置时整个路由不存在,不新增攻击面.
+MCP 使用标准 **OAuth 2.1**：MCP 客户端通过动态客户端注册、授权码 + PKCE 登录 KychNet 账号，拿到短期 access token 和 refresh token。不再使用静态 Bearer token。
 
-公网地址是 **`https://kych.net/mcp`**;`api.kych.net` 只是回源 Host,不能作为 MCP 或 Git 的客户端地址.
+公网地址是 **`https://kych.net/mcp`**；`api.kych.net` 只是回源 Host，不能作为 MCP 或 Git 的客户端地址。
 
-- 只读工具:`list_pages`、`get_page`、`search_content`、`site_info`.
-- 写入工具:`save_content`/`delete_content`(内容写入并自动编译当前页)、`list_projects`、`list_project_files`、`read_project_file`、`write_project_file`、`delete_project_file`(项目 Git 文件读写;默认分支写入后整站构建).
-- 项目写操作的 Git 提交身份取第一个可用管理员;MCP token 现在同时具备读写权限,泄露等于站点写权限.
-- 鉴权:`Authorization: Bearer <MCP_TOKEN>`,比较走常量时间;失败统一返回同一条消息,不区分「没带」与「带错」.token 是读写凭据,请像管理员密码一样保管.
-- 限流:按客户端 IP 每分钟 120 次,复用 `rate.rs` 的进程内限流器;IP 来源口径与 `client_ip` 一致(`TRUST_PROXY_HEADERS`).
-- 层隔离:`/mcp` merge 在主应用 layer 链之后,不沾会话、CORS、Origin 白名单这些浏览器侧的层;鉴权与限流由 `src/mcp.rs` 自带.
+### 端点
 
-### 获取 token
+- 资源元数据：`https://kych.net/.well-known/oauth-protected-resource`
+- 授权服务器元数据：`https://kych.net/.well-known/oauth-authorization-server`
+- 动态注册：`POST https://kych.net/oauth/register`
+- 授权：`GET https://kych.net/oauth/authorize`
+- Token：`POST https://kych.net/oauth/token`
+- MCP：`https://kych.net/mcp`
 
-在服务器上读取:
+### 登录
 
-```bash
-sudo cat /root/kych-net-mcp-token.txt
-```
+客户端第一次连 `/mcp` 会收到 `401` 和 `WWW-Authenticate: Bearer resource_metadata=...`，然后自动完成发现和注册，并打开 KychNet 授权页。授权页使用现有账号 + 动态验证码登录；登录后确认权限即可。
 
-token 只应写入客户端配置或环境变量,不要提交到仓库,也不要在聊天/日志里明文传播.
+普通成员和管理员都可以读写 MCP；项目 Git 提交使用当前登录用户作为提交身份。授权页会明确列出读取内容、写入内容、读取项目、写入项目四项权限。
 
-### Claude Desktop
+### 工具
 
-编辑:
+- 只读：`list_pages`、`get_page`、`search_content`、`site_info`
+- 内容写入：`save_content`、`delete_content`
+- 项目读取：`list_projects`、`list_project_files`、`read_project_file`
+- 项目写入：`write_project_file`、`delete_project_file`
 
-- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
-- Windows: `%APPDATA%\\Claude\\claude_desktop_config.json`
+### 客户端安装
 
-加入:
+MCP 客户端需要支持 **Streamable HTTP + OAuth**。不要给客户端配置静态 `Authorization` 头。
 
-```json
-{
-  "mcpServers": {
-    "kych-net": {
-      "url": "https://kych.net/mcp",
-      "headers": { "Authorization": "Bearer <MCP_TOKEN>" }
-    }
-  }
-}
-```
+#### Claude Desktop
 
-保存后完全退出并重启 Claude Desktop.
+编辑：
 
-### Claude Code
-
-```bash
-claude mcp add --transport http kych-net https://kych.net/mcp \
-  --header "Authorization: Bearer <MCP_TOKEN>"
-```
-
-### Cursor
-
-项目级 `.cursor/mcp.json`,或全局 `~/.cursor/mcp.json`:
+- macOS：`~/Library/Application Support/Claude/claude_desktop_config.json`
+- Windows：`%APPDATA%\\Claude\\claude_desktop_config.json`
 
 ```json
 {
   "mcpServers": {
     "kych-net": {
-      "url": "https://kych.net/mcp",
-      "headers": { "Authorization": "Bearer <MCP_TOKEN>" }
+      "url": "https://kych.net/mcp"
     }
   }
 }
 ```
 
-### VS Code / GitHub Copilot MCP
+保存后完全退出并重启 Claude Desktop，首次连接会在浏览器打开授权页。
 
-`.vscode/mcp.json`:
+#### Claude Code
+
+```bash
+claude mcp add --transport http kych-net https://kych.net/mcp
+```
+
+#### Cursor
+
+项目级 `.cursor/mcp.json`，或全局 `~/.cursor/mcp.json`：
+
+```json
+{
+  "mcpServers": {
+    "kych-net": {
+      "url": "https://kych.net/mcp"
+    }
+  }
+}
+```
+
+#### VS Code / GitHub Copilot MCP
+
+`.vscode/mcp.json`：
 
 ```json
 {
   "servers": {
     "kych-net": {
       "type": "http",
-      "url": "https://kych.net/mcp",
-      "headers": { "Authorization": "Bearer <MCP_TOKEN>" }
+      "url": "https://kych.net/mcp"
     }
   }
 }
@@ -267,35 +270,43 @@ claude mcp add --transport http kych-net https://kych.net/mcp \
 
 ### 自检
 
+未带 token 请求 `/mcp`，应得到 401 和发现地址：
+
 ```bash
-curl -sS https://kych.net/mcp \
-  -H "Authorization: Bearer <MCP_TOKEN>" \
+curl -i https://kych.net/mcp \
   -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"1"}}}'
+  -H "Accept: application/json, text/event-stream"
 ```
 
-正常会返回 `text/event-stream`,其中包含 `serverInfo: {"name":"kych-net"}`.
+也可以直接检查元数据：
+
+```bash
+curl -sS https://kych.net/.well-known/oauth-protected-resource
+curl -sS https://kych.net/.well-known/oauth-authorization-server
+```
 
 ### 故障排查
 
-- `401`: token 缺失或错误;
-- `403`: 请求 `Host` 不是 `kych.net`/localhost,或反向代理未正确传 Host;
-- `404`: `MCP_TOKEN` 未设置,`/mcp` 路由未挂载;
-- 客户端只支持 stdio:当前服务是 Streamable HTTP,需要支持远程 HTTP MCP 的客户端.
+- `401`：还没有完成 OAuth，或 access token 过期；客户端应自动刷新；
+- `403`：请求 `Host` 不是 `kych.net`/localhost，或反向代理未正确传 Host；
+- `404`：路径不是 `/mcp`，或 nginx 未转发；
+- 客户端只支持 stdio：当前服务是 Streamable HTTP，需要支持远程 HTTP MCP 的客户端。
 
-### 轮换 token
+### 撤销授权
 
-```bash
-TOKEN=$(openssl rand -base64 32)
-sudo sed -i '/^MCP_TOKEN=/d' /opt/kych-net/.env
-printf 'MCP_TOKEN=%s\n' "$TOKEN" | sudo tee -a /opt/kych-net/.env
-printf '%s\n' "$TOKEN" | sudo tee /root/kych-net-mcp-token.txt >/dev/null
-sudo chmod 600 /root/kych-net-mcp-token.txt
-sudo systemctl restart kych-net
+撤销某个用户的全部 MCP 授权：
+
+```sql
+DELETE FROM oauth_tokens WHERE user_id = '<用户 UUID>';
 ```
 
-然后更新所有客户端配置.
+撤销所有 MCP 授权：
+
+```sql
+DELETE FROM oauth_tokens;
+```
+
+access token 一小时内自然过期；refresh token 最长 30 天。数据库迁移 `0012_oauth` 创建客户端、授权码和 token 表。
 
 ## 项目与 Git
 
