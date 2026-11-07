@@ -958,6 +958,81 @@ td button {
   color: var(--accent);
   border-color: var(--accent);
 }
+.diff-list li.diff-file {
+  display: block;
+  padding: 0;
+  overflow: hidden;
+}
+.diff-file-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  padding: 0.4rem 0.6rem;
+  border-bottom: 1px solid var(--border);
+}
+.diff-file-head code {
+  overflow-wrap: anywhere;
+}
+.diff-stat {
+  margin-left: auto;
+  display: inline-flex;
+  gap: 0.5rem;
+  font-size: 0.8rem;
+  font-variant-numeric: tabular-nums;
+}
+.diff-plus {
+  color: var(--notice-text);
+}
+.diff-minus {
+  color: var(--error-text);
+}
+.diff-hunk {
+  border-top: 1px solid var(--border);
+}
+.diff-hunk:first-of-type {
+  border-top: none;
+}
+.diff-hunk-head {
+  padding: 0.2rem 0.6rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+.diff-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.78rem;
+  line-height: 1.5;
+  table-layout: fixed;
+}
+.diff-no {
+  width: 3.2rem;
+  padding: 0 0.4rem;
+  text-align: right;
+  color: var(--muted);
+  user-select: none;
+  vertical-align: top;
+  font-variant-numeric: tabular-nums;
+}
+.diff-sign {
+  width: 1.2rem;
+  text-align: center;
+  user-select: none;
+  vertical-align: top;
+}
+.diff-text {
+  padding-right: 0.6rem;
+  overflow-x: auto;
+  white-space: pre;
+}
+.diff-row.diff-add {
+  background: var(--notice-bg);
+}
+.diff-row.diff-del {
+  background: var(--error-bg);
+}
 .comment-list li {
   padding: 0.5rem 0.6rem;
   border: 1px solid var(--border);

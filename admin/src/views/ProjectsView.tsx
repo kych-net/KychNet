@@ -837,11 +837,51 @@ export function ProjectsView() {
                         ) : (
                           <ul className="diff-list">
                             {prDetail.files.map((file) => (
-                              <li key={file.path}>
-                                <span className={`diff-status diff-${file.status}`}>
-                                  {DIFF_STATUS_LABEL[file.status]}
-                                </span>
-                                <code>{file.path}</code>
+                              <li key={file.path} className="diff-file">
+                                <div className="diff-file-head">
+                                  <span className={`diff-status diff-${file.status}`}>
+                                    {DIFF_STATUS_LABEL[file.status]}
+                                  </span>
+                                  <code>{file.path}</code>
+                                  <span className="diff-stat">
+                                    <span className="diff-plus">+{file.additions}</span>
+                                    <span className="diff-minus">-{file.deletions}</span>
+                                  </span>
+                                </div>
+                                {file.truncated ? (
+                                  <p className="hint">文件过大或不是文本，未显示行级差异。</p>
+                                ) : file.hunks.length === 0 ? (
+                                  <p className="hint">没有可见的行级变化。</p>
+                                ) : (
+                                  file.hunks.map((hunk, hunkIndex) => (
+                                    <div className="diff-hunk" key={hunkIndex}>
+                                      <div className="diff-hunk-head">{hunk.header}</div>
+                                      <table className="diff-table">
+                                        <tbody>
+                                          {hunk.lines.map((line, lineIndex) => (
+                                            <tr
+                                              key={lineIndex}
+                                              className={`diff-row diff-${line.kind}`}
+                                            >
+                                              <td className="diff-no">{line.old_line ?? ""}</td>
+                                              <td className="diff-no">{line.new_line ?? ""}</td>
+                                              <td className="diff-sign">
+                                                {line.kind === "add"
+                                                  ? "+"
+                                                  : line.kind === "del"
+                                                    ? "-"
+                                                    : " "}
+                                              </td>
+                                              <td className="diff-text">
+                                                <code>{line.text || " "}</code>
+                                              </td>
+                                            </tr>
+                                          ))}
+                                        </tbody>
+                                      </table>
+                                    </div>
+                                  ))
+                                )}
                               </li>
                             ))}
                           </ul>

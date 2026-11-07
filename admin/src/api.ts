@@ -120,11 +120,28 @@ export type PrComment = {
   created_at: string;
 };
 
+export type PrDiffLine = {
+  kind: "context" | "add" | "del";
+  old_line: number | null;
+  new_line: number | null;
+  text: string;
+};
+
+export type PrDiffHunk = {
+  header: string;
+  lines: PrDiffLine[];
+};
+
 export type PrFileDiff = {
   path: string;
   status: "add" | "modify" | "delete";
   old_oid?: string | null;
   new_oid?: string | null;
+  additions: number;
+  deletions: number;
+  /** 文件过大或不是文本时为 true，此时 hunks 为空。 */
+  truncated: boolean;
+  hunks: PrDiffHunk[];
 };
 
 export type PrDetail = PullRequest & {

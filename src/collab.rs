@@ -6,11 +6,12 @@
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
+use similar::{ChangeTag, TextDiff};
 use sqlx::{PgConnection, PgPool};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use uuid::Uuid;
 
-use crate::git::object::{TreeEntry, Oid};
+use crate::git::object::{is_text, ObjectKind, Oid, TreeEntry};
 use crate::git::store;
 use crate::git::tree;
 use crate::models::User;
@@ -18,6 +19,12 @@ use crate::project::valid_branch;
 
 /// 与 `git/http.rs` 保持一致的提交遍历上限，防止过深历史拖垮请求。
 const MAX_COMMIT_WALK: usize = 5000;
+
+/// 行级差异的展示上限：超过任一限制就只显示文件名，不生成 hunks。
+const DIFF_MAX_BYTES: usize = 200 * 1024;
+const DIFF_MAX_LINES: usize = 4000;
+/// 每个 hunk 上下保留的相等行数。
+const DIFF_CONTEXT: usize = 3;
 
 const PR_SELECT: &str = "SELECT pr.id, pr.project_id, pr.number, pr.title, pr.body,
         pr.source_branch, pr.target_branch, pr.status, pr.created_at, pr.updated_at,
@@ -57,12 +64,33 @@ pub struct PrComment {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+pub struct DiffLine {
+    /// `context` / `add` / `del`
+    pub kind: String,
+    pub old_line: Option<usize>,
+    pub new_line: Option<usize>,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DiffHunk {
+    /// 形如 `@@ -1,3 +1,4 @@`。
+    pub header: String,
+    pub lines: Vec<DiffLine>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct FileDiff {
     pub path: String,
     /// `add` / `modify` / `delete`
     pub status: String,
     pub old_oid: Option<String>,
     pub new_oid: Option<String>,
+    pub additions: usize,
+    pub deletions: usize,
+    /// 文件过大或不是文本时置为 true，此时 `hunks` 为空。
+    pub truncated: bool,
+    pub hunks: Vec<DiffHunk>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -211,14 +239,95 @@ async fn diff_trees(
             (Some(_), None) => "delete",
             _ => "modify",
         };
+
+        // 新增/删除时缺失的一侧按空文件处理，只有真实存在却读不出文本才视为无法展示。
+        let old_text = match old_oid {
+            None => Some(String::new()),
+            Some(oid) => blob_text(conn, project_id, oid).await?,
+        };
+        let new_text = match new_oid {
+            None => Some(String::new()),
+            Some(oid) => blob_text(conn, project_id, oid).await?,
+        };
+        let (additions, deletions, hunks, truncated) = match (old_text, new_text) {
+            (Some(old_text), Some(new_text)) => {
+                if old_text.len() > DIFF_MAX_BYTES
+                    || new_text.len() > DIFF_MAX_BYTES
+                    || old_text.lines().count() > DIFF_MAX_LINES
+                    || new_text.lines().count() > DIFF_MAX_LINES
+                {
+                    (0, 0, Vec::new(), true)
+                } else {
+                    let (hunks, additions, deletions) = compute_diff(&old_text, &new_text);
+                    (additions, deletions, hunks, false)
+                }
+            }
+            _ => (0, 0, Vec::new(), true),
+        };
+
         diffs.push(FileDiff {
             path: path.clone(),
             status: status.to_string(),
             old_oid: old_oid.map(|oid| oid.to_hex()),
             new_oid: new_oid.map(|oid| oid.to_hex()),
+            additions,
+            deletions,
+            truncated,
+            hunks,
         });
     }
     Ok(diffs)
+}
+
+/// 读取 blob 的文本内容；不是 blob 或不是合法 UTF-8 时返回 None。
+async fn blob_text(conn: &mut PgConnection, project_id: Uuid, oid: Oid) -> Result<Option<String>> {
+    let object = store::require_object(conn, project_id, oid).await?;
+    if object.kind != ObjectKind::Blob || !is_text(&object.data) {
+        return Ok(None);
+    }
+    Ok(Some(String::from_utf8_lossy(&object.data).into_owned()))
+}
+
+/// 生成按 hunk 分组的行级差异，并统计新增/删除行数。
+fn compute_diff(old: &str, new: &str) -> (Vec<DiffHunk>, usize, usize) {
+    let diff = TextDiff::from_lines(old, new);
+    let mut additions = 0;
+    let mut deletions = 0;
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            ChangeTag::Insert => additions += 1,
+            ChangeTag::Delete => deletions += 1,
+            ChangeTag::Equal => {}
+        }
+    }
+
+    let mut hunks = Vec::new();
+    for hunk in diff
+        .unified_diff()
+        .context_radius(DIFF_CONTEXT)
+        .iter_hunks()
+    {
+        let mut lines = Vec::new();
+        for line in hunk.iter_changes() {
+            let kind = match line.tag() {
+                ChangeTag::Insert => "add",
+                ChangeTag::Delete => "del",
+                ChangeTag::Equal => "context",
+            };
+            lines.push(DiffLine {
+                kind: kind.to_string(),
+                old_line: line.old_index().map(|index| index + 1),
+                new_line: line.new_index().map(|index| index + 1),
+                // 行内容已按行切分，尾部换行不属于展示内容。
+                text: line.to_string().trim_end_matches('\n').to_string(),
+            });
+        }
+        hunks.push(DiffHunk {
+            header: hunk.header().to_string(),
+            lines,
+        });
+    }
+    (hunks, additions, deletions)
 }
 
 async fn fetch_pr(
@@ -636,4 +745,42 @@ pub async fn close_discussion(
     fetch_discussion(&mut conn, project_id, discussion_id)
         .await?
         .context("讨论关闭后无法读取")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn computes_line_numbers_and_stats() {
+        let old = "a\nb\nc\nd\n";
+        let new = "a\nB\nc\nd\ne\n";
+        let (hunks, additions, deletions) = compute_diff(old, new);
+        assert_eq!(additions, 2);
+        assert_eq!(deletions, 1);
+        assert_eq!(hunks.len(), 1);
+        let lines = &hunks[0].lines;
+        // 3 行上下文 + 1 删 + 2 增。
+        assert_eq!(lines.len(), 6);
+        assert!(lines.iter().any(|line| line.kind == "del"
+            && line.old_line == Some(2)
+            && line.new_line.is_none()
+            && line.text == "b"));
+        assert!(lines.iter().any(|line| line.kind == "add"
+            && line.old_line.is_none()
+            && line.new_line == Some(2)
+            && line.text == "B"));
+        assert_eq!(hunks[0].header, "@@ -1,4 +1,5 @@");
+    }
+
+    #[test]
+    fn added_file_marks_every_line() {
+        let (hunks, additions, deletions) = compute_diff("", "x\ny\n");
+        assert_eq!((additions, deletions), (2, 0));
+        assert_eq!(hunks.len(), 1);
+        assert!(hunks[0]
+            .lines
+            .iter()
+            .all(|line| line.kind == "add" && line.old_line.is_none()));
+    }
 }
