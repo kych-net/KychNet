@@ -930,7 +930,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d045de693cb712d0b22c6a64be5b953f67b3ce00ab5ad3dd5d8b441886ab8e1a"
 dependencies = [
  "quote",
- "syn 3.0.9",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -1110,9 +1110,9 @@ checksum = "b5320ae4c3782150d900b79807611a59a99fc9a1d61d686faafc24b93fc8d7ca"
 
 [[package]]
 name = "enum-map"
-version = "3.1.0"
+version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4532960034c15ba2f55e9eee631040ecc473c32e6c4b200828c759840f13a06"
+checksum = "8bcdc686c6ff67c32b4fe75540427c50a38253431f2d061d65a79ea35e168058"
 dependencies = [
  "enum-map-derive",
 ]
@@ -2428,16 +2428,21 @@ dependencies = [
  "askama",
  "axum",
  "base32",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "dotenvy",
+ "flate2",
  "ftml",
+ "hex",
  "openssl",
  "pulldown-cmark",
  "rand 0.8.8",
  "roxmltree",
  "serde",
  "serde_json",
+ "sha1",
+ "sha2",
  "sqlx",
  "thiserror 2.0.21",
  "time",
