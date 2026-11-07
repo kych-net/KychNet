@@ -374,6 +374,20 @@ fn shallow_response(boundaries: &[Oid], unshallow: &[Oid]) -> Vec<u8> {
     out
 }
 
+/// protocol v2 的 packfile 数据必须走 sideband pkt-line：
+/// 4 字节长度 + 1 字节 channel + 数据；单包数据上限 65515 字节。
+fn sideband_pack(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for chunk in data.chunks(65_515) {
+        let mut payload = Vec::with_capacity(chunk.len() + 1);
+        payload.push(1);
+        payload.extend_from_slice(chunk);
+        out.extend(proto::pkt(&payload));
+    }
+    out.extend(proto::flush());
+    out
+}
+
 /// v0 upload-pack。
 pub async fn upload_pack(pool: &PgPool, project: &Project, body: &[u8]) -> Result<Vec<u8>> {
     let request = proto::parse_upload_request(body)?;
@@ -570,8 +584,7 @@ async fn v2_fetch(
         out.extend(proto::delim());
     }
     out.extend(proto::pkt_str("packfile\n"));
-    out.extend(proto::build_pack(&objects));
-    out.extend(proto::flush());
+    out.extend(sideband_pack(&proto::build_pack(&objects)));
     Ok(out)
 }
 
