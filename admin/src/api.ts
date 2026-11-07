@@ -24,7 +24,7 @@ export type Invite = {
   created_at: string;
 };
 
-export type ContentFormat = "markdown" | "html" | "typst" | "wikidot";
+export type ContentFormat = "markdown" | "html" | "typst" | "wikidot" | "css";
 
 export type Content = {
   id: string;
@@ -39,6 +39,7 @@ export type Content = {
 
 /** 输出路径对应的源文件路径，用于编辑器展示。 */
 export function sourcePath(item: { slug: string; format: ContentFormat }): string {
+  if (item.format === "css") return item.slug;
   const ext =
     item.format === "markdown" ? ".md" : item.format === "typst" ? ".typ" : item.format === "wikidot" ? ".wj" : ".html";
   return item.slug.replace(/\.html$/, ext);

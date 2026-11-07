@@ -62,6 +62,7 @@ pub enum ContentFormat {
     Html,
     Typst,
     Wikidot,
+    Css,
 }
 
 impl ContentFormat {
@@ -71,6 +72,7 @@ impl ContentFormat {
             "html" => Some(Self::Html),
             "typst" => Some(Self::Typst),
             "wikidot" => Some(Self::Wikidot),
+            "css" => Some(Self::Css),
             _ => None,
         }
     }
@@ -82,6 +84,7 @@ impl ContentFormat {
             Self::Html => "html",
             Self::Typst => "typst",
             Self::Wikidot => "wikidot",
+            Self::Css => "css",
         }
     }
 
@@ -92,6 +95,7 @@ impl ContentFormat {
             Self::Html => ".html",
             Self::Typst => ".typ",
             Self::Wikidot => ".wj",
+            Self::Css => ".css",
         }
     }
 
@@ -102,6 +106,7 @@ impl ContentFormat {
             "html" => Some(Self::Html),
             "typ" => Some(Self::Typst),
             "wj" => Some(Self::Wikidot),
+            "css" => Some(Self::Css),
             _ => None,
         }
     }

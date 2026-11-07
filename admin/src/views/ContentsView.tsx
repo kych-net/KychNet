@@ -7,7 +7,7 @@ type Props = {
 };
 
 function extensionFor(format: ContentFormat): string {
-  return format === "markdown" ? ".md" : format === "typst" ? ".typ" : format === "wikidot" ? ".wj" : ".html";
+  return format === "markdown" ? ".md" : format === "typst" ? ".typ" : format === "wikidot" ? ".wj" : format === "css" ? ".css" : ".html";
 }
 
 export function ContentsView({ editContentId, onEditHandled }: Props) {
@@ -129,6 +129,7 @@ export function ContentsView({ editContentId, onEditHandled }: Props) {
               <option value="html">HTML</option>
               <option value="typst">Typst</option>
               <option value="wikidot">Wikidot</option>
+              <option value="css">CSS</option>
             </select>
           </label>
         </div>
@@ -136,6 +137,8 @@ export function ContentsView({ editContentId, onEditHandled }: Props) {
           目录主页必须写 <code>/eoe/index</code>，不再接受 <code>/eoe/</code>；普通页面用 <code>/reff/93df/l.html</code>。
           <code>.html/.md/.typ/.wj</code> 最终都输出同一个 <code>.html</code>，同一路径只保留一条内容。
           <code>/api</code> 是保留路径；<code>/index.html</code> 是主页，只能编辑不能删除。
+          CSS 文件必须使用 <code>/css/xxx</code> 路径和 CSS 格式；页面正文最前面写
+          <code>---</code>、<code>css: /css/xxx.css</code>、<code>---</code> 才会加载它。
         </p>
         <label>
           正文

@@ -16,6 +16,7 @@ struct IndexTemplate {
     admin_url: String,
     posts: Vec<PostLink>,
     tree: String,
+    styles: Vec<String>,
 }
 
 struct PostLink {
@@ -34,6 +35,7 @@ struct PageTemplate {
     content: String,
     pdf_url: String,
     tree: String,
+    styles: Vec<String>,
 }
 
 /// 一篇已经渲染完成的页面，先留在内存里，等全部成功后再统一落盘。
@@ -202,23 +204,133 @@ fn make_parent_dirs_public(out: &Path, parent: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 页面顶部显式声明要加载的 CSS：
+///
+/// ```text
+/// ---
+/// css: /css/theme.css, /css/wikidot.css
+/// ---
+/// ```
+///
+/// 返回 (链接列表, 去掉声明头后的正文)。格式未知或没有声明时原样返回。
+fn parse_page_styles(body: &str) -> Result<(Vec<String>, String)> {
+    let lines: Vec<&str> = body.lines().collect();
+    if lines.first().map(|line| line.trim()) != Some("---") {
+        return Ok((Vec::new(), body.to_string()));
+    }
+    let Some(end) = lines
+        .iter()
+        .enumerate()
+        .skip(1)
+        .take(60)
+        .find(|(_, line)| line.trim() == "---")
+        .map(|(index, _)| index)
+    else {
+        return Ok((Vec::new(), body.to_string()));
+    };
+
+    let mut styles = Vec::new();
+    for line in &lines[1..end] {
+        let Some(value) = line
+            .trim()
+            .strip_prefix("css:")
+            .or_else(|| line.trim().strip_prefix("styles:"))
+        else {
+            continue;
+        };
+        for token in value.split([',', ';', ' ', '\t']) {
+            let token = token.trim();
+            if token.is_empty() {
+                continue;
+            }
+            let (slug, _) = service::normalize_content_path(token, ContentFormat::Css)
+                .with_context(|| format!("页面 CSS 声明非法: {token}"))?;
+            let href = format!("/{slug}");
+            if !styles.contains(&href) {
+                styles.push(href);
+            }
+        }
+    }
+
+    let stripped = lines[end + 1..].join("\n");
+    let stripped = if body.ends_with('\n') && !stripped.is_empty() {
+        format!("{stripped}\n")
+    } else {
+        stripped
+    };
+    Ok((styles, stripped))
+}
+
+fn write_style(out: &Path, content: &Content) -> Result<()> {
+    if !service::valid_style_slug(&content.slug) {
+        bail!("非法 CSS 路径: {}", content.slug);
+    }
+    let target = out.join(&content.slug);
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+        make_parent_dirs_public(out, parent)?;
+    }
+    std::fs::write(&target, &content.body)?;
+    make_public(&target, false)?;
+    Ok(())
+}
+
+/// 全站构建时清掉 /css 下由内容生成的 .css；其它静态资源保留。
+fn clean_styles(root: &Path) -> Result<()> {
+    let dir = root.join("css");
+    if !dir.exists() {
+        return Ok(());
+    }
+    fn clean(dir: &Path) -> Result<bool> {
+        let mut empty = true;
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                if clean(&path)? {
+                    std::fs::remove_dir(&path)?;
+                } else {
+                    empty = false;
+                }
+            } else if file_type.is_file() {
+                if path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("css")) {
+                    std::fs::remove_file(&path)?;
+                } else {
+                    empty = false;
+                }
+            } else {
+                empty = false;
+            }
+        }
+        Ok(empty)
+    }
+    clean(&dir)?;
+    Ok(())
+}
+
 pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
     let settings = service::get_settings(pool).await?;
     let all = service::list_published(pool).await?;
 
-    let contents: Vec<Content> = all
-        .into_iter()
-        .filter(|content| {
-            if service::valid_content_slug(&content.slug) {
-                true
+    let mut contents = Vec::new();
+    let mut styles = Vec::new();
+    for content in all {
+        if content.format() == ContentFormat::Css {
+            if service::valid_style_slug(&content.slug) {
+                styles.push(content);
             } else {
-                // 历史脏数据不该让整站构建永久失败。新增数据已在 save_content 拦住，
-                // 这里只作兜底：跳过并告警，索引和目录树里也不会出现它。
-                tracing::warn!("跳过非法 slug: {:?}", content.slug);
-                false
+                tracing::warn!("跳过非法 CSS slug: {:?}", content.slug);
             }
-        })
-        .collect();
+        } else if service::valid_content_slug(&content.slug) {
+            contents.push(content);
+        } else {
+            // 历史脏数据不该让整站构建永久失败。新增数据已在 save_content 拦住，
+            // 这里只作兜底：跳过并告警，索引和目录树里也不会出现它。
+            tracing::warn!("跳过非法 slug: {:?}", content.slug);
+        }
+    }
+    styles.sort_by(|a, b| a.slug.cmp(&b.slug));
 
     let mut tree = TreeNode::default();
     let mut wikidot_includes = HashMap::new();
@@ -243,12 +355,13 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
             .strip_suffix(".html")
             .unwrap_or(&content.slug)
             .replace('/', ":");
+        let (styles, body) = parse_page_styles(&content.body)?;
         let ctx = render::DocContext {
             page: &page,
             title: &content.title,
             includes: &wikidot_includes,
         };
-        let rendered = render::render_doc(content.format(), &content.body, &cfg.content_root, &ctx)
+        let rendered = render::render_doc(content.format(), &body, &cfg.content_root, &ctx)
             .with_context(|| format!("渲染 {} 失败", content.slug))?;
 
         let date = content.updated_at.format("%Y-%m-%d").to_string();
@@ -265,6 +378,7 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
             content: rendered.html,
             pdf_url,
             tree: tree_html.clone(),
+            styles,
         };
         pages.push(BuiltPage {
             slug: content.slug.clone(),
@@ -295,6 +409,7 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
                 admin_url: cfg.admin_origin.clone(),
                 posts: links,
                 tree: tree_html,
+                styles: Vec::new(),
             }
             .render()?,
         )
@@ -305,6 +420,11 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
     std::fs::create_dir_all(out)?;
     make_public(out, true)?;
     clean_generated(out)?;
+    clean_styles(out)?;
+
+    for style in &styles {
+        write_style(out, style)?;
+    }
 
     for page in &pages {
         let target = out.join(&page.slug);
@@ -343,21 +463,38 @@ pub async fn run_one(
     only: &str,
     remove: Option<&str>,
 ) -> Result<()> {
-    if !service::valid_content_slug(only) {
+    if !service::valid_content_slug(only) && !service::valid_style_slug(only) {
         bail!("非法内容路径: {only}");
     }
     if let Some(old) = remove {
-        if old != only && service::valid_content_slug(old) {
+        if old != only && (service::valid_content_slug(old) || service::valid_style_slug(old)) {
             remove_output(out, old)?;
         }
     }
 
     let settings = service::get_settings(pool).await?;
     let all = service::list_published(pool).await?;
-    let contents: Vec<Content> = all
-        .into_iter()
-        .filter(|content| service::valid_content_slug(&content.slug))
-        .collect();
+    let mut contents = Vec::new();
+    let mut styles = Vec::new();
+    for content in all {
+        if content.format() == ContentFormat::Css {
+            if service::valid_style_slug(&content.slug) {
+                styles.push(content);
+            }
+        } else if service::valid_content_slug(&content.slug) {
+            contents.push(content);
+        }
+    }
+    styles.sort_by(|a, b| a.slug.cmp(&b.slug));
+
+    if service::valid_style_slug(only) {
+        if let Some(style) = styles.iter().find(|style| style.slug == only) {
+            write_style(out, style)?;
+        } else {
+            remove_output(out, only)?;
+        }
+        return Ok(());
+    }
 
     let mut tree = TreeNode::default();
     let mut wikidot_includes = HashMap::new();
@@ -379,6 +516,7 @@ pub async fn run_one(
         return Ok(());
     };
 
+    let (styles, body) = parse_page_styles(&content.body)?;
     let page = content
         .slug
         .strip_suffix(".html")
@@ -389,7 +527,7 @@ pub async fn run_one(
         title: &content.title,
         includes: &wikidot_includes,
     };
-    let rendered = render::render_doc(content.format(), &content.body, &cfg.content_root, &ctx)
+    let rendered = render::render_doc(content.format(), &body, &cfg.content_root, &ctx)
         .with_context(|| format!("渲染 {} 失败", content.slug))?;
     let date = content.updated_at.format("%Y-%m-%d").to_string();
     let pdf_url = if rendered.pdf.is_some() {
@@ -405,6 +543,7 @@ pub async fn run_one(
         content: rendered.html,
         pdf_url,
         tree: tree_html,
+        styles,
     }
     .render()?;
 
@@ -431,12 +570,17 @@ pub async fn run_one(
 
 /// 删除单页产物，并清掉因此变空的目录。
 fn remove_output(out: &Path, slug: &str) -> Result<()> {
-    if !service::valid_content_slug(slug) {
+    if !service::valid_content_slug(slug) && !service::valid_style_slug(slug) {
         return Ok(());
     }
+    let is_page = service::valid_content_slug(slug);
     let html = out.join(slug);
-    let pdf = out.join(pdf_path(slug));
-    for path in [&html, &pdf] {
+    let pdf = if is_page {
+        Some(out.join(pdf_path(slug)))
+    } else {
+        None
+    };
+    for path in [Some(&html), pdf.as_ref()].into_iter().flatten() {
         match std::fs::remove_file(path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -518,6 +662,7 @@ mod tests {
                 date: "2026-11-06".into(),
             }],
             tree: tree.clone(),
+            styles: Vec::new(),
         };
         let html = index.render().unwrap();
         assert!(html.contains("第一篇"));
@@ -531,6 +676,7 @@ mod tests {
             content: "<p>正文</p>".into(),
             pdf_url: "/demo.pdf".into(),
             tree,
+            styles: Vec::new(),
         };
         let html = page.render().unwrap();
         assert!(html.contains("<p>正文</p>"));
@@ -602,6 +748,20 @@ mod tests {
         assert_eq!(std::fs::metadata(base.join("nested")).unwrap().permissions().mode() & 0o777, 0o755);
         assert_eq!(std::fs::metadata(base.join("nested/page.html")).unwrap().permissions().mode() & 0o777, 0o644);
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn parses_page_css_declaration() {
+        let (styles, body) = parse_page_styles(
+            "---\ncss: /css/theme.css, /css/wikidot\n---\n\n**正文**\n",
+        )
+        .unwrap();
+        assert_eq!(styles, vec!["/css/theme.css", "/css/wikidot.css"]);
+        assert_eq!(body, "\n**正文**\n");
+
+        let (styles, body) = parse_page_styles("**正文**").unwrap();
+        assert!(styles.is_empty());
+        assert_eq!(body, "**正文**");
     }
 
     #[test]

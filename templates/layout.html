@@ -4,6 +4,9 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>{% block title %}{{ site.site_name }}{% endblock %}</title>
+    {% for href in styles %}
+    <link rel="stylesheet" href="{{ href }}" />
+    {% endfor %}
     <style>
       :root {
         --bg: #f7f7f5;

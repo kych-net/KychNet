@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use ftml::data::{PageInfo, PageRef, ScoreValue};
 use ftml::includes::{FetchedPage, IncludeRef, Includer};
 use ftml::layout::Layout;
@@ -70,6 +70,7 @@ pub fn render_doc(
         }),
         ContentFormat::Typst => render_typst(body, root),
         ContentFormat::Wikidot => render_wikidot(body, ctx),
+        ContentFormat::Css => bail!("CSS 文件不是页面，不能走页面渲染"),
     }
 }
 
