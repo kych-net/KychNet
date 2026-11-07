@@ -288,7 +288,7 @@ Trae 目前不原生执行 MCP OAuth，直接填远程 `url` 会得到 401。用
 也可以直接编辑全局配置：
 
 - macOS：`~/Library/Application Support/Trae/User/mcp.json`
-- Windows：`%APPDATA%\\Trae\\User\\mcp.json`
+- Windows：`%APPDATA%\Trae\User\mcp.json`
 - Linux：`~/.config/Trae/User/mcp.json`
 
 保存后首次连接会在浏览器打开 KychNet 授权页。`mcp-remote` 会在本地缓存 token；不要额外配置 `Authorization` 头。
