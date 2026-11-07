@@ -825,7 +825,7 @@ async fn save_content(
 ) -> ApiResult<Json<serde_json::Value>> {
     current_user(&state, &session).await?;
     let Some(format) = crate::models::ContentFormat::parse(&req.format) else {
-        api_bail!("format 只能是 markdown、html、typst 或 wikidot");
+        api_bail!("format 只能是 markdown、html、typst、wikidot 或 css");
     };
     // 路径在这里归一化成输出路径：
     //   /xef/ -> xef/index.html

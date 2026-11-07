@@ -61,8 +61,22 @@ pub fn valid_content_slug(slug: &str) -> bool {
     if segments.is_empty() || segments.iter().any(|s| !valid_segment(s)) {
         return false;
     }
-    // `/api` 与 `/api/...` 是后端保留路径，不能作为内容页。
-    !segments[0].eq_ignore_ascii_case("api")
+    // `/api` 与 `/css` 是保留命名空间，不能作为 HTML 内容页。
+    !segments[0].eq_ignore_ascii_case("api") && !segments[0].eq_ignore_ascii_case("css")
+}
+
+/// 校验 `/css/...css` 路径（数据库里的输出路径，例如 `css/theme.css`）。
+pub fn valid_style_slug(slug: &str) -> bool {
+    let Some(stem) = slug.strip_suffix(".css") else {
+        return false;
+    };
+    if slug.len() > MAX_PATH_BYTES {
+        return false;
+    }
+    let segments: Vec<&str> = stem.split('/').collect();
+    segments.len() >= 2
+        && segments[0] == "css"
+        && segments.iter().all(|segment| valid_segment(segment))
 }
 
 /// 把用户输入的路径归一化成数据库里的输出路径，并从扩展名推断格式。
@@ -92,6 +106,28 @@ pub fn normalize_content_path(
     if trimmed.ends_with('/') {
         bail!("目录路径请显式写出文件名，例如 /xef/index");
     }
+
+    if requested == ContentFormat::Css {
+        let raw = trimmed.trim_start_matches('/');
+        let mut parts: Vec<String> = raw.split('/').map(str::to_string).collect();
+        if parts.len() < 2 || !parts[0].eq_ignore_ascii_case("css") {
+            bail!("CSS 路径必须放在 /css/ 下，例如 /css/theme");
+        }
+        parts[0] = "css".to_string();
+        let last = parts.last_mut().expect("parts 至少有两个元素");
+        if let Some((stem, ext)) = last.rsplit_once('.') {
+            if !ext.eq_ignore_ascii_case("css") {
+                bail!("CSS 文件必须使用 .css 扩展名");
+            }
+            *last = stem.to_string();
+        }
+        let slug = format!("{}.css", parts.join("/"));
+        if !valid_style_slug(&slug) {
+            bail!("CSS 路径只能包含 Unicode 字母/数字、-、_ 和 /");
+        }
+        return Ok((slug, ContentFormat::Css));
+    }
+
     let raw = trimmed.trim_start_matches('/').to_string();
 
     let mut parts: Vec<String> = raw.split('/').map(str::to_string).collect();
@@ -144,6 +180,9 @@ pub fn normalize_content_path(
 
 /// 输出路径对应的源文件路径，用于编辑器和目录树展示。
 pub fn source_path(slug: &str, format: ContentFormat) -> String {
+    if format == ContentFormat::Css {
+        return slug.to_string();
+    }
     match slug.strip_suffix(".html") {
         Some(stem) => format!("{stem}{}", format.extension()),
         None => slug.to_string(),
@@ -586,6 +625,17 @@ mod tests {
             normalize_content_path("/wiki.wj", ContentFormat::Wikidot).unwrap(),
             ("wiki.html".to_string(), ContentFormat::Wikidot)
         );
+        assert_eq!(
+            normalize_content_path("/css/theme", ContentFormat::Css).unwrap(),
+            ("css/theme.css".to_string(), ContentFormat::Css)
+        );
+        assert_eq!(
+            normalize_content_path("/css/theme.css", ContentFormat::Css).unwrap(),
+            ("css/theme.css".to_string(), ContentFormat::Css)
+        );
+        assert!(normalize_content_path("/css/", ContentFormat::Css).is_err());
+        assert!(normalize_content_path("/css/theme.md", ContentFormat::Css).is_err());
+        assert!(normalize_content_path("/other/theme.css", ContentFormat::Css).is_err());
     }
 
     #[test]
@@ -651,6 +701,7 @@ mod tests {
             "a#b.html",
             "api.html",
             "API/index.html",
+            "css/index.html",
             "😀.html",
         ] {
             assert!(!valid_content_slug(slug), "应当拒绝: {slug:?}");
@@ -671,5 +722,6 @@ mod tests {
         assert_eq!(source_path("eoe/index.html", ContentFormat::Typst), "eoe/index.typ");
         assert_eq!(source_path("reff/93df/l.html", ContentFormat::Html), "reff/93df/l.html");
         assert_eq!(source_path("wiki.html", ContentFormat::Wikidot), "wiki.wj");
+        assert_eq!(source_path("css/theme.css", ContentFormat::Css), "css/theme.css");
     }
 }

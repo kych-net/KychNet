@@ -23,6 +23,7 @@
 | html | 原样注入模板,不做转义与过滤 |
 | typst | typst 编译为 HTML,并同时输出 PDF 供下载 |
 | wikidot | ftml 解析 Wikidot 语法并渲染 HTML,支持 `[[include]]`;项目因此按 AGPL-3.0 分发 |
+| css | 原样写入 `/css/*.css`,供页面显式引用 |
 
 这些格式均不做内容限制,内容作者均为邀请注册的可信用户,因此允许存储型 XSS 是项目明确的取舍。
 
@@ -42,7 +43,7 @@
 | --- | --- |
 | 后端框架 | Rust + Axum + Tokio |
 | 静态生成 | Askama 模板 + `build` 子命令 |
-| 内容渲染 | pulldown-cmark / typst |
+| 内容渲染 | pulldown-cmark / typst / ftml / CSS |
 | 数据库 | PostgreSQL + SQLx |
 | 认证 | webauthn-rs(Passkey) + totp-rs(TOTP) |
 | 会话 | tower-sessions + Postgres store(schema `tower_sessions`,表 `session`) + HttpOnly/Secure/SameSite=Strict Cookie,登录后轮换会话 ID,有效期 8 小时 |
@@ -189,7 +190,15 @@ cd admin && pnpm install && cp .env.example .env && pnpm dev
 
 - 内容以数据库为唯一事实源,构建直接读库,不调用线上 API.
 - 站点名称、图标与顶栏导航存于 `site_settings`,由管理端编辑,构建时读取.
-- 内容路径允许嵌套目录,路径段只允许 Unicode 字母/数字、`-` `_`;目录主页必须显式写出文件名,例如 `/xef/index` 归一化为 `xef/index.html`;不再接受 `/xef/`.页面可写 `/reff/93df/l.html`,也可写 `.md/.typ` 由扩展名决定格式,但最终都输出 `.html`,同一路径只保留一条.`/api` 与 `/api/...` 保留;`index.html` 固定为网站主页,可编辑不可删除.路径总长上限 512 字节、单段上限 200 字节;链接中的非 ASCII 路径段按 `%XX` 编码,磁盘文件名保持原始 UTF-8.
+- 内容路径允许嵌套目录,路径段只允许 Unicode 字母/数字、`-` `_`;目录主页必须显式写出文件名,例如 `/xef/index` 归一化为 `xef/index.html`;不再接受 `/xef/`.页面可写 `/reff/93df/l.html`,也可写 `.md/.typ/.wj` 由扩展名决定格式,但最终都输出 `.html`,同一路径只保留一条.`/api` 与 `/css` 保留;`index.html` 固定为网站主页,可编辑不可删除.路径总长上限 512 字节、单段上限 200 字节;链接中的非 ASCII 路径段按 `%XX` 编码,磁盘文件名保持原始 UTF-8.
+- 自定义 CSS 使用 CSS 格式,路径必须写成 `/css/theme` 或 `/css/theme.css`,输出 `css/theme.css`;页面要在正文最前面显式声明才会加载:
+  ```text
+  ---
+  css: /css/theme.css, /css/wikidot.css
+  ---
+  ```
+  只有声明了 `css:` 的页面才会生成对应的 `<link rel="stylesheet">`;CSS 文件本身不会出现在内容站目录树里.
+- 技术栈中的内容渲染包含 pulldown-cmark、Typst、ftml;管理端和技术栈表不再单独维护 CSS 项.
 - 模板与 API 共用同一套领域模型,避免两端口径漂移.
 - Typst 在当前进程内编译,由 `VirtualPath::resolve(root)` 加 canonicalize 双重校验把文件读取限制在 `CONTENT_ROOT` 内,避免内容作者通过 `#include` 读到构建机上的任意文件;父目录校验之外还会对目标文件本身做 `symlink_metadata` 判断,内容目录里的符号链接一律拒绝(否则 `link.png -> /etc/passwd` 会被 `fs::read` 跟进去).生产仍建议放进断网容器并加 CPU/内存限额,构建机上的 `.env` 与云凭据不要落在可读目录.
 - Wikidot 由 [ftml](https://docs.rs/ftml) 渲染,`[[include]]` 在构建时从数据库预取 Wikidot 页面并限制 8 层递归;`ftml` 是 AGPL-3.0,因此本项目也按 AGPL-3.0 分发,见 `LICENSE`.
