@@ -22,6 +22,172 @@ pub fn flush() -> Vec<u8> {
     b"0000".to_vec()
 }
 
+/// protocol v2 的 delim-pkt，用来分隔命令/能力段与参数段。
+pub fn delim() -> Vec<u8> {
+    b"0001".to_vec()
+}
+
+/// 读取一条 pkt-line 头，返回 `(长度, 头占用字节)`。
+fn read_header(data: &[u8], pos: usize) -> Result<usize> {
+    if pos + 4 > data.len() {
+        bail!("pkt-line 数据被截断");
+    }
+    let header = std::str::from_utf8(&data[pos..pos + 4])
+        .map_err(|_| anyhow::anyhow!("pkt-line 长度不是 ASCII"))?;
+    usize::from_str_radix(header, 16).map_err(|_| anyhow::anyhow!("pkt-line 长度非法: {header}"))
+}
+
+/// protocol v2 的命令请求。
+///
+/// 第一段是 `command=...` 与客户端能力，delim 之后是命令参数，flush 结束。
+pub struct V2Request {
+    pub command: String,
+    pub args: Vec<String>,
+}
+
+pub fn parse_v2_request(data: &[u8]) -> Result<V2Request> {
+    let mut command = String::new();
+    let mut args = Vec::new();
+    let mut in_args = false;
+    let mut pos = 0usize;
+    loop {
+        let length = read_header(data, pos)?;
+        match length {
+            0 => break,
+            1 => {
+                in_args = true;
+                pos += 4;
+            }
+            2 => break,
+            3 => bail!("非法的 pkt-line 长度"),
+            _ => {
+                if length < 4 || pos + length > data.len() {
+                    bail!("pkt-line 长度超出数据范围");
+                }
+                let payload = &data[pos + 4..pos + length];
+                let text = String::from_utf8_lossy(payload)
+                    .trim_end_matches('\n')
+                    .to_string();
+                if !in_args {
+                    if let Some(value) = text.strip_prefix("command=") {
+                        command = value.to_string();
+                    }
+                } else if !text.is_empty() {
+                    args.push(text);
+                }
+                pos += length;
+            }
+        }
+    }
+    Ok(V2Request { command, args })
+}
+
+/// v0 upload-pack 请求里的协商参数。
+#[derive(Default)]
+pub struct UploadRequest {
+    pub wants: Vec<Oid>,
+    pub haves: Vec<Oid>,
+    pub done: bool,
+    /// `deepen <n>`，只处理非相对深度。
+    pub deepen: Option<u32>,
+    pub deepen_relative: bool,
+    /// 客户端已有的浅边界。
+    pub shallow: Vec<Oid>,
+    /// 目前只支持 `filter blob:none`。
+    pub filter_blob_none: bool,
+}
+
+pub fn parse_upload_request(data: &[u8]) -> Result<UploadRequest> {
+    let (lines, _) = parse_pkt_lines(data)?;
+    let mut request = UploadRequest::default();
+    for line in lines {
+        let text = String::from_utf8_lossy(&line);
+        let text = text.trim_end_matches('\n');
+        if let Some(rest) = text.strip_prefix("want ") {
+            let hex = rest.split(' ').next().unwrap_or_default();
+            request.wants.push(Oid::from_hex(hex)?);
+        } else if let Some(rest) = text.strip_prefix("have ") {
+            request.haves.push(Oid::from_hex(rest.split(' ').next().unwrap_or_default())?);
+        } else if let Some(rest) = text.strip_prefix("shallow ") {
+            request.shallow.push(Oid::from_hex(rest.split(' ').next().unwrap_or_default())?);
+        } else if let Some(rest) = text.strip_prefix("deepen ") {
+            request.deepen = rest.trim().parse().ok();
+        } else if text == "deepen-relative" {
+            request.deepen_relative = true;
+        } else if text == "done" {
+            request.done = true;
+        } else if text.starts_with("filter blob:none") {
+            request.filter_blob_none = true;
+        }
+    }
+    Ok(request)
+}
+
+/// v0 receive-pack 请求：命令列表、可选的推送选项、以及随后的 pack。
+pub struct ReceiveRequest {
+    pub commands: Vec<(Oid, Oid, String)>,
+    /// 第一条命令里 `\0` 之后的能力列表，例如 `atomic`、`push-options`。
+    pub capabilities: Vec<String>,
+    pub options: Vec<String>,
+    pub pack: Vec<u8>,
+}
+
+pub fn parse_receive_request(data: &[u8]) -> Result<ReceiveRequest> {
+    let (lines, mut consumed) = parse_pkt_lines(data)?;
+    let mut commands = Vec::new();
+    let mut capabilities = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let text = String::from_utf8_lossy(line);
+        let text = text.trim_end_matches('\n');
+        if text.is_empty() {
+            continue;
+        }
+        let (head, caps) = match text.split_once('\0') {
+            Some((head, caps)) => (head, Some(caps)),
+            None => (text, None),
+        };
+        if index == 0 {
+            if let Some(caps) = caps {
+                capabilities.extend(
+                    caps.split_whitespace().map(|item| item.to_string()),
+                );
+            }
+        }
+        let mut parts = head.split(' ');
+        let old = Oid::from_hex(parts.next().unwrap_or_default())?;
+        let new = Oid::from_hex(parts.next().unwrap_or_default())?;
+        let name = parts
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("推送命令缺少引用名"))?;
+        commands.push((old, new, name.to_string()));
+    }
+
+    // 客户端启用 push-options 时，会在命令列表的 flush 之后再发一段
+    // pkt-line 选项并以 flush 结束；pack 以 "PACK" 开头，很容易区分。
+    let mut options = Vec::new();
+    if let Some(rest) = data.get(consumed..) {
+        if !rest.is_empty() && !rest.starts_with(b"PACK") {
+            let (option_lines, used) = parse_pkt_lines(rest)?;
+            for line in option_lines {
+                let text = String::from_utf8_lossy(&line)
+                    .trim_end_matches('\n')
+                    .to_string();
+                if let Some(value) = text.strip_prefix("push-option ") {
+                    options.push(value.to_string());
+                }
+            }
+            consumed += used;
+        }
+    }
+
+    Ok(ReceiveRequest {
+        commands,
+        capabilities,
+        options,
+        pack: data[consumed..].to_vec(),
+    })
+}
+
 /// 解析一串 pkt-line，遇到 flush-pkt 停止。
 ///
 /// 返回 `(lines, consumed)`，`consumed` 是 flush-pkt 之后的偏移，
@@ -468,5 +634,83 @@ mod tests {
         let resolved = resolve(&raw, &HashMap::new()).unwrap();
         let expected = hash_object(ObjectKind::Blob, b"hello there\n");
         assert!(resolved.iter().any(|(oid, kind, _)| *oid == expected && *kind == ObjectKind::Blob));
+    }
+
+    #[test]
+    fn parses_receive_request_with_atomic_and_push_options() {
+        let old = "0".repeat(40);
+        let new = "1".repeat(40);
+        let mut data = pkt_str(&format!(
+            "{old} {new} refs/heads/main\0report-status atomic push-options\n"
+        ));
+        data.extend(flush());
+        data.extend(pkt_str("push-option ci.skip\n"));
+        data.extend(flush());
+        data.extend_from_slice(b"PACKrest");
+
+        let request = parse_receive_request(&data).unwrap();
+        assert_eq!(request.commands.len(), 1);
+        assert_eq!(request.commands[0].2, "refs/heads/main");
+        assert!(request.capabilities.iter().any(|item| item == "atomic"));
+        assert_eq!(request.options, vec!["ci.skip".to_string()]);
+        assert_eq!(request.pack, b"PACKrest");
+    }
+
+    #[test]
+    fn parses_receive_request_pack_without_options() {
+        let old = "0".repeat(40);
+        let new = "2".repeat(40);
+        let mut data = pkt_str(&format!(
+            "{old} {new} refs/tags/v1\0report-status\n"
+        ));
+        data.extend(flush());
+        data.extend_from_slice(b"PACKbody");
+        let request = parse_receive_request(&data).unwrap();
+        assert!(request.options.is_empty());
+        assert_eq!(request.pack, b"PACKbody");
+    }
+
+    #[test]
+    fn parses_v2_command_and_arguments() {
+        let mut data = pkt_str("command=ls-refs\n");
+        data.extend(pkt_str("agent=git/2.40\n"));
+        data.extend(delim());
+        data.extend(pkt_str("peel\n"));
+        data.extend(pkt_str("symrefs\n"));
+        data.extend(pkt_str("ref-prefix refs/heads/\n"));
+        data.extend(flush());
+
+        let request = parse_v2_request(&data).unwrap();
+        assert_eq!(request.command, "ls-refs");
+        assert_eq!(
+            request.args,
+            vec![
+                "peel".to_string(),
+                "symrefs".to_string(),
+                "ref-prefix refs/heads/".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_upload_request_flags() {
+        let want = "3".repeat(40);
+        let have = "4".repeat(40);
+        let shallow = "5".repeat(40);
+        let mut data = pkt_str(&format!("want {want} multi_ack\n"));
+        data.extend(pkt_str(&format!("have {have}\n")));
+        data.extend(pkt_str(&format!("shallow {shallow}\n")));
+        data.extend(pkt_str("deepen 2\n"));
+        data.extend(pkt_str("filter blob:none\n"));
+        data.extend(pkt_str("done\n"));
+        data.extend(flush());
+
+        let request = parse_upload_request(&data).unwrap();
+        assert_eq!(request.wants.len(), 1);
+        assert_eq!(request.haves.len(), 1);
+        assert_eq!(request.shallow.len(), 1);
+        assert_eq!(request.deepen, Some(2));
+        assert!(request.filter_blob_none);
+        assert!(request.done);
     }
 }

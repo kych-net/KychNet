@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sqlx::{PgConnection, PgPool};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use uuid::Uuid;
 
 use crate::git::object::{
@@ -152,7 +152,7 @@ async fn lock_project(conn: &mut PgConnection, project_id: Uuid) -> Result<()> {
     Ok(())
 }
 
-async fn commit_files(
+async fn commit_snapshot(
     conn: &mut PgConnection,
     project_id: Uuid,
     user: &User,
@@ -160,15 +160,12 @@ async fn commit_files(
     parent: Option<Oid>,
     tree_oid: Oid,
     message: &str,
-    path: &str,
-    change: &str,
-    old_path: Option<&str>,
-    blob: Option<Oid>,
 ) -> Result<Oid> {
     let now = Utc::now();
     let parents: Vec<Oid> = parent.into_iter().collect();
     let data = encode_commit(tree_oid, &parents, &identity(user), message, now.timestamp());
-    let commit = store::put_object(conn, project_id, &crate::git::object::Object::commit(data)).await?;
+    let commit =
+        store::put_object(conn, project_id, &crate::git::object::Object::commit(data)).await?;
     store::set_ref(conn, project_id, &format!("refs/heads/{branch}"), commit).await?;
     store::insert_commit_index(
         conn,
@@ -183,6 +180,25 @@ async fn commit_files(
         now,
     )
     .await?;
+    Ok(commit)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn commit_files(
+    conn: &mut PgConnection,
+    project_id: Uuid,
+    user: &User,
+    branch: &str,
+    parent: Option<Oid>,
+    tree_oid: Oid,
+    message: &str,
+    path: &str,
+    change: &str,
+    old_path: Option<&str>,
+    blob: Option<Oid>,
+) -> Result<Oid> {
+    let commit =
+        commit_snapshot(conn, project_id, user, branch, parent, tree_oid, message).await?;
     store::insert_commit_path(
         conn, project_id, commit, path, change, old_path, blob,
     )
@@ -559,6 +575,286 @@ pub async fn move_file(
         path: to.to_string(),
         oid: blob.to_hex(),
     })
+}
+
+/// 提交历史列表项。OID 统一用十六进制文本返回，前端无需处理 bytea。
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct CommitSummary {
+    pub oid: String,
+    pub parent_oid: Option<String>,
+    pub second_parent_oid: Option<String>,
+    pub tree_oid: String,
+    pub author_name: String,
+    pub message: String,
+    pub committed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CommitDetail {
+    #[serde(flatten)]
+    pub commit: CommitSummary,
+    pub files: Vec<crate::collab::FileDiff>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RevertResult {
+    pub commit: String,
+}
+
+const COMMIT_SELECT: &str = "SELECT encode(oid, 'hex') AS oid,
+        encode(parent_oid, 'hex') AS parent_oid,
+        encode(second_parent_oid, 'hex') AS second_parent_oid,
+        encode(tree_oid, 'hex') AS tree_oid,
+        author_name, message, committed_at
+     FROM git_commits";
+
+/// 从引用出发遍历全部父提交，用于按分支过滤历史。
+async fn walk_commit_oids(
+    conn: &mut PgConnection,
+    project_id: Uuid,
+    tip: Oid,
+) -> Result<Vec<Oid>> {
+    let mut seen = HashSet::new();
+    let mut stack = vec![tip];
+    let mut out = Vec::new();
+    while let Some(oid) = stack.pop() {
+        if !seen.insert(oid) {
+            continue;
+        }
+        if seen.len() > 5000 {
+            bail!("提交历史过深，暂时无法列出");
+        }
+        let object = store::require_object(conn, project_id, oid).await?;
+        if object.kind != crate::git::object::ObjectKind::Commit {
+            continue;
+        }
+        out.push(oid);
+        stack.extend(commit_parents(&object.data)?);
+    }
+    Ok(out)
+}
+
+pub async fn list_commits(
+    pool: &PgPool,
+    project_id: Uuid,
+    reference: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<CommitSummary>> {
+    let limit = limit.clamp(1, 200);
+    let offset = offset.max(0);
+    let mut conn = pool.acquire().await?;
+
+    match reference {
+        Some(reference) => {
+            if !valid_branch(reference) {
+                bail!("非法分支名");
+            }
+            let Some(tip) = store::resolve_branch(&mut conn, project_id, reference).await? else {
+                return Ok(Vec::new());
+            };
+            let oids = walk_commit_oids(&mut conn, project_id, tip).await?;
+            let bytes: Vec<Vec<u8>> = oids.iter().map(|oid| oid.as_bytes().to_vec()).collect();
+            let rows = sqlx::query_as::<_, CommitSummary>(&format!(
+                "{COMMIT_SELECT} WHERE project_id = $1 AND oid = ANY($2)
+                 ORDER BY committed_at DESC"
+            ))
+            .bind(project_id)
+            .bind(&bytes)
+            .fetch_all(&mut *conn)
+            .await?;
+            Ok(rows
+                .into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .collect())
+        }
+        None => Ok(sqlx::query_as::<_, CommitSummary>(&format!(
+            "{COMMIT_SELECT} WHERE project_id = $1
+             ORDER BY committed_at DESC LIMIT $2 OFFSET $3"
+        ))
+        .bind(project_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&mut *conn)
+        .await?),
+    }
+}
+
+/// 提交详情：与第一个父提交做差异，根提交按空树处理。
+pub async fn commit_detail(
+    pool: &PgPool,
+    project_id: Uuid,
+    oid_hex: &str,
+) -> Result<Option<CommitDetail>> {
+    let oid = Oid::from_hex(oid_hex)?;
+    let mut conn = pool.acquire().await?;
+    let row = sqlx::query_as::<_, CommitSummary>(&format!(
+        "{COMMIT_SELECT} WHERE project_id = $1 AND oid = $2"
+    ))
+    .bind(project_id)
+    .bind(&oid.as_bytes()[..])
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some(commit) = row else {
+        return Ok(None);
+    };
+    let base = commit
+        .parent_oid
+        .as_deref()
+        .map(Oid::from_hex)
+        .transpose()?;
+    let files = crate::collab::diff_commits(&mut conn, project_id, base, oid).await?;
+    Ok(Some(CommitDetail { commit, files }))
+}
+
+/// 还原某个提交：把该提交相对父提交的改动反向应用到分支顶部。
+pub async fn revert_commit(
+    pool: &PgPool,
+    user: &User,
+    project_id: Uuid,
+    branch: &str,
+    oid_hex: &str,
+    message: Option<&str>,
+) -> Result<RevertResult> {
+    if !valid_branch(branch) {
+        bail!("非法分支名");
+    }
+    let commit = Oid::from_hex(oid_hex)?;
+
+    let mut tx = pool.begin().await?;
+    lock_project(&mut tx, project_id).await?;
+
+    let tip = store::resolve_branch(&mut tx, project_id, branch)
+        .await?
+        .context("分支不存在")?;
+    // 只有当前分支历史里的提交才允许还原。
+    if crate::collab::merge_base(&mut tx, project_id, tip, commit).await? != Some(commit) {
+        bail!("只能还原当前分支历史中的提交");
+    }
+
+    let object = store::require_object(&mut tx, project_id, commit).await?;
+    if object.kind != crate::git::object::ObjectKind::Commit {
+        bail!("目标不是提交对象");
+    }
+    let parent = commit_parents(&object.data)?.first().copied();
+    let commit_files_map = tree::read_files(&mut tx, project_id, commit).await?;
+    let parent_files = match parent {
+        Some(parent) => tree::read_files(&mut tx, project_id, parent).await?,
+        None => BTreeMap::new(),
+    };
+    let mut current = tree::read_files(&mut tx, project_id, tip).await?;
+
+    let mut paths: BTreeSet<&String> = BTreeSet::new();
+    paths.extend(commit_files_map.keys());
+    paths.extend(parent_files.keys());
+
+    let mut changes: Vec<(String, String, Option<Oid>)> = Vec::new();
+    for path in paths {
+        let before = commit_files_map.get(path);
+        let after = parent_files.get(path);
+        if before == after {
+            continue;
+        }
+        match after {
+            Some(data) => {
+                let existed = current.contains_key(path);
+                let blob = tree::write_blob(&mut tx, project_id, data).await?;
+                current.insert(path.clone(), data.clone());
+                changes.push((
+                    path.clone(),
+                    if existed { "modify" } else { "add" }.to_string(),
+                    Some(blob),
+                ));
+            }
+            None => {
+                current.remove(path);
+                changes.push((path.clone(), "delete".to_string(), None));
+            }
+        }
+    }
+    if changes.is_empty() {
+        bail!("该提交没有可还原的改动");
+    }
+    for path in current.keys() {
+        ensure_no_output_conflict(path, &current)?;
+    }
+
+    let root = tree::build_from_files(&mut tx, project_id, &current).await?;
+    let short: String = oid_hex.chars().take(8).collect();
+    let default_message = format!("还原提交 {short}");
+    let message = message_or(&default_message, message);
+    let new_commit =
+        commit_snapshot(&mut tx, project_id, user, branch, Some(tip), root, &message).await?;
+    for (path, change, blob) in &changes {
+        store::insert_commit_path(
+            &mut tx,
+            project_id,
+            new_commit,
+            path,
+            change,
+            None,
+            *blob,
+        )
+        .await?;
+    }
+    sqlx::query("UPDATE projects SET updated_at = now() WHERE id = $1")
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(RevertResult {
+        commit: new_commit.to_hex(),
+    })
+}
+
+/// 从指定分支（或默认分支）拉出新分支。
+pub async fn create_branch(
+    pool: &PgPool,
+    project_id: Uuid,
+    name: &str,
+    from: &str,
+) -> Result<()> {
+    if !valid_branch(name) || !valid_branch(from) {
+        bail!("非法分支名");
+    }
+    let mut tx = pool.begin().await?;
+    lock_project(&mut tx, project_id).await?;
+    if store::resolve_branch(&mut tx, project_id, name).await?.is_some() {
+        bail!("分支已存在: {name}");
+    }
+    let tip = store::resolve_branch(&mut tx, project_id, from)
+        .await?
+        .with_context(|| format!("来源分支不存在: {from}"))?;
+    store::set_ref(&mut tx, project_id, &format!("refs/heads/{name}"), tip).await?;
+    sqlx::query("UPDATE projects SET updated_at = now() WHERE id = $1")
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn delete_branch(pool: &PgPool, project_id: Uuid, name: &str) -> Result<()> {
+    if !valid_branch(name) {
+        bail!("非法分支名");
+    }
+    let project = get_project(pool, project_id).await?.context("项目不存在")?;
+    if name == project.default_branch {
+        bail!("不能删除默认分支");
+    }
+    let mut tx = pool.begin().await?;
+    lock_project(&mut tx, project_id).await?;
+    if store::resolve_branch(&mut tx, project_id, name).await?.is_none() {
+        bail!("分支不存在: {name}");
+    }
+    store::delete_ref(&mut tx, project_id, &format!("refs/heads/{name}")).await?;
+    sqlx::query("UPDATE projects SET updated_at = now() WHERE id = $1")
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 /// 项目默认分支的完整快照，供静态构建使用。

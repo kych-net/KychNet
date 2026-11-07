@@ -49,8 +49,9 @@ const REGISTER_PER_IP: (u32, u64) = (10, 60);
 
 /// 全局请求体上限。Typst / Markdown 正文写满 2 MiB 已经是极限量级。
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
-/// Git 推送的 pack 上限。项目禁止二进制后，64 MiB 足够容纳大量文本历史。
-const GIT_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+/// Git 推送的 pack 与 Git LFS 上传共用的请求体上限。
+/// LFS 二进制可能较大，这里放宽到 256 MiB；普通文本推送远小于此。
+const GIT_MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
 /// 头像上限：比 svg.rs 自己的 256 KB 稍大，让「超长」由 svg.rs 报出中文提示，
 /// 而不是被传输层截成一句 413。
 const AVATAR_MAX_BODY_BYTES: usize = 256 * 1024 + 1024;
@@ -71,6 +72,8 @@ struct AppState {
     /// 管理端触发整站重建的协调器。构建独立成子进程跑，serve 自身
     /// 不引入 Typst 渲染逻辑（见 `BuildCtl` 注释）。
     build_ctl: Arc<BuildCtl>,
+    /// Git LFS 二进制对象的落盘根目录。
+    lfs_root: PathBuf,
 }
 
 /// 一次构建的执行结果快照。
@@ -1251,6 +1254,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
         trust_proxy_headers: cfg.trust_proxy_headers,
         content_root: cfg.content_root.clone(),
         build_ctl: Arc::new(BuildCtl::new(cfg.build_out_dir.clone())),
+        lfs_root: cfg.lfs_root.clone(),
     };
 
     let admin_origin: HeaderValue = cfg
@@ -1345,6 +1349,20 @@ pub async fn serve(cfg: Config) -> Result<()> {
                 .delete(project_delete_file),
         )
         .route("/api/projects/{id}/move", post(project_move_file))
+        .route("/api/projects/{id}/commits", get(project_commits))
+        .route(
+            "/api/projects/{id}/commits/{oid}",
+            get(project_commit_detail),
+        )
+        .route("/api/projects/{id}/revert", post(project_revert))
+        .route(
+            "/api/projects/{id}/branches",
+            post(project_branch_create),
+        )
+        .route(
+            "/api/projects/{id}/branches/{*name}",
+            delete(project_branch_delete),
+        )
         .route("/api/projects/{id}/prs", get(pr_list).post(pr_create))
         .route("/api/projects/{id}/prs/{number}", get(pr_detail))
         .route(
@@ -1380,6 +1398,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
             "/git/{*path}",
             get(git_http_get)
                 .post(git_http_post)
+                .put(git_http_put)
                 .layer(DefaultBodyLimit::max(GIT_MAX_BODY_BYTES)),
         )
         .route("/api/invites", get(invites).post(create_invite))
@@ -1657,6 +1676,124 @@ async fn project_move_file(
 }
 
 #[derive(Deserialize)]
+struct CommitListQuery {
+    #[serde(rename = "ref")]
+    reference: Option<String>,
+    #[serde(default)]
+    limit: Option<i64>,
+    #[serde(default)]
+    offset: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct RevertBody {
+    #[serde(rename = "ref", default = "main_branch")]
+    branch: String,
+    commit: String,
+    message: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct BranchCreateBody {
+    name: String,
+    #[serde(default)]
+    from: Option<String>,
+}
+
+async fn project_commits(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+    Query(query): Query<CommitListQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current_user(&state, &session).await?;
+    require_project(&state, id).await?;
+    let items = crate::project::list_commits(
+        &state.pool,
+        id,
+        query.reference.as_deref(),
+        query.limit.unwrap_or(50),
+        query.offset.unwrap_or(0),
+    )
+    .await?;
+    Ok(Json(json!({ "items": items })))
+}
+
+async fn project_commit_detail(
+    State(state): State<AppState>,
+    session: Session,
+    Path((id, oid)): Path<(Uuid, String)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current_user(&state, &session).await?;
+    require_project(&state, id).await?;
+    let Some(item) = crate::project::commit_detail(&state.pool, id, &oid).await? else {
+        api_reject!(StatusCode::NOT_FOUND, "提交不存在");
+    };
+    Ok(Json(json!({ "item": item })))
+}
+
+async fn project_revert(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+    Json(body): Json<RevertBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = current_user(&state, &session).await?;
+    let Some(project) = crate::project::get_project(&state.pool, id).await? else {
+        api_reject!(StatusCode::NOT_FOUND, "项目不存在");
+    };
+    let result = crate::project::revert_commit(
+        &state.pool,
+        &user,
+        id,
+        &body.branch,
+        &body.commit,
+        body.message.as_deref(),
+    )
+    .await?;
+    if body.branch == project.default_branch {
+        if let Err(error) = state.build_ctl.build_all().await {
+            return Err(ApiError::with_status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("已还原提交，但自动编译失败：{error}"),
+            ));
+        }
+    }
+    Ok(Json(json!({ "item": result })))
+}
+
+async fn project_branch_create(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+    Json(body): Json<BranchCreateBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current_user(&state, &session).await?;
+    let Some(project) = crate::project::get_project(&state.pool, id).await? else {
+        api_reject!(StatusCode::NOT_FOUND, "项目不存在");
+    };
+    let from = body
+        .from
+        .as_deref()
+        .unwrap_or(&project.default_branch);
+    crate::project::create_branch(&state.pool, id, &body.name, from).await?;
+    let branches = crate::project::list_branches(&state.pool, id).await?;
+    Ok(Json(json!({ "branches": branches })))
+}
+
+async fn project_branch_delete(
+    State(state): State<AppState>,
+    session: Session,
+    Path((id, name)): Path<(Uuid, String)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current_user(&state, &session).await?;
+    require_project(&state, id).await?;
+    crate::project::delete_branch(&state.pool, id, &name).await?;
+    let branches = crate::project::list_branches(&state.pool, id).await?;
+    Ok(Json(json!({ "branches": branches })))
+}
+
+#[derive(Deserialize)]
 struct PrCreateBody {
     title: String,
     #[serde(default)]
@@ -1750,9 +1887,9 @@ async fn pr_merge(
 ) -> ApiResult<Json<serde_json::Value>> {
     let user = current_user(&state, &session).await?;
     let project = require_project(&state, id).await?;
-    let item = crate::collab::merge_pr(&state.pool, &user, id, number).await?;
+    let outcome = crate::collab::merge_pr(&state.pool, &user, id, number).await?;
     // 只有合并进默认分支才会改变线上内容，此时才触发整站编译。
-    if item.target_branch == project.default_branch {
+    if outcome.pr.target_branch == project.default_branch {
         if let Err(error) = state.build_ctl.build_all().await {
             return Err(ApiError::with_status(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1760,7 +1897,10 @@ async fn pr_merge(
             ));
         }
     }
-    Ok(Json(json!({ "item": item })))
+    Ok(Json(json!({
+        "item": outcome.pr,
+        "overwrote_target": outcome.overwrote_target
+    })))
 }
 
 async fn pr_close(
@@ -1902,6 +2042,17 @@ fn git_binary(content_type: &'static str, body: Vec<u8>) -> Response {
         .into_response()
 }
 
+fn git_json(content_type: &'static str, body: Vec<u8>) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, HeaderValue::from_static(content_type)),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-cache")),
+        ],
+        body,
+    )
+        .into_response()
+}
+
 async fn git_project(
     state: &AppState,
     slug: &str,
@@ -1926,6 +2077,20 @@ async fn git_http_get(
         Ok(value) => value,
         Err(error) => return git_plain(StatusCode::NOT_FOUND, &error.to_string()),
     };
+    let project = match git_project(&state, &slug).await {
+        Ok(project) => project,
+        Err(response) => return response,
+    };
+
+    // Git LFS 下载：公开可读，文件落在 LFS_ROOT 下。
+    if let Some(oid) = action.strip_prefix("info/lfs/objects/") {
+        return match crate::git::lfs::load(&state.pool, &state.lfs_root, project.id, oid).await {
+            Ok(Some(data)) => git_binary("application/octet-stream", data),
+            Ok(None) => git_plain(StatusCode::NOT_FOUND, "LFS 对象不存在"),
+            Err(error) => git_plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+        };
+    }
+
     if action != "info/refs" {
         return git_plain(StatusCode::NOT_FOUND, "未知的 Git 路径");
     }
@@ -1933,10 +2098,6 @@ async fn git_http_get(
     if service != "git-upload-pack" && service != "git-receive-pack" {
         return git_plain(StatusCode::BAD_REQUEST, "缺少或非法的 service 参数");
     }
-    let project = match git_project(&state, &slug).await {
-        Ok(project) => project,
-        Err(response) => return response,
-    };
     // receive-pack 的广告也要求认证，Git 客户端才会主动带上凭据。
     if service == "git-receive-pack" {
         match crate::git::token::authenticate(&state.pool, &headers).await {
@@ -1947,6 +2108,15 @@ async fn git_http_get(
             }
         }
     }
+
+    // protocol v2 使用独立的能力广告；receive-pack 仍走 v0。
+    if service == "git-upload-pack" && wants_v2(&headers) {
+        return git_binary(
+            "application/x-git-upload-pack-advertisement",
+            crate::git::http::advertise_v2(&service),
+        );
+    }
+
     match crate::git::http::advertise(&state.pool, &project, &service).await {
         Ok(body) => git_binary(
             if service == "git-upload-pack" {
@@ -1958,6 +2128,59 @@ async fn git_http_get(
         ),
         Err(error) => git_plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     }
+}
+
+fn wants_v2(headers: &HeaderMap) -> bool {
+    headers
+        .get("git-protocol")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(':')
+                .any(|part| part.trim() == "version=2")
+        })
+        .unwrap_or(false)
+}
+
+/// 生成 LFS 批量接口里可访问的绝对地址。
+fn lfs_base_url(state: &AppState, project: &crate::project::Project, headers: &HeaderMap) -> String {
+    let scheme = if state.trust_proxy_headers {
+        headers
+            .get("x-forwarded-proto")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_else(|| {
+                if state.site_url.starts_with("https") {
+                    "https"
+                } else {
+                    "http"
+                }
+            })
+    } else if state.site_url.starts_with("https") {
+        "https"
+    } else {
+        "http"
+    };
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("localhost");
+    format!(
+        "{scheme}://{host}/git/{}.git/info/lfs/objects",
+        percent_encode_segment(&project.slug)
+    )
+}
+
+/// 只编码 URL 路径段里必须编码的字节。
+fn percent_encode_segment(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 async fn git_http_post(
@@ -1975,13 +2198,84 @@ async fn git_http_post(
         Err(response) => return response,
     };
     match action.as_str() {
-        "git-upload-pack" => match crate::git::http::upload_pack(&state.pool, &project, &body).await
-        {
-            Ok(data) => git_binary("application/x-git-upload-pack-result", data),
-            Err(error) => git_plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
-        },
+        "info/lfs/objects/batch" => {
+            let authenticated = crate::git::token::authenticate(&state.pool, &headers)
+                .await
+                .map(|user| user.is_some())
+                .unwrap_or(false);
+            let base = lfs_base_url(&state, &project, &headers);
+            match crate::git::lfs::batch(
+                &state.pool,
+                &state.lfs_root,
+                &project,
+                &body,
+                &base,
+                authenticated,
+            )
+            .await
+            {
+                Ok(result) if result.unauthorized => {
+                    let mut response =
+                        git_plain(StatusCode::UNAUTHORIZED, "上传 LFS 对象需要 Git 令牌");
+                    response.headers_mut().insert(
+                        "lfs-authenticate",
+                        HeaderValue::from_static("Basic realm=\"Git LFS\""),
+                    );
+                    response
+                }
+                Ok(result) => match serde_json::to_vec(&result.body) {
+                    Ok(data) => git_json("application/vnd.git-lfs+json", data),
+                    Err(error) => {
+                        git_plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
+                    }
+                },
+                Err(error) => git_plain(StatusCode::BAD_REQUEST, &error.to_string()),
+            }
+        }
+        "git-upload-pack" => {
+            let body = if wants_v2(&headers) {
+                crate::git::http::upload_pack_v2(&state.pool, &project, &body).await
+            } else {
+                crate::git::http::upload_pack(&state.pool, &project, &body).await
+            };
+            match body {
+                Ok(data) => git_binary("application/x-git-upload-pack-result", data),
+                Err(error) => git_plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+            }
+        }
         "git-receive-pack" => git_receive(&state, &project, &headers, &body).await,
         _ => git_plain(StatusCode::NOT_FOUND, "未知的 Git 路径"),
+    }
+}
+
+/// Git LFS 上传。只有携带令牌的写请求才允许落盘。
+async fn git_http_put(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let (slug, action) = match crate::git::http::split_target(&path) {
+        Ok(value) => value,
+        Err(error) => return git_plain(StatusCode::NOT_FOUND, &error.to_string()),
+    };
+    let project = match git_project(&state, &slug).await {
+        Ok(project) => project,
+        Err(response) => return response,
+    };
+    let Some(oid) = action.strip_prefix("info/lfs/objects/") else {
+        return git_plain(StatusCode::NOT_FOUND, "未知的 Git 路径");
+    };
+    match crate::git::token::authenticate(&state.pool, &headers).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return git_unauthorized(),
+        Err(error) => {
+            return git_plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
+        }
+    }
+    match crate::git::lfs::store(&state.pool, &state.lfs_root, project.id, oid, &body).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(error) => git_plain(StatusCode::BAD_REQUEST, &error.to_string()),
     }
 }
 

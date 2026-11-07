@@ -1,17 +1,20 @@
 //! 项目协作：Pull Request 与项目讨论。
 //!
-//! PR 只做快进合并：目标分支必须是来源分支的祖先，否则要求先把目标分支
-//! 合并进来源分支，避免在服务端做可能产生冲突的三方合并。所有写操作都在
-//! 项目级 advisory lock 下串行执行，与 `project.rs` 的文件编辑共用同一把锁。
+//! PR 差异使用三点比较（merge-base → 来源分支），合并时能快进就快进；
+//! 不能快进时在服务端生成一个双亲 merge commit，树直接取来源分支，
+//! 因此目标分支独有的改动会被覆盖，详情接口会通过警示字段告知前端。
+//! 所有写操作都在项目级 advisory lock 下串行执行，与 `project.rs` 的文件编辑共用同一把锁。
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use similar::{ChangeTag, TextDiff};
 use sqlx::{PgConnection, PgPool};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use uuid::Uuid;
 
-use crate::git::object::{is_text, ObjectKind, Oid, TreeEntry};
+use crate::git::object::{
+    encode_commit, identity_name, is_text, Object, ObjectKind, Oid, TreeEntry,
+};
 use crate::git::store;
 use crate::git::tree;
 use crate::models::User;
@@ -98,8 +101,20 @@ pub struct PrDetail {
     #[serde(flatten)]
     pub pr: PullRequest,
     pub files: Vec<FileDiff>,
+    /// 两个分支都存在时就可以合并（非快进会生成 merge commit）。
     pub mergeable: bool,
+    /// 目标分支是否已经是来源分支的祖先。
+    pub is_fast_forward: bool,
+    /// 非快进合并会用来源分支的树覆盖目标分支，前端需要明确警示。
+    pub overwrites_target: bool,
+    pub merge_base: Option<String>,
     pub comments: Vec<PrComment>,
+}
+
+/// 合并结果。非快进时 `overwrote_target` 为 true。
+pub struct MergeOutcome {
+    pub pr: PullRequest,
+    pub overwrote_target: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
@@ -185,6 +200,103 @@ async fn is_ancestor(
     Ok(false)
 }
 
+/// 读取提交父关系图，同时记录到起点的深度。
+async fn walk_graph(
+    conn: &mut PgConnection,
+    project_id: Uuid,
+    start: Oid,
+    graph: &mut HashMap<Oid, Vec<Oid>>,
+    depths: &mut HashMap<Oid, usize>,
+) -> Result<HashSet<Oid>> {
+    let mut seen = HashSet::new();
+    let mut stack = vec![(start, 0usize)];
+    while let Some((oid, depth)) = stack.pop() {
+        if seen.len() >= MAX_COMMIT_WALK {
+            bail!("提交历史过深，无法计算合并基点");
+        }
+        if !seen.insert(oid) {
+            continue;
+        }
+        depths.entry(oid).or_insert(depth);
+        if let Some(parents) = graph.get(&oid) {
+            for parent in parents {
+                stack.push((*parent, depth + 1));
+            }
+            continue;
+        }
+        let object = store::require_object(conn, project_id, oid).await?;
+        if object.kind != ObjectKind::Commit {
+            graph.insert(oid, Vec::new());
+            continue;
+        }
+        let parents = crate::git::object::commit_parents(&object.data)?;
+        for parent in &parents {
+            stack.push((*parent, depth + 1));
+        }
+        graph.insert(oid, parents);
+    }
+    Ok(seen)
+}
+
+fn reachable_in_graph(graph: &HashMap<Oid, Vec<Oid>>, from: Oid, target: Oid) -> bool {
+    let mut seen = HashSet::new();
+    let mut stack = vec![from];
+    while let Some(oid) = stack.pop() {
+        if oid == target {
+            return true;
+        }
+        if !seen.insert(oid) {
+            continue;
+        }
+        if let Some(parents) = graph.get(&oid) {
+            stack.extend(parents.iter().copied());
+        }
+    }
+    false
+}
+
+/// 计算两个提交的合并基点；没有公共祖先时返回 None。
+pub(crate) async fn merge_base(
+    conn: &mut PgConnection,
+    project_id: Uuid,
+    a: Oid,
+    b: Oid,
+) -> Result<Option<Oid>> {
+    if a == b {
+        return Ok(Some(a));
+    }
+    let mut graph = HashMap::new();
+    let mut depths_a = HashMap::new();
+    let mut depths_b = HashMap::new();
+    let set_a = walk_graph(conn, project_id, a, &mut graph, &mut depths_a).await?;
+    let set_b = walk_graph(conn, project_id, b, &mut graph, &mut depths_b).await?;
+
+    let mut common: Vec<Oid> = set_a.intersection(&set_b).copied().collect();
+    if common.is_empty() {
+        return Ok(None);
+    }
+    // 公共祖先很多时用「到两侧距离之和」近似挑选最近的基点，
+    // 避免在大仓库上做平方级的祖先判定。
+    if common.len() > 64 {
+        common.sort_by_key(|oid| {
+            depths_a.get(oid).copied().unwrap_or(usize::MAX)
+                .saturating_add(depths_b.get(oid).copied().unwrap_or(usize::MAX))
+        });
+        return Ok(common.first().copied());
+    }
+
+    let candidates = common.clone();
+    for candidate in &candidates {
+        let is_ancestor_of_other = candidates
+            .iter()
+            .any(|other| other != candidate && reachable_in_graph(&graph, *other, *candidate));
+        if !is_ancestor_of_other {
+            return Ok(Some(*candidate));
+        }
+    }
+    Ok(candidates.first().copied())
+}
+
 /// 收集某棵树下的全部文件路径与 blob OID。
 async fn blob_map(
     conn: &mut PgConnection,
@@ -212,15 +324,16 @@ async fn blob_map(
     Ok(files)
 }
 
-async fn diff_trees(
+async fn diff_roots(
     conn: &mut PgConnection,
     project_id: Uuid,
-    target_commit: Oid,
-    source_commit: Oid,
+    old_root: Option<Oid>,
+    new_root: Oid,
 ) -> Result<Vec<FileDiff>> {
-    let old_root = tree::read_commit_tree(conn, project_id, target_commit).await?;
-    let new_root = tree::read_commit_tree(conn, project_id, source_commit).await?;
-    let old = blob_map(conn, project_id, old_root).await?;
+    let old = match old_root {
+        Some(root) => blob_map(conn, project_id, root).await?,
+        None => BTreeMap::new(),
+    };
     let new = blob_map(conn, project_id, new_root).await?;
 
     let mut paths: BTreeSet<&String> = BTreeSet::new();
@@ -277,6 +390,21 @@ async fn diff_trees(
         });
     }
     Ok(diffs)
+}
+
+/// 比较两个提交；`base` 为 None 时按空树处理（根提交）。
+pub async fn diff_commits(
+    conn: &mut PgConnection,
+    project_id: Uuid,
+    base: Option<Oid>,
+    head: Oid,
+) -> Result<Vec<FileDiff>> {
+    let new_root = tree::read_commit_tree(conn, project_id, head).await?;
+    let old_root = match base {
+        Some(base) => Some(tree::read_commit_tree(conn, project_id, base).await?),
+        None => None,
+    };
+    diff_roots(conn, project_id, old_root, new_root).await
 }
 
 /// 读取 blob 的文本内容；不是 blob 或不是合法 UTF-8 时返回 None。
@@ -465,20 +593,33 @@ pub async fn pr_detail(
 
     let source = store::resolve_branch(&mut conn, project_id, &pr.source_branch).await?;
     let target = store::resolve_branch(&mut conn, project_id, &pr.target_branch).await?;
-    let (files, mergeable) = match (source, target) {
-        (Some(source_oid), Some(target_oid)) => {
-            let files = diff_trees(&mut conn, project_id, target_oid, source_oid).await?;
-            let mergeable = source_oid == target_oid
-                || is_ancestor(&mut conn, project_id, target_oid, source_oid).await?;
-            (files, mergeable)
-        }
-        _ => (Vec::new(), false),
-    };
+    let (files, mergeable, is_fast_forward, overwrites_target, merge_base) =
+        match (source, target) {
+            (Some(source_oid), Some(target_oid)) => {
+                // 三点差异：以两个分支的合并基点为基准，避免把目标分支
+                // 独有的历史算进 PR 的改动里。
+                let base = merge_base(&mut conn, project_id, target_oid, source_oid).await?;
+                let files = diff_commits(&mut conn, project_id, base, source_oid).await?;
+                let fast_forward = source_oid == target_oid
+                    || is_ancestor(&mut conn, project_id, target_oid, source_oid).await?;
+                (
+                    files,
+                    true,
+                    fast_forward,
+                    !fast_forward,
+                    base.map(|oid| oid.to_hex()),
+                )
+            }
+            _ => (Vec::new(), false, false, false, None),
+        };
 
     Ok(Some(PrDetail {
         pr,
         files,
         mergeable,
+        is_fast_forward,
+        overwrites_target,
+        merge_base,
         comments,
     }))
 }
@@ -520,7 +661,7 @@ pub async fn merge_pr(
     user: &User,
     project_id: Uuid,
     number: i32,
-) -> Result<PullRequest> {
+) -> Result<MergeOutcome> {
     let mut tx = pool.begin().await?;
     lock_project(&mut tx, project_id).await?;
 
@@ -538,24 +679,50 @@ pub async fn merge_pr(
         .await?
         .context("目标分支不存在")?;
 
-    if target == source {
-        // 目标分支已经指向来源分支，直接标记合并。
-    } else if is_ancestor(&mut tx, project_id, target, source).await? {
-        store::set_ref(
+    let fast_forward = target == source
+        || is_ancestor(&mut tx, project_id, target, source).await?;
+    let merge_oid = if fast_forward {
+        source
+    } else {
+        // 非快进：创建双亲 merge commit，树直接取来源分支。
+        // 目标分支独有的改动会被覆盖，详情接口已提前给出警示。
+        let tree_oid = tree::read_commit_tree(&mut tx, project_id, source).await?;
+        let identity = format!("{} <noreply@kych.net>", identity_name(&user.username));
+        let timestamp = Utc::now().timestamp();
+        let message = format!(
+            "合并 PR #{number}: {}\n\n来源分支: {}\n目标分支: {}",
+            pr.title, pr.source_branch, pr.target_branch
+        );
+        let data = encode_commit(
+            tree_oid,
+            &[target, source],
+            &identity,
+            &message,
+            timestamp,
+        );
+        store::put_object(
             &mut tx,
             project_id,
-            &format!("refs/heads/{}", pr.target_branch),
-            source,
+            &Object {
+                kind: ObjectKind::Commit,
+                data,
+            },
         )
+        .await?
+    };
+
+    store::set_ref(
+        &mut tx,
+        project_id,
+        &format!("refs/heads/{}", pr.target_branch),
+        merge_oid,
+    )
+    .await?;
+    crate::git::http::index_commits(&mut tx, project_id, merge_oid, user).await?;
+    sqlx::query("UPDATE projects SET updated_at = now() WHERE id = $1")
+        .bind(project_id)
+        .execute(&mut *tx)
         .await?;
-        crate::git::http::index_commits(&mut tx, project_id, source, user).await?;
-        sqlx::query("UPDATE projects SET updated_at = now() WHERE id = $1")
-            .bind(project_id)
-            .execute(&mut *tx)
-            .await?;
-    } else {
-        bail!("目标分支包含来源分支没有的提交，请先把目标分支合并进来源分支");
-    }
 
     sqlx::query(
         "UPDATE pull_requests
@@ -564,15 +731,19 @@ pub async fn merge_pr(
     )
     .bind(project_id)
     .bind(number)
-    .bind(&source.as_bytes()[..])
+    .bind(&merge_oid.as_bytes()[..])
     .execute(&mut *tx)
     .await?;
 
     tx.commit().await?;
     let mut conn = pool.acquire().await?;
-    fetch_pr(&mut conn, project_id, number)
+    let pr = fetch_pr(&mut conn, project_id, number)
         .await?
-        .context("PR 合并后无法读取")
+        .context("PR 合并后无法读取")?;
+    Ok(MergeOutcome {
+        pr,
+        overwrote_target: !fast_forward,
+    })
 }
 
 pub async fn close_pr(pool: &PgPool, project_id: Uuid, number: i32) -> Result<PullRequest> {
@@ -782,5 +953,17 @@ mod tests {
             .lines
             .iter()
             .all(|line| line.kind == "add" && line.old_line.is_none()));
+    }
+
+    #[test]
+    fn walks_parent_graph_for_ancestry() {
+        let a = Oid::from_hex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let b = Oid::from_hex("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+        let c = Oid::from_hex("cccccccccccccccccccccccccccccccccccccccc").unwrap();
+        let mut graph = HashMap::new();
+        graph.insert(b, vec![a]);
+        graph.insert(c, vec![b]);
+        assert!(reachable_in_graph(&graph, c, a));
+        assert!(!reachable_in_graph(&graph, a, c));
     }
 }

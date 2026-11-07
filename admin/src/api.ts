@@ -147,7 +147,26 @@ export type PrFileDiff = {
 export type PrDetail = PullRequest & {
   files: PrFileDiff[];
   mergeable: boolean;
+  /** 目标分支是否已经是来源分支的祖先。 */
+  is_fast_forward: boolean;
+  /** 非快进合并会用来源分支覆盖目标分支，前端必须明确警示。 */
+  overwrites_target: boolean;
+  merge_base: string | null;
   comments: PrComment[];
+};
+
+export type CommitSummary = {
+  oid: string;
+  parent_oid: string | null;
+  second_parent_oid: string | null;
+  tree_oid: string;
+  author_name: string;
+  message: string;
+  committed_at: string;
+};
+
+export type CommitDetail = CommitSummary & {
+  files: PrFileDiff[];
 };
 
 export type Discussion = {
@@ -391,6 +410,29 @@ export const api = {
       { method: "POST", body: JSON.stringify(payload) },
     ),
 
+  commits: (id: string, ref?: string, limit = 50, offset = 0) =>
+    request<{ items: CommitSummary[] }>(
+      `/projects/${id}/commits?limit=${limit}&offset=${offset}` +
+        (ref ? `&ref=${encodeURIComponent(ref)}` : ""),
+    ),
+  commitDetail: (id: string, oid: string) =>
+    request<{ item: CommitDetail }>(`/projects/${id}/commits/${oid}`),
+  revertCommit: (id: string, payload: { ref: string; commit: string; message?: string }) =>
+    request<{ item: { commit: string } }>(`/projects/${id}/revert`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  createBranch: (id: string, payload: { name: string; from?: string }) =>
+    request<{ branches: string[] }>(`/projects/${id}/branches`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  deleteBranch: (id: string, name: string) =>
+    request<{ branches: string[] }>(
+      `/projects/${id}/branches/${encodeURIComponent(name)}`,
+      { method: "DELETE" },
+    ),
+
   prs: (id: string) => request<{ items: PullRequest[] }>(`/projects/${id}/prs`),
   createPr: (
     id: string,
@@ -408,7 +450,10 @@ export const api = {
       body: JSON.stringify({ body }),
     }),
   mergePr: (id: string, number: number) =>
-    request<{ item: PullRequest }>(`/projects/${id}/prs/${number}/merge`, { method: "POST" }),
+    request<{ item: PullRequest; overwrote_target: boolean }>(
+      `/projects/${id}/prs/${number}/merge`,
+      { method: "POST" },
+    ),
   closePr: (id: string, number: number) =>
     request<{ item: PullRequest }>(`/projects/${id}/prs/${number}/close`, { method: "POST" }),
 
