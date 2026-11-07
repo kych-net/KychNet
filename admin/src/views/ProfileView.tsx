@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { startRegistration } from "@simplewebauthn/browser";
-import { api, avatarUrl, User } from "../api";
+import { api, avatarUrl, isStepUpRequired, User } from "../api";
+import { StepUpDialog } from "../components/StepUpDialog";
 
 type Props = {
   user: User;
@@ -19,6 +20,8 @@ export function ProfileView({ user, avatarVersion, onUserChange, onAvatarChange 
   const [totpSecret, setTotpSecret] = useState("");
   const [totpUrl, setTotpUrl] = useState("");
   const [totpCode, setTotpCode] = useState("");
+  const [stepUpOpen, setStepUpOpen] = useState(false);
+  const [pendingAction, setPendingAction] = useState<(() => Promise<void>) | null>(null);
 
   const initial = user.username.slice(0, 1).toUpperCase();
 
@@ -54,7 +57,13 @@ export function ProfileView({ user, avatarVersion, onUserChange, onAvatarChange 
       await api.passkeySetupFinish(started.flow_id, credential);
       setNotice("通行密钥已绑定");
     } catch (e) {
-      setError((e as Error).message);
+      if (isStepUpRequired(e)) {
+        setError("");
+        setPendingAction(() => bindPasskey);
+        setStepUpOpen(true);
+      } else {
+        setError((e as Error).message);
+      }
     }
   }
 
@@ -66,7 +75,13 @@ export function ProfileView({ user, avatarVersion, onUserChange, onAvatarChange 
       setTotpUrl(result.otpauth_url);
       setNotice("请用认证器 App 添加该密钥,然后输入动态码确认");
     } catch (e) {
-      setError((e as Error).message);
+      if (isStepUpRequired(e)) {
+        setError("");
+        setPendingAction(() => setupTotp);
+        setStepUpOpen(true);
+      } else {
+        setError((e as Error).message);
+      }
     }
   }
 
@@ -144,6 +159,22 @@ export function ProfileView({ user, avatarVersion, onUserChange, onAvatarChange 
       ) : (
         <button onClick={setupTotp}>生成 TOTP 密钥</button>
       )}
+
+      <StepUpDialog
+        open={stepUpOpen}
+        onClose={() => {
+          setStepUpOpen(false);
+          setPendingAction(null);
+        }}
+        onSuccess={() => {
+          setStepUpOpen(false);
+          const action = pendingAction;
+          setPendingAction(null);
+          if (action) {
+            void action();
+          }
+        }}
+      />
     </section>
   );
 }

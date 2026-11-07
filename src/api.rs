@@ -731,6 +731,62 @@ async fn logout(session: Session) -> ApiResult<StatusCode> {
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Deserialize)]
+struct StepUpTotpRequest {
+    code: String,
+}
+
+async fn mark_step_up(session: &Session) -> ApiResult<()> {
+    session
+        .insert("auth_at", Utc::now().timestamp())
+        .await
+        .map_err(|e| anyhow!("写入会话失败: {e}"))?;
+    Ok(())
+}
+
+/// 用当前账号的 TOTP 重新确认身份，刷新会话里的 `auth_at`。
+async fn step_up_totp(
+    State(state): State<AppState>,
+    session: Session,
+    Json(req): Json<StepUpTotpRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = current_user(&state, &session).await?;
+    let key = format!("stepup:totp:user:{}", user.id);
+    limited(&state, &key, TOTP_ATTEMPTS_PER_USER)?;
+    if !auth::totp_verify(&state.pool, &user, &req.code).await? {
+        api_bail!("动态验证码错误");
+    }
+    state.limits.reset(&key);
+    mark_step_up(&session).await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn step_up_passkey_start(
+    State(state): State<AppState>,
+    session: Session,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = current_user(&state, &session).await?;
+    let (options, flow_id) = state.auth.start_authentication(&state.pool, &user).await?;
+    Ok(Json(json!({ "flow_id": flow_id, "options": options })))
+}
+
+async fn step_up_passkey_finish(
+    State(state): State<AppState>,
+    session: Session,
+    Json(req): Json<LoginFinishRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = current_user(&state, &session).await?;
+    let user_id = state
+        .auth
+        .finish_authentication(&state.pool, req.flow_id, &req.credential)
+        .await?;
+    if user_id != user.id {
+        api_bail!("认证流程不属于当前用户");
+    }
+    mark_step_up(&session).await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
 async fn totp_setup(
     State(state): State<AppState>,
     session: Session,
@@ -1203,6 +1259,9 @@ pub async fn serve(cfg: Config) -> Result<()> {
         .route("/api/auth/login/start", post(login_start))
         .route("/api/auth/login/finish", post(login_finish))
         .route("/api/auth/totp/login", post(totp_login))
+        .route("/api/auth/step-up/totp", post(step_up_totp))
+        .route("/api/auth/step-up/passkey/start", post(step_up_passkey_start))
+        .route("/api/auth/step-up/passkey/finish", post(step_up_passkey_finish))
         .route("/api/auth/logout", post(logout))
         .route("/api/me", get(me))
         .route(

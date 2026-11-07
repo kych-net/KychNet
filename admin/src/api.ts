@@ -77,6 +77,20 @@ export function avatarUrl(id: string, version?: number): string {
   return `${apiUrl(`/avatar/${id}`)}${suffix}`;
 }
 
+export class ApiError extends Error {
+  status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
+export function isStepUpRequired(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 403;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(apiUrl(path), {
     credentials: "include",
@@ -85,7 +99,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   });
   if (!response.ok) {
     const data = await response.json().catch(() => null);
-    throw new Error(data?.error ?? response.statusText);
+    throw new ApiError(data?.error ?? response.statusText, response.status);
   }
   if (response.status === 204) {
     return undefined as T;
@@ -135,6 +149,21 @@ export const api = {
     request<User>("/auth/totp/login", {
       method: "POST",
       body: JSON.stringify({ username, code }),
+    }),
+
+  stepUpTotp: (code: string) =>
+    request<{ ok: boolean }>("/auth/step-up/totp", {
+      method: "POST",
+      body: JSON.stringify({ code }),
+    }),
+  stepUpPasskeyStart: () =>
+    request<{ flow_id: string; options: any }>("/auth/step-up/passkey/start", {
+      method: "POST",
+    }),
+  stepUpPasskeyFinish: (flowId: string, credential: any) =>
+    request<{ ok: boolean }>("/auth/step-up/passkey/finish", {
+      method: "POST",
+      body: JSON.stringify({ flow_id: flowId, credential }),
     }),
 
   totpSetup: () =>
