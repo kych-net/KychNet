@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
-use sqlx::{PgConnection, PgPool, Row};
+use sqlx::{PgConnection, PgPool};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use uuid::Uuid;
 
