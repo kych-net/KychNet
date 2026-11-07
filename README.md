@@ -182,12 +182,14 @@ export PATH=/usr/local/bin:$PATH            # 通常已默认包含
 
 ## MCP 服务器
 
-设置 `MCP_TOKEN` 后,`serve` 会在同一个二进制上挂载 `/mcp`(Streamable HTTP,基于官方 Rust SDK `rmcp`),让 AI 客户端(Claude、Cursor 等)以 MCP 协议只读查询站点内容;未设置时整个路由不存在,不新增攻击面.
+设置 `MCP_TOKEN` 后,`serve` 会在同一个二进制上挂载 `/mcp`(Streamable HTTP,基于官方 Rust SDK `rmcp`),让 AI 客户端(Claude、Cursor 等)查询和写入站点内容、读写项目文件;未设置时整个路由不存在,不新增攻击面.
 
 公网地址是 **`https://kych.net/mcp`**;`api.kych.net` 只是回源 Host,不能作为 MCP 或 Git 的客户端地址.
 
-- 工具:`list_pages`(枚举已发布页面)、`get_page`(按路径读正文)、`search_content`(标题与正文全文搜索)、`site_info`(站点概况).全部只读,不暴露任何写操作.
-- 鉴权:`Authorization: Bearer <MCP_TOKEN>`,比较走常量时间;失败统一返回同一条消息,不区分「没带」与「带错」.
+- 只读工具:`list_pages`、`get_page`、`search_content`、`site_info`.
+- 写入工具:`save_content`/`delete_content`(内容写入并自动编译当前页)、`list_projects`、`list_project_files`、`read_project_file`、`write_project_file`、`delete_project_file`(项目 Git 文件读写;默认分支写入后整站构建).
+- 项目写操作的 Git 提交身份取第一个可用管理员;MCP token 现在同时具备读写权限,泄露等于站点写权限.
+- 鉴权:`Authorization: Bearer <MCP_TOKEN>`,比较走常量时间;失败统一返回同一条消息,不区分「没带」与「带错」.token 是读写凭据,请像管理员密码一样保管.
 - 限流:按客户端 IP 每分钟 120 次,复用 `rate.rs` 的进程内限流器;IP 来源口径与 `client_ip` 一致(`TRUST_PROXY_HEADERS`).
 - 层隔离:`/mcp` merge 在主应用 layer 链之后,不沾会话、CORS、Origin 白名单这些浏览器侧的层;鉴权与限流由 `src/mcp.rs` 自带.
 

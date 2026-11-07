@@ -69,6 +69,9 @@ pub fn valid_branch(name: &str) -> bool {
         || name.ends_with(".lock")
         || name.contains("..")
         || name.contains("//")
+        || name.contains("@{")
+        || name == "@"
+        || name.split('/').any(|part| part.starts_with('.') || part.ends_with(".lock"))
     {
         return false;
     }
@@ -870,21 +873,34 @@ pub async fn snapshots(pool: &PgPool) -> Result<Vec<ProjectSnapshot>> {
     let mut conn = pool.acquire().await?;
     let mut snapshots = Vec::new();
     for project in projects {
-        let Some(commit) =
-            store::resolve_branch(&mut conn, project.id, &project.default_branch).await?
-        else {
-            continue;
-        };
-        let files = tree::read_files(&mut conn, project.id, commit).await?;
-        let committed_at = store::commit_time(&mut conn, project.id, commit)
-            .await?
-            .unwrap_or(project.updated_at);
-        snapshots.push(ProjectSnapshot {
-            project,
-            files,
-            commit,
-            committed_at,
-        });
+        let result: Result<Option<ProjectSnapshot>> = async {
+            let Some(commit) =
+                store::resolve_branch(&mut conn, project.id, &project.default_branch).await?
+            else {
+                return Ok(None);
+            };
+            let files = tree::read_files(&mut conn, project.id, commit).await?;
+            let committed_at = store::commit_time(&mut conn, project.id, commit)
+                .await?
+                .unwrap_or(project.updated_at);
+            Ok(Some(ProjectSnapshot {
+                project: project.clone(),
+                files,
+                commit,
+                committed_at,
+            }))
+        }
+        .await;
+        match result {
+            Ok(Some(snapshot)) => snapshots.push(snapshot),
+            Ok(None) => {}
+            // 单个坏仓库不能永久毒化整站构建；保留其它项目继续构建。
+            Err(error) => tracing::warn!(
+                project = %project.slug,
+                %error,
+                "项目快照读取失败，跳过该项目"
+            ),
+        }
     }
     Ok(snapshots)
 }
@@ -931,5 +947,10 @@ mod tests {
         assert!(!valid_branch("a..b"));
         assert!(!valid_branch("a b"));
         assert!(!valid_branch("/main"));
+        assert!(!valid_branch("main@{1}"));
+        assert!(!valid_branch("@"));
+        assert!(!valid_branch(".hidden"));
+        assert!(!valid_branch("feature/.hidden"));
+        assert!(!valid_branch("feature/main.lock"));
     }
 }

@@ -173,6 +173,16 @@ pub struct Tree {
     pub entries: BTreeMap<String, TreeEntry>,
 }
 
+/// Git tree 条目的名字必须是单个路径段，不能为空、`.`、`..` 或包含 `/`、NUL、控制字符。
+pub(crate) fn valid_tree_entry_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\0')
+        && !name.chars().any(|ch| ch.is_control())
+}
+
 impl Tree {
     pub fn parse(data: &[u8]) -> Result<Self> {
         let mut entries = BTreeMap::new();
@@ -191,6 +201,9 @@ impl Tree {
                 .map(|offset| name_start + offset)
                 .ok_or_else(|| anyhow::anyhow!("tree 对象缺少名字终止符"))?;
             let name = std::str::from_utf8(&data[name_start..nul])?.to_string();
+            if !valid_tree_entry_name(&name) {
+                bail!("tree 对象包含非法条目名: {name:?}");
+            }
             if nul + 21 > data.len() {
                 bail!("tree 对象条目被截断");
             }
@@ -321,6 +334,15 @@ mod tests {
             hash_object(ObjectKind::Blob, b"hello\n").to_hex(),
             "ce013625030ba8dba906f756967f9e9ca394464a"
         );
+    }
+
+    #[test]
+    fn tree_rejects_path_traversal_names() {
+        for name in ["", ".", "..", "a/b", "a\0b"] {
+            let mut data = format!("100644 {name}\0").into_bytes();
+            data.extend_from_slice(&[0u8; 20]);
+            assert!(Tree::parse(&data).is_err(), "应拒绝 tree 条目名 {name:?}");
+        }
     }
 
     #[test]
