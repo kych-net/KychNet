@@ -195,7 +195,24 @@ export PATH=/usr/local/bin:$PATH            # 通常已默认包含
 - 限流:按客户端 IP 每分钟 120 次,复用 `rate.rs` 的进程内限流器;IP 来源口径与 `client_ip` 一致(`TRUST_PROXY_HEADERS`).
 - 层隔离:`/mcp` merge 在主应用 layer 链之后,不沾会话、CORS、Origin 白名单这些浏览器侧的层;鉴权与限流由 `src/mcp.rs` 自带.
 
-客户端配置示例(Claude Desktop / Cursor 等):
+### 获取 token
+
+在服务器上读取:
+
+```bash
+sudo cat /root/kych-net-mcp-token.txt
+```
+
+token 只应写入客户端配置或环境变量,不要提交到仓库,也不要在聊天/日志里明文传播.
+
+### Claude Desktop
+
+编辑:
+
+- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- Windows: `%APPDATA%\\Claude\\claude_desktop_config.json`
+
+加入:
 
 ```json
 {
@@ -207,6 +224,78 @@ export PATH=/usr/local/bin:$PATH            # 通常已默认包含
   }
 }
 ```
+
+保存后完全退出并重启 Claude Desktop.
+
+### Claude Code
+
+```bash
+claude mcp add --transport http kych-net https://kych.net/mcp \
+  --header "Authorization: Bearer <MCP_TOKEN>"
+```
+
+### Cursor
+
+项目级 `.cursor/mcp.json`,或全局 `~/.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "kych-net": {
+      "url": "https://kych.net/mcp",
+      "headers": { "Authorization": "Bearer <MCP_TOKEN>" }
+    }
+  }
+}
+```
+
+### VS Code / GitHub Copilot MCP
+
+`.vscode/mcp.json`:
+
+```json
+{
+  "servers": {
+    "kych-net": {
+      "type": "http",
+      "url": "https://kych.net/mcp",
+      "headers": { "Authorization": "Bearer <MCP_TOKEN>" }
+    }
+  }
+}
+```
+
+### 自检
+
+```bash
+curl -sS https://kych.net/mcp \
+  -H "Authorization: Bearer <MCP_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"1"}}}'
+```
+
+正常会返回 `text/event-stream`,其中包含 `serverInfo: {"name":"kych-net"}`.
+
+### 故障排查
+
+- `401`: token 缺失或错误;
+- `403`: 请求 `Host` 不是 `kych.net`/localhost,或反向代理未正确传 Host;
+- `404`: `MCP_TOKEN` 未设置,`/mcp` 路由未挂载;
+- 客户端只支持 stdio:当前服务是 Streamable HTTP,需要支持远程 HTTP MCP 的客户端.
+
+### 轮换 token
+
+```bash
+TOKEN=$(openssl rand -base64 32)
+sudo sed -i '/^MCP_TOKEN=/d' /opt/kych-net/.env
+printf 'MCP_TOKEN=%s\n' "$TOKEN" | sudo tee -a /opt/kych-net/.env
+printf '%s\n' "$TOKEN" | sudo tee /root/kych-net-mcp-token.txt >/dev/null
+sudo chmod 600 /root/kych-net-mcp-token.txt
+sudo systemctl restart kych-net
+```
+
+然后更新所有客户端配置.
 
 ## 项目与 Git
 
