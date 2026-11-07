@@ -70,6 +70,7 @@ export function InvitesView() {
         <button type="submit">生成</button>
       </form>
 
+      <div className="table-wrap">
       <table>
         <thead>
           <tr>
@@ -94,6 +95,7 @@ export function InvitesView() {
           ))}
         </tbody>
       </table>
+      </div>
     </section>
   );
 }

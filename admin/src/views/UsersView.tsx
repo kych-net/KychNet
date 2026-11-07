@@ -30,6 +30,7 @@ export function UsersView() {
     <section>
       <h2>用户</h2>
       {error && <p className="error">{error}</p>}
+      <div className="table-wrap">
       <table>
         <thead>
           <tr>
@@ -52,6 +53,7 @@ export function UsersView() {
           ))}
         </tbody>
       </table>
+      </div>
     </section>
   );
 }
