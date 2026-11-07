@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::PgPool;
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -58,6 +61,131 @@ struct AppState {
     site_url: String,
     limits: RateLimiter,
     trust_proxy_headers: bool,
+    /// 管理端触发整站重建的协调器。构建独立成子进程跑，serve 自身
+    /// 不引入 Typst 渲染逻辑（见 `BuildCtl` 注释）。
+    build_ctl: Arc<BuildCtl>,
+}
+
+/// 一次构建的执行结果快照。
+#[derive(Clone, Serialize)]
+struct BuildRecord {
+    started_at: i64,
+    finished_at: Option<i64>,
+    /// None = 仍在运行；Some = 退出码。
+    exit_code: Option<i32>,
+    /// 输出尾部（stdout + stderr 合并截断），失败时用来定位原因。
+    tail: String,
+}
+
+#[derive(Serialize)]
+struct BuildStatus {
+    running: bool,
+    last: Option<BuildRecord>,
+}
+
+/// 管理端触发的整站重建。
+///
+/// serve 进程不直接调 `build::run`，而是用「当前二进制 + build 子命令」拉起
+/// 独立进程：Typst 及其内嵌字体是重依赖，进程隔离让渲染崩溃、内存尖峰只损失
+/// 一次构建，不会波及常驻的 API 服务。可执行文件取 `current_exe()`，
+/// 与 serve 是同一个二进制，不存在路径配置问题。
+struct BuildCtl {
+    /// 同一时刻只允许一个构建。用原子量而不是锁，避免排队语义——
+    /// 并发触发直接 409，让前端提示「已在构建」。
+    running: AtomicBool,
+    last: tokio::sync::Mutex<Option<BuildRecord>>,
+    out_dir: PathBuf,
+    exe: PathBuf,
+}
+
+/// 输出尾部保留长度，超过即从头部截断。
+const BUILD_TAIL_BYTES: usize = 4096;
+
+impl BuildCtl {
+    fn new(out_dir: PathBuf) -> Self {
+        Self {
+            running: AtomicBool::new(false),
+            last: tokio::sync::Mutex::new(None),
+            out_dir,
+            exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("kychnet")),
+        }
+    }
+}
+
+/// 触发一次整站重建。立即返回 200 并异步执行，前端轮询 GET 拿进度与结果。
+async fn rebuild_site(
+    State(state): State<AppState>,
+    session: Session,
+) -> ApiResult<Json<BuildStatus>> {
+    current_admin(&state, &session).await?;
+    require_step_up(&session).await?;
+    let ctl = &state.build_ctl;
+    if ctl.running.swap(true, Ordering::SeqCst) {
+        return Err(ApiError::with_status(
+            StatusCode::CONFLICT,
+            "已有一次构建在进行，请等待其结束",
+        ));
+    }
+    let record = BuildRecord {
+        started_at: Utc::now().timestamp(),
+        finished_at: None,
+        exit_code: None,
+        tail: String::new(),
+    };
+    *ctl.last.lock().await = Some(record);
+
+    let ctl = Arc::clone(&state.build_ctl);
+    tokio::spawn(async move {
+        let output = tokio::process::Command::new(ctl.exe.clone())
+            .arg("build")
+            .arg("--out")
+            .arg(&ctl.out_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await;
+        let (exit_code, tail) = match output {
+            Ok(out) => {
+                let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+                text.push_str(&String::from_utf8_lossy(&out.stderr));
+                let cut = text.len().saturating_sub(BUILD_TAIL_BYTES);
+                let tail = if cut > 0 {
+                    // 按字符边界截，避免中文被腰斩成乱码。
+                    let start = (cut..=text.len())
+                        .find(|&i| text.is_char_boundary(i))
+                        .unwrap_or(text.len());
+                    format!("…{}", &text[start..])
+                } else {
+                    text
+                };
+                (Some(out.status.code().unwrap_or(-1)), tail)
+            }
+            Err(e) => (None, format!("构建进程启动失败: {e}")),
+        };
+        let mut last = ctl.last.lock().await;
+        if let Some(rec) = last.as_mut() {
+            rec.finished_at = Some(Utc::now().timestamp());
+            rec.exit_code = exit_code;
+            rec.tail = tail;
+        }
+        drop(last);
+        ctl.running.store(false, Ordering::SeqCst);
+    });
+
+    let last = state.build_ctl.last.lock().await.clone();
+    Ok(Json(BuildStatus {
+        running: true,
+        last,
+    }))
+}
+
+/// 查询最近一次构建的状态。
+async fn build_status(State(state): State<AppState>) -> ApiResult<Json<BuildStatus>> {
+    Ok(Json(BuildStatus {
+        running: state.build_ctl.running.load(Ordering::SeqCst),
+        last: state.build_ctl.last.lock().await.clone(),
+    }))
 }
 
 struct ApiError {
@@ -843,6 +971,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
         site_url: cfg.site_url.clone(),
         limits: RateLimiter::default(),
         trust_proxy_headers: cfg.trust_proxy_headers,
+        build_ctl: Arc::new(BuildCtl::new(cfg.build_out_dir.clone())),
     };
 
     let admin_origin: HeaderValue = cfg
@@ -924,6 +1053,9 @@ pub async fn serve(cfg: Config) -> Result<()> {
         .route("/api/invites/{code}", delete(revoke_invite))
         .route("/api/users", get(users))
         .route("/api/users/{id}", patch(patch_user))
+        // 整站重建：POST 触发、GET 查询状态，共用一个路径。挂管理员 +
+        // step-up 双闸，构建会覆盖线上产物目录，等于发布权限。
+        .route("/api/admin/rebuild", post(rebuild_site).get(build_status))
         .with_state(state)
         // 请求体上限写成显式常量，不依赖 axum 的默认 2 MiB：正文里塞一个
         // 几十 MB 的字符串除了把内存和 SQL 连接拖死之外没有任何作用，
