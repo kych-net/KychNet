@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { marked } from "marked";
 import { api, Content, ContentFormat, editorPath } from "../api";
 import { CodeEditor } from "../components/CodeEditor";
 
@@ -24,6 +25,14 @@ function formatLabel(format: ContentFormat): string {
 
 function extensionFor(format: ContentFormat): string {
   return format === "markdown" ? ".md" : format === "typst" ? ".typ" : format === "wikidot" ? ".wj" : format === "css" ? ".css" : ".html";
+}
+
+function stripPreviewHeader(body: string): string {
+  const match = body.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
+  if (!match || !/^\s*(css|styles)\s*:/im.test(match[1])) {
+    return body;
+  }
+  return body.slice(match[0].length);
 }
 
 function previewDocument(html: string): string {
@@ -85,6 +94,29 @@ export function ContentsView({ editContentId, onEditHandled }: Props) {
       setPreviewLoading(false);
       return;
     }
+    // Markdown 和 HTML 用浏览器端渲染，不走 API。
+    if (format === "html" || format === "markdown") {
+      try {
+        const source = stripPreviewHeader(body);
+        const html =
+          format === "html"
+            ? source
+            : (marked.parse(source, {
+                async: false,
+                gfm: true,
+                breaks: false,
+              }) as string);
+        setPreviewHtml(html);
+        setPreviewError("");
+      } catch (e) {
+        setPreviewHtml("");
+        setPreviewError((e as Error).message);
+      }
+      setPreviewLoading(false);
+      return;
+    }
+
+    // Wikidot 需要 ftml，继续走服务端预览，并做防抖。
     let cancelled = false;
     setPreviewLoading(true);
     const timer = window.setTimeout(() => {
