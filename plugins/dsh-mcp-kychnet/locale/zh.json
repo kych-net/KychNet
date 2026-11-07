@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "KychNet 站点",
+    "description": "通过 OAuth 2.1 连接 kych.net 的 MCP 服务，在对话里读写站点内容与项目文件。"
+  }
+}
