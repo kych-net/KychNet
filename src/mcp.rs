@@ -61,7 +61,6 @@ pub struct KychMcp {
 #[derive(Debug, sqlx::FromRow)]
 struct SearchRow {
     slug: String,
-    title: String,
     format: String,
     body: String,
 }
@@ -152,7 +151,7 @@ impl KychMcp {
             .map(|page| {
                 json!({
                     "slug": page.slug,
-                    "title": page.title,
+                    "filename": mcp_filename(&page.slug, &page.format),
                     "format": page.format,
                     "updated_at": page.updated_at.to_rfc3339(),
                 })
@@ -183,7 +182,7 @@ impl KychMcp {
         Ok(text_result(
             json!({
                 "slug": page.slug,
-                "title": page.title,
+                "filename": mcp_filename(&page.slug, &page.format),
                 "format": page.format,
                 "updated_at": page.updated_at.to_rfc3339(),
                 "body": page.body,
@@ -209,8 +208,8 @@ impl KychMcp {
 
         let pattern = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
         let rows = sqlx::query_as::<_, SearchRow>(
-            "SELECT slug, title, format, body FROM contents
-             WHERE published = TRUE AND (title ILIKE $1 OR body ILIKE $1)
+            "SELECT slug, format, body FROM contents
+             WHERE published = TRUE AND body ILIKE $1
              ORDER BY updated_at DESC
              LIMIT 20",
         )
@@ -224,7 +223,7 @@ impl KychMcp {
             .map(|row| {
                 json!({
                     "slug": row.slug,
-                    "title": row.title,
+                    "filename": mcp_filename(&row.slug, &row.format),
                     "format": row.format,
                     "excerpt": excerpt(&row.body, query, 80),
                 })
@@ -273,7 +272,6 @@ impl KychMcp {
         let item = service::upsert_content(
             &self.pool,
             &slug,
-            &params.title,
             format.as_str(),
             &params.body,
             params.published,
@@ -419,7 +417,6 @@ struct SearchParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SaveContentParams {
     slug: String,
-    title: String,
     format: String,
     body: String,
     #[serde(default = "default_true")]
@@ -461,6 +458,22 @@ struct ProjectDeleteParams {
     path: String,
     branch: Option<String>,
     message: Option<String>,
+}
+
+fn mcp_filename(slug: &str, format: &str) -> String {
+    let name = slug.rsplit('/').next().unwrap_or(slug);
+    let ext = match format {
+        "markdown" => ".md",
+        "html" => ".html",
+        "typst" => ".typ",
+        "wikidot" => ".wj",
+        "css" => ".css",
+        _ => ".html",
+    };
+    match name.strip_suffix(".html") {
+        Some(stem) => format!("{stem}{ext}"),
+        None => name.to_string(),
+    }
 }
 
 fn text_result(payload: String) -> CallToolResult {

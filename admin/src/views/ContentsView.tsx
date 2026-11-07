@@ -72,7 +72,6 @@ export function ContentsView({ editContentId, onEditHandled }: Props) {
 
   const [contentId, setContentId] = useState<string | null>(null);
   const [slug, setSlug] = useState("");
-  const [title, setTitle] = useState("");
   const [format, setFormat] = useState<ContentFormat>("markdown");
   const [body, setBody] = useState("");
   const [published, setPublished] = useState(false);
@@ -171,7 +170,6 @@ export function ContentsView({ editContentId, onEditHandled }: Props) {
       const result = await api.saveContent({
         id: contentId ?? undefined,
         slug,
-        title,
         format,
         body,
         published,
@@ -198,7 +196,6 @@ export function ContentsView({ editContentId, onEditHandled }: Props) {
   function edit(item: Content) {
     setContentId(item.id);
     setSlug(editorPath(item));
-    setTitle(item.title);
     setFormat(item.format);
     setBody(item.body);
     setPublished(item.published);
@@ -212,7 +209,6 @@ export function ContentsView({ editContentId, onEditHandled }: Props) {
   function newContent() {
     setContentId(null);
     setSlug("");
-    setTitle("");
     setFormat("markdown");
     setBody("");
     setPublished(false);
@@ -236,10 +232,6 @@ export function ContentsView({ editContentId, onEditHandled }: Props) {
               placeholder="/xef/index 或 /reff/93df/l.html"
               required
             />
-          </label>
-          <label>
-            标题
-            <input value={title} onChange={(e) => setTitle(e.target.value)} required />
           </label>
           <label>
             格式
@@ -324,7 +316,6 @@ export function ContentsView({ editContentId, onEditHandled }: Props) {
       <table>
         <thead>
           <tr>
-            <th>标题</th>
             <th>路径</th>
             <th>格式</th>
             <th>状态</th>
@@ -334,7 +325,6 @@ export function ContentsView({ editContentId, onEditHandled }: Props) {
         <tbody>
           {items.map((item) => (
             <tr key={item.id}>
-              <td>{item.title}</td>
               <td className="mono small">{editorPath(item)}</td>
               <td>{item.format}</td>
               <td>{item.published ? "已发布" : "草稿"}</td>

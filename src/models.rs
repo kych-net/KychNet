@@ -116,7 +116,6 @@ impl ContentFormat {
 pub struct Content {
     pub id: Uuid,
     pub slug: String,
-    pub title: String,
     pub format: String,
     pub body: String,
     pub published: bool,
@@ -127,6 +126,15 @@ pub struct Content {
 impl Content {
     pub fn format(&self) -> ContentFormat {
         ContentFormat::parse(&self.format).unwrap_or(ContentFormat::Html)
+    }
+
+    /// 展示名统一用源文件名，不再从标题字段推导。
+    pub fn filename(&self) -> String {
+        let name = self.slug.rsplit('/').next().unwrap_or(&self.slug);
+        match name.strip_suffix(".html") {
+            Some(stem) => format!("{stem}{}", self.format().extension()),
+            None => name.to_string(),
+        }
     }
 }
 
