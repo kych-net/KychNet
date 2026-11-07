@@ -10,6 +10,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::PgPool;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -25,9 +26,11 @@ use webauthn_rs::prelude::{
 };
 
 use crate::auth::{self, Auth};
+use crate::build;
 use crate::config::Config;
-use crate::models::{SiteSettings, User};
+use crate::models::{ContentFormat, SiteSettings, User};
 use crate::rate::RateLimiter;
+use crate::render;
 use crate::service;
 
 /// 认证相关接口的限流额度，格式为 `(窗口内最多几次, 窗口秒数)`。
@@ -61,6 +64,8 @@ struct AppState {
     site_url: String,
     limits: RateLimiter,
     trust_proxy_headers: bool,
+    /// 预览 Markdown / Wikidot 时需要的字体与资源根目录。
+    content_root: PathBuf,
     /// 管理端触发整站重建的协调器。构建独立成子进程跑，serve 自身
     /// 不引入 Typst 渲染逻辑（见 `BuildCtl` 注释）。
     build_ctl: Arc<BuildCtl>,
@@ -806,6 +811,12 @@ async fn contents(
 }
 
 #[derive(Deserialize)]
+struct PreviewRequest {
+    format: String,
+    body: String,
+}
+
+#[derive(Deserialize)]
 struct ContentRequest {
     /// 编辑已有内容时带 id，改名才会更新原记录而不是新建一条。
     #[serde(default)]
@@ -816,6 +827,48 @@ struct ContentRequest {
     body: String,
     #[serde(default)]
     published: bool,
+}
+
+async fn preview_content(
+    State(state): State<AppState>,
+    session: Session,
+    Json(req): Json<PreviewRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current_user(&state, &session).await?;
+    let format = ContentFormat::parse(&req.format)
+        .ok_or_else(|| ApiError::with_status(StatusCode::BAD_REQUEST, "未知内容格式"))?;
+    if !matches!(
+        format,
+        ContentFormat::Markdown | ContentFormat::Html | ContentFormat::Wikidot
+    ) {
+        return Err(ApiError::with_status(
+            StatusCode::BAD_REQUEST,
+            "实时预览目前只支持 Markdown、HTML 和 Wikidot",
+        ));
+    }
+
+    let (_, body) = build::parse_page_styles(&req.body)?;
+    let mut includes = HashMap::new();
+    if format == ContentFormat::Wikidot {
+        let published = service::list_published(&state.pool).await?;
+        for content in published
+            .into_iter()
+            .filter(|content| content.format() == ContentFormat::Wikidot)
+        {
+            let stem = content.slug.strip_suffix(".html").unwrap_or(&content.slug);
+            let page = stem.replace('/', ":");
+            includes.insert(page.clone(), content.body.clone());
+            let normalized = ftml::data::PageRef::page_only(&page).page;
+            includes.insert(normalized, content.body.clone());
+        }
+    }
+    let ctx = render::DocContext {
+        page: "preview",
+        title: "预览",
+        includes: &includes,
+    };
+    let rendered = render::render_doc(format, &body, &state.content_root, &ctx)?;
+    Ok(Json(json!({ "html": rendered.html })))
 }
 
 async fn save_content(
@@ -1087,6 +1140,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
         site_url: cfg.site_url.clone(),
         limits: RateLimiter::default(),
         trust_proxy_headers: cfg.trust_proxy_headers,
+        content_root: cfg.content_root.clone(),
         build_ctl: Arc::new(BuildCtl::new(cfg.build_out_dir.clone())),
     };
 
@@ -1164,6 +1218,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
         .route("/api/passkey/setup", post(passkey_setup))
         .route("/api/passkey/setup/finish", post(passkey_setup_finish))
         .route("/api/contents", get(contents).post(save_content))
+        .route("/api/preview", post(preview_content))
         .route("/api/contents/{id}", delete(delete_content))
         .route("/api/invites", get(invites).post(create_invite))
         .route("/api/invites/{code}", delete(revoke_invite))

@@ -213,7 +213,7 @@ fn make_parent_dirs_public(out: &Path, parent: &Path) -> Result<()> {
 /// ```
 ///
 /// 返回 (链接列表, 去掉声明头后的正文)。格式未知或没有声明时原样返回。
-fn parse_page_styles(body: &str) -> Result<(Vec<String>, String)> {
+pub(crate) fn parse_page_styles(body: &str) -> Result<(Vec<String>, String)> {
     let lines: Vec<&str> = body.lines().collect();
     if lines.first().map(|line| line.trim()) != Some("---") {
         return Ok((Vec::new(), body.to_string()));

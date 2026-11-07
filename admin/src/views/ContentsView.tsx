@@ -26,6 +26,36 @@ function extensionFor(format: ContentFormat): string {
   return format === "markdown" ? ".md" : format === "typst" ? ".typ" : format === "wikidot" ? ".wj" : format === "css" ? ".css" : ".html";
 }
 
+function previewDocument(html: string): string {
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<style>
+  :root { color-scheme: light; }
+  body { margin: 0; padding: 1rem; color: #1a1a1a; background: #fff; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; line-height: 1.7; }
+  .preview-content { overflow-wrap: anywhere; }
+  .preview-content img { max-width: 100%; height: auto; }
+  .preview-content table { width: 100%; border-collapse: collapse; }
+  .preview-content th, .preview-content td { border: 1px solid #ddd; padding: .4rem .55rem; text-align: left; }
+  .preview-content pre { overflow-x: auto; padding: .8rem; background: #f6f7f9; border: 1px solid #e1e4e8; border-radius: 6px; }
+  .preview-content blockquote { margin-left: 0; padding-left: .8rem; border-left: 3px solid #ddd; color: #555; }
+  .preview-content .wiki-note { padding: .75rem 1rem; border-left: 4px solid #2f7d5c; background: #eef7f1; border-radius: 6px; }
+  .preview-content .wj-code { display: block; margin: 1rem 0; border: 1px solid #ddd; border-radius: 6px; overflow: hidden; }
+  .preview-content .wj-code-panel { display: flex; justify-content: space-between; padding: .3rem .65rem; background: #f6f7f9; border-bottom: 1px solid #ddd; font-size: .8rem; }
+  .preview-content .wj-code pre { margin: 0; border: 0; border-radius: 0; }
+  .preview-content .wj-collapsible { margin: 1rem 0; border: 1px solid #ddd; border-radius: 6px; }
+  .preview-content .wj-collapsible-button { padding: .5rem .7rem; background: #f6f7f9; cursor: pointer; }
+  .preview-content .wj-collapsible-content { padding: .65rem .8rem; }
+  .preview-content .wj-footnote-ref-marker, .preview-content .wj-footnote-list-item-marker { color: #1f6feb; }
+  .preview-content .wj-footnote-list { margin-top: 1.5rem; padding-top: .75rem; border-top: 1px solid #ddd; font-size: .9rem; }
+  .preview-content .wj-math-ml { display: inline-block; }
+</style>
+</head>
+<body><article class="preview-content">${html}</article></body>
+</html>`;
+}
+
 export function ContentsView({ editContentId, onEditHandled }: Props) {
   const [items, setItems] = useState<Content[]>([]);
   const [error, setError] = useState("");
@@ -37,10 +67,51 @@ export function ContentsView({ editContentId, onEditHandled }: Props) {
   const [format, setFormat] = useState<ContentFormat>("markdown");
   const [body, setBody] = useState("");
   const [published, setPublished] = useState(false);
+  const [previewOn, setPreviewOn] = useState(true);
+  const [previewHtml, setPreviewHtml] = useState("");
+  const [previewError, setPreviewError] = useState("");
+  const [previewLoading, setPreviewLoading] = useState(false);
 
   useEffect(() => {
     void refresh();
   }, []);
+  const previewSupported =
+    format === "markdown" || format === "html" || format === "wikidot";
+
+  useEffect(() => {
+    if (!previewOn || !previewSupported) {
+      setPreviewHtml("");
+      setPreviewError("");
+      setPreviewLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setPreviewLoading(true);
+    const timer = window.setTimeout(() => {
+      api
+        .previewContent(format, body)
+        .then((result) => {
+          if (!cancelled) {
+            setPreviewHtml(result.html);
+            setPreviewError("");
+          }
+        })
+        .catch((e) => {
+          if (!cancelled) {
+            setPreviewHtml("");
+            setPreviewError((e as Error).message);
+          }
+        })
+        .finally(() => {
+          if (!cancelled) setPreviewLoading(false);
+        });
+    }, 350);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [body, format, previewOn, previewSupported]);
+
 
   useEffect(() => {
     if (!editContentId) {
@@ -159,11 +230,47 @@ export function ContentsView({ editContentId, onEditHandled }: Props) {
         <div className="editor-shell">
           <div className="editor-toolbar">
             <span>正文</span>
-            <span>
+            <span className="editor-toolbar-right">
               {formatLabel(format)} · {body.length} 字符
+              {previewSupported && (
+                <button
+                  type="button"
+                  className="preview-toggle"
+                  onClick={() => setPreviewOn((value) => !value)}
+                >
+                  {previewOn ? "隐藏预览" : "实时预览"}
+                </button>
+              )}
             </span>
           </div>
-          <CodeEditor value={body} format={format} onChange={setBody} />
+          <div className={`editor-workbench ${previewOn && previewSupported ? "with-preview" : ""}`}>
+            <div className="editor-pane">
+              <CodeEditor value={body} format={format} onChange={setBody} />
+            </div>
+            {previewOn && previewSupported && (
+              <div className="preview-pane">
+                <div className="preview-head">
+                  <span>预览</span>
+                  {previewLoading && <span>渲染中…</span>}
+                </div>
+                {previewError ? (
+                  <p className="error preview-error">{previewError}</p>
+                ) : (
+                  <iframe
+                    className="preview-frame"
+                    title="内容预览"
+                    sandbox=""
+                    srcDoc={previewDocument(previewHtml)}
+                  />
+                )}
+              </div>
+            )}
+            {previewOn && !previewSupported && (
+              <div className="preview-empty">
+                实时预览目前支持 Markdown、HTML 和 Wikidot；Typst / CSS 请保存后查看正式页面。
+              </div>
+            )}
+          </div>
         </div>
         <div className="row align">
           <label className="checkbox">
