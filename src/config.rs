@@ -15,6 +15,8 @@ pub struct Config {
     pub build_out_dir: PathBuf,
     /// 是否信任 `X-Forwarded-For`。只有当服务确实只经由可信 CDN/反代进来时才开。
     pub trust_proxy_headers: bool,
+    /// Git LFS 二进制对象的落盘根目录。
+    pub lfs_root: PathBuf,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -48,6 +50,7 @@ impl Config {
             content_root: PathBuf::from(env_or("CONTENT_ROOT", "content")),
             build_out_dir: PathBuf::from(env_or("BUILD_OUT_DIR", "dist")),
             trust_proxy_headers: env_flag("TRUST_PROXY_HEADERS"),
+            lfs_root: PathBuf::from(env_or("LFS_ROOT", "lfs")),
         })
     }
 }

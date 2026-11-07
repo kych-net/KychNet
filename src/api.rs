@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use axum::body::Bytes;
-use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -49,6 +49,9 @@ const REGISTER_PER_IP: (u32, u64) = (10, 60);
 
 /// 全局请求体上限。Typst / Markdown 正文写满 2 MiB 已经是极限量级。
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+/// Git 推送的 pack 与 Git LFS 上传共用的请求体上限。
+/// LFS 二进制可能较大，这里放宽到 256 MiB；普通文本推送远小于此。
+const GIT_MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
 /// 头像上限：比 svg.rs 自己的 256 KB 稍大，让「超长」由 svg.rs 报出中文提示，
 /// 而不是被传输层截成一句 413。
 const AVATAR_MAX_BODY_BYTES: usize = 256 * 1024 + 1024;
@@ -69,6 +72,8 @@ struct AppState {
     /// 管理端触发整站重建的协调器。构建独立成子进程跑，serve 自身
     /// 不引入 Typst 渲染逻辑（见 `BuildCtl` 注释）。
     build_ctl: Arc<BuildCtl>,
+    /// Git LFS 二进制对象的落盘根目录。
+    lfs_root: PathBuf,
 }
 
 /// 一次构建的执行结果快照。
@@ -143,6 +148,57 @@ impl BuildCtl {
         }
 
         let output = command.output().await;
+        let (exit_code, tail) = match output {
+            Ok(out) => {
+                let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+                text.push_str(&String::from_utf8_lossy(&out.stderr));
+                let cut = text.len().saturating_sub(BUILD_TAIL_BYTES);
+                let tail = if cut > 0 {
+                    let start = (cut..=text.len())
+                        .find(|&i| text.is_char_boundary(i))
+                        .unwrap_or(text.len());
+                    format!("…{}", &text[start..])
+                } else {
+                    text
+                };
+                (Some(out.status.code().unwrap_or(-1)), tail)
+            }
+            Err(error) => (None, format!("编译进程启动失败: {error}")),
+        };
+
+        {
+            let mut last = self.last.lock().await;
+            *last = Some(BuildRecord {
+                started_at: Utc::now().timestamp(),
+                finished_at: Some(Utc::now().timestamp()),
+                exit_code,
+                tail: tail.clone(),
+            });
+        }
+        self.running.store(false, Ordering::SeqCst);
+
+        if exit_code != Some(0) {
+            bail!("{}", if tail.is_empty() { "自动编译失败".to_string() } else { tail });
+        }
+        Ok(())
+    }
+
+    /// 项目文件可能影响多个页面（目录树、项目索引），保存后直接整站重建。
+    async fn build_all(&self) -> Result<()> {
+        if self.running.swap(true, Ordering::SeqCst) {
+            bail!("已有构建在进行，请稍后重试或执行整站重建");
+        }
+
+        let output = tokio::process::Command::new(&self.exe)
+            .arg("build")
+            .arg("--out")
+            .arg(&self.out_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await;
+
         let (exit_code, tail) = match output {
             Ok(out) => {
                 let mut text = String::from_utf8_lossy(&out.stdout).to_string();
@@ -1198,6 +1254,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
         trust_proxy_headers: cfg.trust_proxy_headers,
         content_root: cfg.content_root.clone(),
         build_ctl: Arc::new(BuildCtl::new(cfg.build_out_dir.clone())),
+        lfs_root: cfg.lfs_root.clone(),
     };
 
     let admin_origin: HeaderValue = cfg
@@ -1279,6 +1336,71 @@ pub async fn serve(cfg: Config) -> Result<()> {
         .route("/api/contents", get(contents).post(save_content))
         .route("/api/preview", post(preview_content))
         .route("/api/contents/{id}", delete(delete_content))
+        .route("/api/projects", get(project_list).post(project_create))
+        .route(
+            "/api/projects/{id}",
+            get(project_detail).patch(project_update),
+        )
+        .route("/api/projects/{id}/tree", get(project_tree))
+        .route(
+            "/api/projects/{id}/file",
+            get(project_file)
+                .put(project_write_file)
+                .delete(project_delete_file),
+        )
+        .route("/api/projects/{id}/move", post(project_move_file))
+        .route("/api/projects/{id}/commits", get(project_commits))
+        .route(
+            "/api/projects/{id}/commits/{oid}",
+            get(project_commit_detail),
+        )
+        .route("/api/projects/{id}/revert", post(project_revert))
+        .route(
+            "/api/projects/{id}/branches",
+            post(project_branch_create),
+        )
+        .route(
+            "/api/projects/{id}/branches/{*name}",
+            delete(project_branch_delete),
+        )
+        .route("/api/projects/{id}/prs", get(pr_list).post(pr_create))
+        .route("/api/projects/{id}/prs/{number}", get(pr_detail))
+        .route(
+            "/api/projects/{id}/prs/{number}/comments",
+            post(pr_add_comment),
+        )
+        .route("/api/projects/{id}/prs/{number}/merge", post(pr_merge))
+        .route("/api/projects/{id}/prs/{number}/close", post(pr_close))
+        .route(
+            "/api/projects/{id}/discussions",
+            get(discussion_list).post(discussion_create),
+        )
+        .route(
+            "/api/projects/{id}/discussions/{discussion_id}",
+            get(discussion_detail),
+        )
+        .route(
+            "/api/projects/{id}/discussions/{discussion_id}/comments",
+            post(discussion_add_comment),
+        )
+        .route(
+            "/api/projects/{id}/discussions/{discussion_id}/close",
+            post(discussion_close),
+        )
+        .route(
+            "/api/git-tokens",
+            get(git_token_list).post(git_token_create),
+        )
+        .route("/api/git-tokens/{id}", delete(git_token_revoke))
+        // Git smart HTTP：公开仓库匿名可 clone，写入需要令牌认证。
+        // 推送的 pack 可能远大于普通 API 请求，单独放宽这一条路由的上限。
+        .route(
+            "/git/{*path}",
+            get(git_http_get)
+                .post(git_http_post)
+                .put(git_http_put)
+                .layer(DefaultBodyLimit::max(GIT_MAX_BODY_BYTES)),
+        )
         .route("/api/invites", get(invites).post(create_invite))
         .route("/api/invites/{code}", delete(revoke_invite))
         .route("/api/users", get(users))
@@ -1305,6 +1427,880 @@ pub async fn serve(cfg: Config) -> Result<()> {
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .await?;
     Ok(())
+}
+
+#[derive(Deserialize)]
+struct ProjectCreateBody {
+    slug: String,
+    title: String,
+    #[serde(default)]
+    description: String,
+}
+
+#[derive(Deserialize)]
+struct ProjectUpdateBody {
+    title: Option<String>,
+    description: Option<String>,
+    archived: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct ProjectTreeQuery {
+    #[serde(rename = "ref", default = "main_branch")]
+    branch: String,
+    #[serde(default)]
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct ProjectFileQuery {
+    #[serde(rename = "ref", default = "main_branch")]
+    branch: String,
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct ProjectWriteBody {
+    #[serde(rename = "ref", default = "main_branch")]
+    branch: String,
+    path: String,
+    content: String,
+    message: Option<String>,
+    base_oid: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ProjectMoveBody {
+    #[serde(rename = "ref", default = "main_branch")]
+    branch: String,
+    from: String,
+    to: String,
+    message: Option<String>,
+}
+
+fn main_branch() -> String {
+    "main".to_string()
+}
+
+async fn project_list(
+    State(state): State<AppState>,
+    session: Session,
+) -> ApiResult<Json<serde_json::Value>> {
+    current_user(&state, &session).await?;
+    Ok(Json(json!({
+        "items": crate::project::list_projects(&state.pool).await?
+    })))
+}
+
+async fn project_create(
+    State(state): State<AppState>,
+    session: Session,
+    Json(body): Json<ProjectCreateBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = current_user(&state, &session).await?;
+    let project = crate::project::create_project(
+        &state.pool,
+        &user,
+        &body.slug,
+        &body.title,
+        &body.description,
+    )
+    .await?;
+    if let Err(error) = state.build_ctl.build_all().await {
+        return Err(ApiError::with_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("项目已创建，但自动编译失败：{error}"),
+        ));
+    }
+    Ok(Json(json!({ "item": project })))
+}
+
+async fn project_detail(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current_user(&state, &session).await?;
+    let Some(project) = crate::project::get_project(&state.pool, id).await? else {
+        api_reject!(StatusCode::NOT_FOUND, "项目不存在");
+    };
+    let branches = crate::project::list_branches(&state.pool, id).await?;
+    Ok(Json(json!({ "item": project, "branches": branches })))
+}
+
+async fn project_update(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+    Json(body): Json<ProjectUpdateBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current_user(&state, &session).await?;
+    let Some(existing) = crate::project::get_project(&state.pool, id).await? else {
+        api_reject!(StatusCode::NOT_FOUND, "项目不存在");
+    };
+    if body.archived == Some(true) {
+        crate::project::archive_project(&state.pool, id).await?;
+    }
+    let project = crate::project::update_project(
+        &state.pool,
+        id,
+        body.title.as_deref().unwrap_or(&existing.title),
+        body.description
+            .as_deref()
+            .unwrap_or(&existing.description),
+    )
+    .await?;
+    if let Err(error) = state.build_ctl.build_all().await {
+        return Err(ApiError::with_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("项目已更新，但自动编译失败：{error}"),
+        ));
+    }
+    Ok(Json(json!({ "item": project })))
+}
+
+async fn project_tree(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+    Query(query): Query<ProjectTreeQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current_user(&state, &session).await?;
+    let Some(project) = crate::project::get_project(&state.pool, id).await? else {
+        api_reject!(StatusCode::NOT_FOUND, "项目不存在");
+    };
+    let items = crate::project::list_dir(&state.pool, id, &query.branch, &query.path).await?;
+    let branches = crate::project::list_branches(&state.pool, id).await?;
+    Ok(Json(json!({
+        "items": items,
+        "branches": branches,
+        "default_branch": project.default_branch
+    })))
+}
+
+async fn project_file(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+    Query(query): Query<ProjectFileQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current_user(&state, &session).await?;
+    let item = crate::project::read_file(&state.pool, id, &query.branch, &query.path).await?;
+    Ok(Json(json!({ "item": item })))
+}
+
+async fn project_write_file(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+    Json(body): Json<ProjectWriteBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = current_user(&state, &session).await?;
+    let Some(project) = crate::project::get_project(&state.pool, id).await? else {
+        api_reject!(StatusCode::NOT_FOUND, "项目不存在");
+    };
+    let result = crate::project::write_file(
+        &state.pool,
+        &user,
+        id,
+        &body.branch,
+        &body.path,
+        &body.content,
+        body.message.as_deref(),
+        body.base_oid.as_deref(),
+    )
+    .await?;
+    // 只有默认分支会被静态构建，PR 分支等合并后再发布。
+    if body.branch == project.default_branch {
+        if let Err(error) = state.build_ctl.build_all().await {
+            return Err(ApiError::with_status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("文件已保存，但自动编译失败：{error}"),
+            ));
+        }
+    }
+    Ok(Json(json!({ "item": result })))
+}
+
+async fn project_delete_file(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+    Query(query): Query<ProjectFileQuery>,
+) -> ApiResult<StatusCode> {
+    let user = current_user(&state, &session).await?;
+    let Some(project) = crate::project::get_project(&state.pool, id).await? else {
+        api_reject!(StatusCode::NOT_FOUND, "项目不存在");
+    };
+    crate::project::delete_file(&state.pool, &user, id, &query.branch, &query.path, None).await?;
+    if query.branch == project.default_branch {
+        if let Err(error) = state.build_ctl.build_all().await {
+            return Err(ApiError::with_status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("文件已删除，但自动编译失败：{error}"),
+            ));
+        }
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn project_move_file(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+    Json(body): Json<ProjectMoveBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = current_user(&state, &session).await?;
+    let Some(project) = crate::project::get_project(&state.pool, id).await? else {
+        api_reject!(StatusCode::NOT_FOUND, "项目不存在");
+    };
+    let result = crate::project::move_file(
+        &state.pool,
+        &user,
+        id,
+        &body.branch,
+        &body.from,
+        &body.to,
+        body.message.as_deref(),
+    )
+    .await?;
+    if body.branch == project.default_branch {
+        if let Err(error) = state.build_ctl.build_all().await {
+            return Err(ApiError::with_status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("文件已移动，但自动编译失败：{error}"),
+            ));
+        }
+    }
+    Ok(Json(json!({ "item": result })))
+}
+
+#[derive(Deserialize)]
+struct CommitListQuery {
+    #[serde(rename = "ref")]
+    reference: Option<String>,
+    #[serde(default)]
+    limit: Option<i64>,
+    #[serde(default)]
+    offset: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct RevertBody {
+    #[serde(rename = "ref", default = "main_branch")]
+    branch: String,
+    commit: String,
+    message: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct BranchCreateBody {
+    name: String,
+    #[serde(default)]
+    from: Option<String>,
+}
+
+async fn project_commits(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+    Query(query): Query<CommitListQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current_user(&state, &session).await?;
+    require_project(&state, id).await?;
+    let items = crate::project::list_commits(
+        &state.pool,
+        id,
+        query.reference.as_deref(),
+        query.limit.unwrap_or(50),
+        query.offset.unwrap_or(0),
+    )
+    .await?;
+    Ok(Json(json!({ "items": items })))
+}
+
+async fn project_commit_detail(
+    State(state): State<AppState>,
+    session: Session,
+    Path((id, oid)): Path<(Uuid, String)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current_user(&state, &session).await?;
+    require_project(&state, id).await?;
+    let Some(item) = crate::project::commit_detail(&state.pool, id, &oid).await? else {
+        api_reject!(StatusCode::NOT_FOUND, "提交不存在");
+    };
+    Ok(Json(json!({ "item": item })))
+}
+
+async fn project_revert(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+    Json(body): Json<RevertBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = current_user(&state, &session).await?;
+    let Some(project) = crate::project::get_project(&state.pool, id).await? else {
+        api_reject!(StatusCode::NOT_FOUND, "项目不存在");
+    };
+    let result = crate::project::revert_commit(
+        &state.pool,
+        &user,
+        id,
+        &body.branch,
+        &body.commit,
+        body.message.as_deref(),
+    )
+    .await?;
+    if body.branch == project.default_branch {
+        if let Err(error) = state.build_ctl.build_all().await {
+            return Err(ApiError::with_status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("已还原提交，但自动编译失败：{error}"),
+            ));
+        }
+    }
+    Ok(Json(json!({ "item": result })))
+}
+
+async fn project_branch_create(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+    Json(body): Json<BranchCreateBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current_user(&state, &session).await?;
+    let Some(project) = crate::project::get_project(&state.pool, id).await? else {
+        api_reject!(StatusCode::NOT_FOUND, "项目不存在");
+    };
+    let from = body
+        .from
+        .as_deref()
+        .unwrap_or(&project.default_branch);
+    crate::project::create_branch(&state.pool, id, &body.name, from).await?;
+    let branches = crate::project::list_branches(&state.pool, id).await?;
+    Ok(Json(json!({ "branches": branches })))
+}
+
+async fn project_branch_delete(
+    State(state): State<AppState>,
+    session: Session,
+    Path((id, name)): Path<(Uuid, String)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current_user(&state, &session).await?;
+    require_project(&state, id).await?;
+    crate::project::delete_branch(&state.pool, id, &name).await?;
+    let branches = crate::project::list_branches(&state.pool, id).await?;
+    Ok(Json(json!({ "branches": branches })))
+}
+
+#[derive(Deserialize)]
+struct PrCreateBody {
+    title: String,
+    #[serde(default)]
+    body: String,
+    source_branch: String,
+    target_branch: String,
+}
+
+#[derive(Deserialize)]
+struct CommentBody {
+    body: String,
+}
+
+#[derive(Deserialize)]
+struct DiscussionCreateBody {
+    title: String,
+    body: String,
+}
+
+/// 协作接口都只对管理端登录用户开放，先确认项目存在再进入具体逻辑。
+async fn require_project(state: &AppState, id: Uuid) -> ApiResult<crate::project::Project> {
+    match crate::project::get_project(&state.pool, id).await? {
+        Some(project) => Ok(project),
+        None => Err(ApiError::with_status(StatusCode::NOT_FOUND, "项目不存在")),
+    }
+}
+
+async fn pr_list(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current_user(&state, &session).await?;
+    require_project(&state, id).await?;
+    Ok(Json(json!({
+        "items": crate::collab::list_prs(&state.pool, id).await?
+    })))
+}
+
+async fn pr_create(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+    Json(body): Json<PrCreateBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = current_user(&state, &session).await?;
+    require_project(&state, id).await?;
+    let item = crate::collab::create_pr(
+        &state.pool,
+        &user,
+        id,
+        &body.title,
+        &body.body,
+        &body.source_branch,
+        &body.target_branch,
+    )
+    .await?;
+    Ok(Json(json!({ "item": item })))
+}
+
+async fn pr_detail(
+    State(state): State<AppState>,
+    session: Session,
+    Path((id, number)): Path<(Uuid, i32)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current_user(&state, &session).await?;
+    require_project(&state, id).await?;
+    let Some(item) = crate::collab::pr_detail(&state.pool, id, number).await? else {
+        api_reject!(StatusCode::NOT_FOUND, "PR 不存在");
+    };
+    Ok(Json(json!({ "item": item })))
+}
+
+async fn pr_add_comment(
+    State(state): State<AppState>,
+    session: Session,
+    Path((id, number)): Path<(Uuid, i32)>,
+    Json(body): Json<CommentBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = current_user(&state, &session).await?;
+    require_project(&state, id).await?;
+    let item =
+        crate::collab::add_pr_comment(&state.pool, &user, id, number, &body.body).await?;
+    Ok(Json(json!({ "item": item })))
+}
+
+async fn pr_merge(
+    State(state): State<AppState>,
+    session: Session,
+    Path((id, number)): Path<(Uuid, i32)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = current_user(&state, &session).await?;
+    let project = require_project(&state, id).await?;
+    let outcome = crate::collab::merge_pr(&state.pool, &user, id, number).await?;
+    // 只有合并进默认分支才会改变线上内容，此时才触发整站编译。
+    if outcome.pr.target_branch == project.default_branch {
+        if let Err(error) = state.build_ctl.build_all().await {
+            return Err(ApiError::with_status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("PR 已合并，但自动编译失败：{error}"),
+            ));
+        }
+    }
+    Ok(Json(json!({
+        "item": outcome.pr,
+        "overwrote_target": outcome.overwrote_target
+    })))
+}
+
+async fn pr_close(
+    State(state): State<AppState>,
+    session: Session,
+    Path((id, number)): Path<(Uuid, i32)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current_user(&state, &session).await?;
+    require_project(&state, id).await?;
+    let item = crate::collab::close_pr(&state.pool, id, number).await?;
+    Ok(Json(json!({ "item": item })))
+}
+
+async fn discussion_list(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current_user(&state, &session).await?;
+    require_project(&state, id).await?;
+    Ok(Json(json!({
+        "items": crate::collab::list_discussions(&state.pool, id).await?
+    })))
+}
+
+async fn discussion_create(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+    Json(body): Json<DiscussionCreateBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = current_user(&state, &session).await?;
+    require_project(&state, id).await?;
+    let item =
+        crate::collab::create_discussion(&state.pool, &user, id, &body.title, &body.body).await?;
+    Ok(Json(json!({ "item": item })))
+}
+
+async fn discussion_detail(
+    State(state): State<AppState>,
+    session: Session,
+    Path((id, discussion_id)): Path<(Uuid, Uuid)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current_user(&state, &session).await?;
+    require_project(&state, id).await?;
+    let Some(item) = crate::collab::discussion_detail(&state.pool, id, discussion_id).await?
+    else {
+        api_reject!(StatusCode::NOT_FOUND, "讨论不存在");
+    };
+    Ok(Json(json!({ "item": item })))
+}
+
+async fn discussion_add_comment(
+    State(state): State<AppState>,
+    session: Session,
+    Path((id, discussion_id)): Path<(Uuid, Uuid)>,
+    Json(body): Json<CommentBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = current_user(&state, &session).await?;
+    require_project(&state, id).await?;
+    let item = crate::collab::add_discussion_comment(
+        &state.pool,
+        &user,
+        id,
+        discussion_id,
+        &body.body,
+    )
+    .await?;
+    Ok(Json(json!({ "item": item })))
+}
+
+async fn discussion_close(
+    State(state): State<AppState>,
+    session: Session,
+    Path((id, discussion_id)): Path<(Uuid, Uuid)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current_user(&state, &session).await?;
+    require_project(&state, id).await?;
+    let item = crate::collab::close_discussion(&state.pool, id, discussion_id).await?;
+    Ok(Json(json!({ "item": item })))
+}
+
+#[derive(Deserialize)]
+struct GitTokenBody {
+    name: String,
+}
+
+async fn git_token_list(
+    State(state): State<AppState>,
+    session: Session,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = current_user(&state, &session).await?;
+    Ok(Json(json!({
+        "items": crate::git::token::list(&state.pool, user.id).await?
+    })))
+}
+
+async fn git_token_create(
+    State(state): State<AppState>,
+    session: Session,
+    Json(body): Json<GitTokenBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = current_user(&state, &session).await?;
+    let (item, token) = crate::git::token::create(&state.pool, user.id, &body.name).await?;
+    Ok(Json(json!({ "item": item, "token": token })))
+}
+
+async fn git_token_revoke(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+) -> ApiResult<StatusCode> {
+    let user = current_user(&state, &session).await?;
+    crate::git::token::revoke(&state.pool, user.id, id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn git_plain(status: StatusCode, message: &str) -> Response {
+    (status, message.to_string()).into_response()
+}
+
+fn git_unauthorized() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, "Basic realm=\"kych git\"")],
+        "需要 Git 访问令牌",
+    )
+        .into_response()
+}
+
+fn git_binary(content_type: &'static str, body: Vec<u8>) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, HeaderValue::from_static(content_type)),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-cache")),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+fn git_json(content_type: &'static str, body: Vec<u8>) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, HeaderValue::from_static(content_type)),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-cache")),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+async fn git_project(
+    state: &AppState,
+    slug: &str,
+) -> std::result::Result<crate::project::Project, Response> {
+    match crate::project::find_project_by_slug(&state.pool, slug).await {
+        Ok(Some(project)) if project.archived_at.is_none() => Ok(project),
+        Ok(_) => Err(git_plain(StatusCode::NOT_FOUND, "项目不存在")),
+        Err(error) => Err(git_plain(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &error.to_string(),
+        )),
+    }
+}
+
+async fn git_http_get(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    let (slug, action) = match crate::git::http::split_target(&path) {
+        Ok(value) => value,
+        Err(error) => return git_plain(StatusCode::NOT_FOUND, &error.to_string()),
+    };
+    let project = match git_project(&state, &slug).await {
+        Ok(project) => project,
+        Err(response) => return response,
+    };
+
+    // Git LFS 下载：公开可读，文件落在 LFS_ROOT 下。
+    if let Some(oid) = action.strip_prefix("info/lfs/objects/") {
+        return match crate::git::lfs::load(&state.pool, &state.lfs_root, project.id, oid).await {
+            Ok(Some(data)) => git_binary("application/octet-stream", data),
+            Ok(None) => git_plain(StatusCode::NOT_FOUND, "LFS 对象不存在"),
+            Err(error) => git_plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+        };
+    }
+
+    if action != "info/refs" {
+        return git_plain(StatusCode::NOT_FOUND, "未知的 Git 路径");
+    }
+    let service = params.get("service").cloned().unwrap_or_default();
+    if service != "git-upload-pack" && service != "git-receive-pack" {
+        return git_plain(StatusCode::BAD_REQUEST, "缺少或非法的 service 参数");
+    }
+    // receive-pack 的广告也要求认证，Git 客户端才会主动带上凭据。
+    if service == "git-receive-pack" {
+        match crate::git::token::authenticate(&state.pool, &headers).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return git_unauthorized(),
+            Err(error) => {
+                return git_plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
+            }
+        }
+    }
+
+    // protocol v2 使用独立的能力广告；receive-pack 仍走 v0。
+    if service == "git-upload-pack" && wants_v2(&headers) {
+        return git_binary(
+            "application/x-git-upload-pack-advertisement",
+            crate::git::http::advertise_v2(&service),
+        );
+    }
+
+    match crate::git::http::advertise(&state.pool, &project, &service).await {
+        Ok(body) => git_binary(
+            if service == "git-upload-pack" {
+                "application/x-git-upload-pack-advertisement"
+            } else {
+                "application/x-git-receive-pack-advertisement"
+            },
+            body,
+        ),
+        Err(error) => git_plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
+}
+
+fn wants_v2(headers: &HeaderMap) -> bool {
+    headers
+        .get("git-protocol")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(':')
+                .any(|part| part.trim() == "version=2")
+        })
+        .unwrap_or(false)
+}
+
+/// 生成 LFS 批量接口里可访问的绝对地址。
+fn lfs_base_url(state: &AppState, project: &crate::project::Project, headers: &HeaderMap) -> String {
+    let scheme = if state.trust_proxy_headers {
+        headers
+            .get("x-forwarded-proto")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_else(|| {
+                if state.site_url.starts_with("https") {
+                    "https"
+                } else {
+                    "http"
+                }
+            })
+    } else if state.site_url.starts_with("https") {
+        "https"
+    } else {
+        "http"
+    };
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("localhost");
+    format!(
+        "{scheme}://{host}/git/{}.git/info/lfs/objects",
+        percent_encode_segment(&project.slug)
+    )
+}
+
+/// 只编码 URL 路径段里必须编码的字节。
+fn percent_encode_segment(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+async fn git_http_post(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let (slug, action) = match crate::git::http::split_target(&path) {
+        Ok(value) => value,
+        Err(error) => return git_plain(StatusCode::NOT_FOUND, &error.to_string()),
+    };
+    let project = match git_project(&state, &slug).await {
+        Ok(project) => project,
+        Err(response) => return response,
+    };
+    match action.as_str() {
+        "info/lfs/objects/batch" => {
+            let authenticated = crate::git::token::authenticate(&state.pool, &headers)
+                .await
+                .map(|user| user.is_some())
+                .unwrap_or(false);
+            let base = lfs_base_url(&state, &project, &headers);
+            match crate::git::lfs::batch(
+                &state.pool,
+                &state.lfs_root,
+                &project,
+                &body,
+                &base,
+                authenticated,
+            )
+            .await
+            {
+                Ok(result) if result.unauthorized => {
+                    let mut response =
+                        git_plain(StatusCode::UNAUTHORIZED, "上传 LFS 对象需要 Git 令牌");
+                    response.headers_mut().insert(
+                        "lfs-authenticate",
+                        HeaderValue::from_static("Basic realm=\"Git LFS\""),
+                    );
+                    response
+                }
+                Ok(result) => match serde_json::to_vec(&result.body) {
+                    Ok(data) => git_json("application/vnd.git-lfs+json", data),
+                    Err(error) => {
+                        git_plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
+                    }
+                },
+                Err(error) => git_plain(StatusCode::BAD_REQUEST, &error.to_string()),
+            }
+        }
+        "git-upload-pack" => {
+            let body = if wants_v2(&headers) {
+                crate::git::http::upload_pack_v2(&state.pool, &project, &body).await
+            } else {
+                crate::git::http::upload_pack(&state.pool, &project, &body).await
+            };
+            match body {
+                Ok(data) => git_binary("application/x-git-upload-pack-result", data),
+                Err(error) => git_plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+            }
+        }
+        "git-receive-pack" => git_receive(&state, &project, &headers, &body).await,
+        _ => git_plain(StatusCode::NOT_FOUND, "未知的 Git 路径"),
+    }
+}
+
+/// Git LFS 上传。只有携带令牌的写请求才允许落盘。
+async fn git_http_put(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let (slug, action) = match crate::git::http::split_target(&path) {
+        Ok(value) => value,
+        Err(error) => return git_plain(StatusCode::NOT_FOUND, &error.to_string()),
+    };
+    let project = match git_project(&state, &slug).await {
+        Ok(project) => project,
+        Err(response) => return response,
+    };
+    let Some(oid) = action.strip_prefix("info/lfs/objects/") else {
+        return git_plain(StatusCode::NOT_FOUND, "未知的 Git 路径");
+    };
+    match crate::git::token::authenticate(&state.pool, &headers).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return git_unauthorized(),
+        Err(error) => {
+            return git_plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
+        }
+    }
+    match crate::git::lfs::store(&state.pool, &state.lfs_root, project.id, oid, &body).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(error) => git_plain(StatusCode::BAD_REQUEST, &error.to_string()),
+    }
+}
+
+async fn git_receive(
+    state: &AppState,
+    project: &crate::project::Project,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Response {
+    let user = match crate::git::token::authenticate(&state.pool, headers).await {
+        Ok(Some(user)) => user,
+        Ok(None) => return git_unauthorized(),
+        Err(error) => return git_plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    let outcome = match crate::git::http::receive_pack(&state.pool, project, &user, body).await {
+        Ok(outcome) => outcome,
+        Err(error) => return git_plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    // 默认分支变了就重新发布静态站；失败不影响推送结果，只记录日志。
+    if outcome.default_branch_updated {
+        if let Err(error) = state.build_ctl.build_all().await {
+            tracing::warn!("Git 推送后自动编译失败: {error:#}");
+        }
+    }
+    git_binary("application/x-git-receive-pack-result", outcome.response)
 }
 
 /// 定期清理过期的认证流程。

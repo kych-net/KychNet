@@ -5,10 +5,11 @@ import { Theme } from "../theme";
 import { ContentsView } from "../views/ContentsView";
 import { InvitesView } from "../views/InvitesView";
 import { ProfileView } from "../views/ProfileView";
+import { ProjectsView } from "../views/ProjectsView";
 import { SettingsView } from "../views/SettingsView";
 import { UsersView } from "../views/UsersView";
 
-type View = "contents" | "invites" | "users" | "settings" | "profile";
+type View = "contents" | "projects" | "invites" | "users" | "settings" | "profile";
 
 type Props = {
   user: User;
@@ -107,6 +108,9 @@ export function Shell({
           <button className={view === "contents" ? "active" : ""} onClick={() => go("contents")}>
             内容
           </button>
+          <button className={view === "projects" ? "active" : ""} onClick={() => go("projects")}>
+            项目
+          </button>
           {user.is_admin &&
             adminViews.map((item) => (
               <button
@@ -177,6 +181,7 @@ export function Shell({
             onEditHandled={() => setEditContentId(null)}
           />
         )}
+        {view === "projects" && <ProjectsView />}
         {view === "invites" && user.is_admin && <InvitesView />}
         {view === "users" && user.is_admin && <UsersView />}
         {view === "settings" && user.is_admin && <SettingsView />}

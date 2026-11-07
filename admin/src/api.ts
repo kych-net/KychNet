@@ -62,6 +62,135 @@ export type BuildStatus = {
   last: BuildRecord | null;
 };
 
+export type Project = {
+  id: string;
+  slug: string;
+  title: string;
+  description: string;
+  default_branch: string;
+  created_by: string | null;
+  created_at: string;
+  updated_at: string;
+  archived_at: string | null;
+};
+
+export type ProjectDirItem = {
+  name: string;
+  path: string;
+  is_dir: boolean;
+  size: number;
+  oid: string;
+};
+
+export type ProjectFile = {
+  path: string;
+  oid: string;
+  content: string;
+};
+
+export type GitToken = {
+  id: string;
+  name: string;
+  created_at: string;
+  expires_at: string | null;
+  last_used_at: string | null;
+};
+
+export type PrStatus = "open" | "merged" | "closed";
+
+export type PullRequest = {
+  id: string;
+  project_id: string;
+  number: number;
+  title: string;
+  body: string;
+  source_branch: string;
+  target_branch: string;
+  status: PrStatus;
+  created_at: string;
+  updated_at: string;
+  merged_at: string | null;
+  author_name: string;
+};
+
+export type PrComment = {
+  id: string;
+  author_name: string;
+  body: string;
+  created_at: string;
+};
+
+export type PrDiffLine = {
+  kind: "context" | "add" | "del";
+  old_line: number | null;
+  new_line: number | null;
+  text: string;
+};
+
+export type PrDiffHunk = {
+  header: string;
+  lines: PrDiffLine[];
+};
+
+export type PrFileDiff = {
+  path: string;
+  status: "add" | "modify" | "delete";
+  old_oid?: string | null;
+  new_oid?: string | null;
+  additions: number;
+  deletions: number;
+  /** 文件过大或不是文本时为 true，此时 hunks 为空。 */
+  truncated: boolean;
+  hunks: PrDiffHunk[];
+};
+
+export type PrDetail = PullRequest & {
+  files: PrFileDiff[];
+  mergeable: boolean;
+  /** 目标分支是否已经是来源分支的祖先。 */
+  is_fast_forward: boolean;
+  /** 非快进合并会用来源分支覆盖目标分支，前端必须明确警示。 */
+  overwrites_target: boolean;
+  merge_base: string | null;
+  comments: PrComment[];
+};
+
+export type CommitSummary = {
+  oid: string;
+  parent_oid: string | null;
+  second_parent_oid: string | null;
+  tree_oid: string;
+  author_name: string;
+  message: string;
+  committed_at: string;
+};
+
+export type CommitDetail = CommitSummary & {
+  files: PrFileDiff[];
+};
+
+export type Discussion = {
+  id: string;
+  project_id: string;
+  title: string;
+  body: string;
+  author_name: string;
+  created_at: string;
+  closed_at: string | null;
+  comment_count: number;
+};
+
+export type DiscussionComment = {
+  id: string;
+  author_name: string;
+  body: string;
+  created_at: string;
+};
+
+export type DiscussionDetail = Discussion & {
+  comments: DiscussionComment[];
+};
+
 // API 基址：开发环境留空，请求走 vite 的 /api 代理（见 vite.config.ts）；
 // 生产环境把 VITE_API_BASE_URL 设为 API 服务的完整 origin（如 https://api.kych.net）。
 // 管理前端是独立发布的静态站，本身没有同源 /api 可以转发，必须显式指向 API 子域。
@@ -75,6 +204,11 @@ function apiUrl(path: string): string {
 export function avatarUrl(id: string, version?: number): string {
   const suffix = version === undefined ? "" : `?v=${version}`;
   return `${apiUrl(`/avatar/${id}`)}${suffix}`;
+}
+
+/** 公开的 Git 仓库地址；项目名按 URL 段编码。 */
+export function gitUrl(slug: string): string {
+  return `${API_BASE}/git/${encodeURIComponent(slug)}.git`;
 }
 
 export class ApiError extends Error {
@@ -226,4 +360,129 @@ export const api = {
 
   buildStatus: () => request<BuildStatus>("/admin/rebuild"),
   rebuild: () => request<BuildStatus>("/admin/rebuild", { method: "POST" }),
+
+  projects: () => request<{ items: Project[] }>("/projects"),
+  createProject: (payload: { slug: string; title: string; description: string }) =>
+    request<{ item: Project }>("/projects", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  project: (id: string) =>
+    request<{ item: Project; branches: string[] }>(`/projects/${id}`),
+  updateProject: (id: string, payload: { title?: string; description?: string; archived?: boolean }) =>
+    request<{ item: Project }>(`/projects/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    }),
+  projectTree: (id: string, ref: string, path: string) =>
+    request<{ items: ProjectDirItem[]; branches: string[]; default_branch: string }>(
+      `/projects/${id}/tree?ref=${encodeURIComponent(ref)}&path=${encodeURIComponent(path)}`,
+    ),
+  projectFile: (id: string, ref: string, path: string) =>
+    request<{ item: ProjectFile | null }>(
+      `/projects/${id}/file?ref=${encodeURIComponent(ref)}&path=${encodeURIComponent(path)}`,
+    ),
+  saveProjectFile: (
+    id: string,
+    payload: {
+      ref: string;
+      path: string;
+      content: string;
+      message?: string;
+      base_oid?: string;
+    },
+  ) =>
+    request<{ item: { commit: string; path: string; oid: string } }>(`/projects/${id}/file`, {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    }),
+  deleteProjectFile: (id: string, ref: string, path: string) =>
+    request<void>(
+      `/projects/${id}/file?ref=${encodeURIComponent(ref)}&path=${encodeURIComponent(path)}`,
+      { method: "DELETE" },
+    ),
+  moveProjectFile: (
+    id: string,
+    payload: { ref: string; from: string; to: string; message?: string },
+  ) =>
+    request<{ item: { commit: string; path: string; oid: string } }>(
+      `/projects/${id}/move`,
+      { method: "POST", body: JSON.stringify(payload) },
+    ),
+
+  commits: (id: string, ref?: string, limit = 50, offset = 0) =>
+    request<{ items: CommitSummary[] }>(
+      `/projects/${id}/commits?limit=${limit}&offset=${offset}` +
+        (ref ? `&ref=${encodeURIComponent(ref)}` : ""),
+    ),
+  commitDetail: (id: string, oid: string) =>
+    request<{ item: CommitDetail }>(`/projects/${id}/commits/${oid}`),
+  revertCommit: (id: string, payload: { ref: string; commit: string; message?: string }) =>
+    request<{ item: { commit: string } }>(`/projects/${id}/revert`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  createBranch: (id: string, payload: { name: string; from?: string }) =>
+    request<{ branches: string[] }>(`/projects/${id}/branches`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  deleteBranch: (id: string, name: string) =>
+    request<{ branches: string[] }>(
+      `/projects/${id}/branches/${encodeURIComponent(name)}`,
+      { method: "DELETE" },
+    ),
+
+  prs: (id: string) => request<{ items: PullRequest[] }>(`/projects/${id}/prs`),
+  createPr: (
+    id: string,
+    payload: { title: string; body: string; source_branch: string; target_branch: string },
+  ) =>
+    request<{ item: PullRequest }>(`/projects/${id}/prs`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  prDetail: (id: string, number: number) =>
+    request<{ item: PrDetail }>(`/projects/${id}/prs/${number}`),
+  addPrComment: (id: string, number: number, body: string) =>
+    request<{ item: PrComment }>(`/projects/${id}/prs/${number}/comments`, {
+      method: "POST",
+      body: JSON.stringify({ body }),
+    }),
+  mergePr: (id: string, number: number) =>
+    request<{ item: PullRequest; overwrote_target: boolean }>(
+      `/projects/${id}/prs/${number}/merge`,
+      { method: "POST" },
+    ),
+  closePr: (id: string, number: number) =>
+    request<{ item: PullRequest }>(`/projects/${id}/prs/${number}/close`, { method: "POST" }),
+
+  discussions: (id: string) =>
+    request<{ items: Discussion[] }>(`/projects/${id}/discussions`),
+  createDiscussion: (id: string, payload: { title: string; body: string }) =>
+    request<{ item: Discussion }>(`/projects/${id}/discussions`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  discussionDetail: (id: string, discussionId: string) =>
+    request<{ item: DiscussionDetail }>(`/projects/${id}/discussions/${discussionId}`),
+  addDiscussionComment: (id: string, discussionId: string, body: string) =>
+    request<{ item: DiscussionComment }>(
+      `/projects/${id}/discussions/${discussionId}/comments`,
+      { method: "POST", body: JSON.stringify({ body }) },
+    ),
+  closeDiscussion: (id: string, discussionId: string) =>
+    request<{ item: Discussion }>(
+      `/projects/${id}/discussions/${discussionId}/close`,
+      { method: "POST" },
+    ),
+
+  gitTokens: () => request<{ items: GitToken[] }>("/git-tokens"),
+  createGitToken: (name: string) =>
+    request<{ item: GitToken; token: string }>("/git-tokens", {
+      method: "POST",
+      body: JSON.stringify({ name }),
+    }),
+  revokeGitToken: (id: string) =>
+    request<void>(`/git-tokens/${id}`, { method: "DELETE" }),
 };
