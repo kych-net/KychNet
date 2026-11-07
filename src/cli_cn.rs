@@ -1,38 +1,30 @@
-//! kych-net — KychNet 中文命令行
-//!
-//! KychNet 已有一套英文 CLI `kychnet`，这套中文入口的二进制叫 `kych-net`。
-//! 中文命令名「跨越晨昏」由服务器环境变量/初始化文件里的别名提供，
-//! 不改动二进制与源码名：shell 用 alias，服务托管场景用 PATH 目录里的同名链接。
-//! 中文命令按中文语序书写，并且**连写、不加空格**：
-//!
-//!   创建邀请码可用三次有效期七天
-//!   创建用户爱丽丝设为管理员
-//!   重置爱丽丝的通行密钥
-//!
-//! 中文不像英文靠空格分词，因此解析时先去掉所有空白，再按中文短语切出命令名、
-//! 数量、时长、所属与位置参数。解析结果直接交给同一个 `kychnet` 执行，与英文 CLI
-//! 共用 service 层，不改动后端代码。
-//!
-//! 放进 KychNet 仓库：把本文件复制为 `src/bin/kych-net.rs`，Cargo 会自动发现它，
-//! `cargo build --bin kych-net` 即可。本目录的 Cargo.toml 是零依赖的独立工程，
-//! 仅用于在没有 PostgreSQL 的环境里编译与自测。
-//!
-//! 后端程序查找顺序：KYCHNET_BIN → 本程序同目录 → PATH。
+// 中文命令前端：把连写的中文短语翻译成英文参数，交给同一个二进制里的 clap 解析器。
+//
+// 中文不像英文靠空格分词，因此解析时先去掉所有空白，再按中文短语切出命令名、
+// 数量、时长、所属与位置参数。翻译结果与英文命令走同一条执行路径——
+// 不再 fork 出第二个进程，也不需要在 PATH 里找另一个二进制。
+//
+// 中文命令按中文语序书写，并且**连写、不加空格**：
+//
+//   创建邀请码可用三次有效期七天
+//   创建用户爱丽丝设为管理员
+//   重置爱丽丝的通行密钥
+//
+// / Chinese front-end: translates concatenated Chinese phrases into English
+// arguments for the very same clap parser. No second process, no sibling binary.
 
-use std::env;
 use std::io::{self, IsTerminal};
-use std::path::PathBuf;
-use std::process::{Command as Process, ExitCode};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-const NAME: &str = "kych-net";
-const VERSION: &str = "0.3.0";
+pub const NAME: &str = "kych-net";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 static COLOR: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------- 命令定义
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Kind {
+pub enum Kind {
     Serve,
     Build,
     Migrate,
@@ -47,17 +39,17 @@ enum Kind {
     PasskeyReset,
 }
 
-struct Cmd {
-    kind: Kind,
-    cn: &'static str,
-    aliases: &'static [&'static str],
-    en: &'static str,
-    group: &'static str,
-    usage: &'static str,
-    desc: &'static str,
+pub struct Cmd {
+    pub kind: Kind,
+    pub cn: &'static str,
+    pub aliases: &'static [&'static str],
+    pub en: &'static str,
+    pub group: &'static str,
+    pub usage: &'static str,
+    pub desc: &'static str,
 }
 
-/// 与 `src/main.rs` 里的 clap 子命令一一对应（含 README 未列出的 `user enable`）。
+/// 与 `main.rs` 里的 clap 子命令一一对应（含 README 未列出的 `user enable`）。
 /// 命令名与修饰语全是连写的中文短语，不用空格、不用 `--英文选项`。
 const CMDS: &[Cmd] = &[
     Cmd {
@@ -196,6 +188,14 @@ fn match_command(line: &str) -> Option<(&'static Cmd, usize)> {
 
 fn is_english_command(s: &str) -> bool {
     matches!(s, "serve" | "build" | "db" | "invite" | "user" | "passkey")
+}
+
+/// 参数里出现非 ASCII 字符就当作中文命令处理。
+///
+/// 英文命令也可能带中文用户名（`user create 爱丽丝`），这种情况交给下面的
+/// 英文透传分支处理，行为与直接敲英文完全一致。
+pub fn has_cjk(args: &[String]) -> bool {
+    args.iter().any(|a| a.chars().any(|c| !c.is_ascii()))
 }
 
 // ---------------------------------------------------------------- 中文数量与时长
@@ -416,7 +416,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
     for (i, ca) in a.chars().enumerate() {
         let mut cur = vec![i + 1; b.len() + 1];
         for (j, cb) in b.iter().enumerate() {
-            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + usize::from(ca != *cb));
+            cur[j + 1] = (prev[j + 1] + 1).min(prev[j] + 1).min(prev[j] + usize::from(ca != *cb));
         }
         prev = cur;
     }
@@ -444,9 +444,16 @@ fn no_match_message(line: &str) -> String {
 // ---------------------------------------------------------------- 输出样式
 
 fn init_color(no_color: bool) {
-    let ok = !no_color && env::var_os("NO_COLOR").is_none() && io::stdout().is_terminal();
+    let ok = !no_color && std::env::var_os("NO_COLOR").is_none() && io::stdout().is_terminal();
     COLOR.store(ok, Ordering::Relaxed);
 }
+
+/// 初始化彩色输出。由 `main` 在任何输出之前调用一次。
+pub fn setup_color(args: &[String]) {
+    let (g, _) = extract_globals(args);
+    init_color(g.no_color);
+}
+
 fn paint(s: &str, code: &str) -> String {
     if COLOR.load(Ordering::Relaxed) {
         format!("\x1b[{}m{}\x1b[0m", code, s)
@@ -454,10 +461,19 @@ fn paint(s: &str, code: &str) -> String {
         s.to_string()
     }
 }
-fn title(s: &str) -> String { paint(s, "1;36") }
-fn bold(s: &str) -> String { paint(s, "1") }
-fn dim(s: &str) -> String { paint(s, "90") }
-fn red(s: &str) -> String { paint(s, "31") }
+
+fn title(s: &str) -> String {
+    paint(s, "1;36")
+}
+fn bold(s: &str) -> String {
+    paint(s, "1")
+}
+fn dim(s: &str) -> String {
+    paint(s, "90")
+}
+fn red(s: &str) -> String {
+    paint(s, "31")
+}
 
 fn is_wide(c: char) -> bool {
     matches!(c as u32,
@@ -465,16 +481,22 @@ fn is_wide(c: char) -> bool {
         | 0xFE10..=0xFE19 | 0xFE30..=0xFE6F | 0xFF00..=0xFF60 | 0xFFE0..=0xFFE6
         | 0x1F300..=0x1FAFF | 0x20000..=0x3FFFD)
 }
-fn width(s: &str) -> usize { s.chars().map(|c| if is_wide(c) { 2 } else { 1 }).sum() }
-fn pad(s: &str, n: usize) -> String { format!("{}{}", s, " ".repeat(n.saturating_sub(width(s)))) }
+
+fn width(s: &str) -> usize {
+    s.chars().map(|c| if is_wide(c) { 2 } else { 1 }).sum()
+}
+
+fn pad(s: &str, n: usize) -> String {
+    format!("{}{}", s, " ".repeat(n.saturating_sub(width(s))))
+}
 
 // ---------------------------------------------------------------- 全局选项
 
 #[derive(Default)]
-struct Global {
-    no_color: bool,
-    help: bool,
-    version: bool,
+pub struct Global {
+    pub no_color: bool,
+    pub help: bool,
+    pub version: bool,
 }
 
 fn extract_globals(tokens: &[String]) -> (Global, Vec<String>) {
@@ -495,135 +517,122 @@ fn extract_globals(tokens: &[String]) -> (Global, Vec<String>) {
     (g, rest)
 }
 
-// ---------------------------------------------------------------- 帮助
+// ---------------------------------------------------------------- 分派结果
 
-fn print_help() {
-    println!("{}", title(&format!("{} {} — KychNet 中文命令行", NAME, VERSION)));
-    println!("中文命令连写、不加空格：动词在前、定语前置、所属用「的」、数量用中文数量词。\n");
-    println!("{}", bold("用法"));
-    println!("  {} <中文命令>", NAME);
-    println!("  例如：{} 创建邀请码可用三次有效期七天\n", NAME);
-    println!("{}", bold("命令一览"));
-    let mut last = "";
-    for c in CMDS {
-        if c.group != last {
-            println!("\n  {}", title(c.group));
-            last = c.group;
-        }
-        println!("    {}  {}", pad(c.usage, 44), c.desc);
-    }
-    println!("\n  {}", title("中文数量与时长"));
-    println!("    可用三次 / 可用3次 / 可用十次      次数写成中文数字或阿拉伯数字");
-    println!("    有效期七天 / 有效期7d / 24小时     时长可用中文或英文简写");
-    println!("    有效期永不过期                     永不过期");
-    println!("    到public / 输出到public            指定静态站目录，默认 dist");
-    println!("\n  {}", title("全局选项"));
-    println!("    {}  显示帮助；也可「帮助 <命令>」看单条用法", pad("--帮助 / -h", 20));
-    println!("    {}  显示版本", pad("--版本 / -V", 20));
-    println!("    {}  关闭彩色输出", pad("--无颜色", 20));
-    println!("\n  {}", title("示例"));
-    println!("    {} 启动服务", NAME);
-    println!("    {} 生成静态站到public", NAME);
-    println!("    {} 创建邀请码可用三次有效期七天", NAME);
-    println!("    {} 作废邀请码ABCD1234", NAME);
-    println!("    {} 创建用户爱丽丝设为管理员", NAME);
-    println!("    {} 创建管理员爱丽丝", NAME);
-    println!("    {} 重置爱丽丝的通行密钥", NAME);
-    println!("\n  {}", title("中文别名（服务器环境变量）"));
-    println!("    二进制名固定为 {}；在服务器的 shell 环境文件里设置别名即可：", NAME);
-    println!("      /etc/profile.d/kychnet-alias.sh → alias 跨越晨昏='{}'", NAME);
-    println!("    alias 是 shell 命令、不是环境变量；systemd 的 Environment= 与容器 ENV 里");
-    println!("    写不了 alias，这类场景改用 PATH 目录里的同名链接（命令别名）：");
-    println!("      ln -s /opt/kychnet/{} /usr/local/bin/跨越晨昏", NAME);
-    println!("\n  {}", title("运行依赖"));
-    println!("    依次查找 KYCHNET_BIN → 本程序同目录 → PATH 中的 kychnet。");
+/// 中文前端把原始参数处理后的结果。
+pub enum Dispatch {
+    /// 翻译好的英文参数，交给 clap 继续解析。
+    Argv(Vec<String>),
+    /// 直接打印这段文本后退出。
+    Print(String),
+    /// 打印完整帮助（中文部分 + 英文子命令列表）后退出。
+    FullHelp,
 }
 
-fn print_command_help(cmd: &Cmd) {
-    println!("{}", title(&format!("用法：{} {}", NAME, cmd.usage)));
-    println!("{}", cmd.desc);
-    if !cmd.aliases.is_empty() {
-        println!("同样说法：{}", cmd.aliases.join("、"));
-    }
-    println!("\n{}", dim("中文命令连写、不加空格，不用 --英文选项。"));
-}
-
-// ---------------------------------------------------------------- 执行后端
-
-fn find_backend() -> Option<PathBuf> {
-    if let Ok(p) = env::var("KYCHNET_BIN") {
-        let pb = PathBuf::from(p);
-        if pb.is_file() {
-            return Some(pb);
-        }
-    }
-    if let Ok(exe) = env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let p = dir.join("kychnet");
-            if p.is_file() {
-                return Some(p);
-            }
-        }
-    }
-    if let Some(paths) = env::var_os("PATH") {
-        for dir in env::split_paths(&paths) {
-            let p = dir.join("kychnet");
-            if p.is_file() {
-                return Some(p);
-            }
-        }
-    }
-    None
-}
-
-// ---------------------------------------------------------------- 入口
-
-fn main() -> ExitCode {
-    let raw: Vec<String> = env::args().skip(1).collect();
-    let (g, parts) = extract_globals(&raw);
-    init_color(g.no_color);
+/// 处理中文命令，返回给 clap 的英文参数。
+///
+/// 只处理带中文的调用；纯英文参数原样放行，由 clap 自己解析。
+pub fn dispatch(args: &[String]) -> Result<Dispatch, String> {
+    let (g, parts) = extract_globals(args);
 
     if g.version {
-        println!("{} {} （KychNet 中文命令行）", NAME, VERSION);
-        return ExitCode::SUCCESS;
+        return Ok(Dispatch::Print(format!(
+            "{} {} （KychNet 站点后端与管理命令行）",
+            NAME, VERSION
+        )));
     }
     let line = parts.join("");
     if g.help {
-        match match_command(&line) {
-            Some((cmd, _)) if !line.is_empty() => print_command_help(cmd),
-            _ => print_help(),
-        }
-        return ExitCode::SUCCESS;
+        return Ok(match match_command(&line) {
+            Some((cmd, _)) if !line.is_empty() => Dispatch::Print(command_help(cmd)),
+            _ => Dispatch::FullHelp,
+        });
     }
     if parts.is_empty() {
-        print_help();
-        return ExitCode::SUCCESS;
+        return Ok(Dispatch::FullHelp);
     }
 
-    let (cmd, argv) = match parse_line(&parts) {
-        Ok(v) => v,
-        Err(msg) => {
-            eprintln!("{}{}", red("错误："), msg);
-            return ExitCode::FAILURE;
-        }
-    };
+    let (_cmd, argv) = parse_line(&parts)?;
+    Ok(Dispatch::Argv(argv))
+}
 
-    let backend = match find_backend() {
-        Some(p) => p,
-        None => {
-            eprintln!("{}找不到 KychNet 后端程序 kychnet。", red("错误："));
-            eprintln!("  · 把 kychnet 放到 PATH 或本程序同目录，或设置 KYCHNET_BIN=/path/to/kychnet");
-            eprintln!("  · 本次命令：{}（{}）", cmd.usage, cmd.desc);
-            return ExitCode::FAILURE;
+// ---------------------------------------------------------------- 帮助
+
+pub fn help_text() -> String {
+    let mut out = String::new();
+    out.push_str(&title(&format!("{} {} — KychNet 命令行", NAME, VERSION)));
+    out.push('\n');
+    out.push_str("中文命令连写、不加空格：动词在前、定语前置、所属用「的」、数量用中文数量词。\n");
+    out.push_str("同一个二进制同时支持中文与英文命令。\n\n");
+    out.push_str(&bold("用法"));
+    out.push('\n');
+    out.push_str(&format!("  {} <中文命令>\n", NAME));
+    out.push_str(&format!("  {} <英文命令>\n\n", NAME));
+    out.push_str(&format!("  例如：{} 创建邀请码可用三次有效期七天\n\n", NAME));
+    out.push_str(&bold("命令一览"));
+    out.push('\n');
+    let mut last = "";
+    for c in CMDS {
+        if c.group != last {
+            out.push_str(&format!("\n  {}\n", title(c.group)));
+            last = c.group;
         }
-    };
-    match Process::new(&backend).args(&argv).status() {
-        Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
-        Err(e) => {
-            eprintln!("{}无法启动 {}：{}", red("错误："), backend.display(), e);
-            ExitCode::FAILURE
-        }
+        out.push_str(&format!("    {}  {}\n", pad(c.usage, 44), c.desc));
     }
+    out.push_str(&format!("\n  {}\n", title("中文数量与时长")));
+    out.push_str("    可用三次 / 可用3次 / 可用十次      次数写成中文数字或阿拉伯数字\n");
+    out.push_str("    有效期七天 / 有效期7d / 24小时     时长可用中文或英文简写\n");
+    out.push_str("    有效期永不过期                     永不过期\n");
+    out.push_str("    到public / 输出到public            指定静态站目录，默认 dist\n");
+    out.push_str(&format!("\n  {}\n", title("全局选项")));
+    out.push_str(&format!(
+        "    {}  显示帮助；也可「帮助 <命令>」看单条用法\n",
+        pad("--帮助 / -h", 20)
+    ));
+    out.push_str(&format!("    {}  显示版本\n", pad("--版本 / -V", 20)));
+    out.push_str(&format!("    {}  关闭彩色输出\n", pad("--无颜色", 20)));
+    out.push_str(&format!("\n  {}\n", title("示例")));
+    out.push_str(&format!("    {} 启动服务\n", NAME));
+    out.push_str(&format!("    {} 生成静态站到public\n", NAME));
+    out.push_str(&format!("    {} 创建邀请码可用三次有效期七天\n", NAME));
+    out.push_str(&format!("    {} 作废邀请码ABCD1234\n", NAME));
+    out.push_str(&format!("    {} 创建用户爱丽丝设为管理员\n", NAME));
+    out.push_str(&format!("    {} 创建管理员爱丽丝\n", NAME));
+    out.push_str(&format!("    {} 重置爱丽丝的通行密钥\n", NAME));
+    out.push_str(&format!("\n  {}\n", title("中文别名（服务器环境变量）")));
+    out.push_str(&format!(
+        "    二进制名固定为 {}；在服务器的 shell 环境文件里设置别名即可：\n",
+        NAME
+    ));
+    out.push_str(&format!(
+        "      /etc/profile.d/kych-net-alias.sh → alias 跨越晨昏='{}'\n",
+        NAME
+    ));
+    out.push_str("    alias 是 shell 命令、不是环境变量；systemd 的 Environment= 与容器 ENV 里\n");
+    out.push_str("    写不了 alias，这类场景改用 PATH 目录里的同名链接（命令别名）：\n");
+    out.push_str(&format!(
+        "      ln -s /opt/kych-net/{} /usr/local/bin/跨越晨昏\n",
+        NAME
+    ));
+    out
+}
+
+pub fn command_help(cmd: &Cmd) -> String {
+    let mut out = String::new();
+    out.push_str(&title(&format!("用法：{} {}", NAME, cmd.usage)));
+    out.push('\n');
+    out.push_str(cmd.desc);
+    out.push('\n');
+    if !cmd.aliases.is_empty() {
+        out.push_str(&format!("同样说法：{}\n", cmd.aliases.join("、")));
+    }
+    out.push_str(&dim("中文命令连写、不加空格，不用 --英文选项。"));
+    out
+}
+
+/// 中文错误信息的统一前缀，与英文侧的 clap 错误区分开。
+pub fn error_text(msg: &str) -> String {
+    format!("{}{}", red("错误："), msg)
 }
 
 // ---------------------------------------------------------------- 单元测试
@@ -636,8 +645,12 @@ mod tests {
         let t: Vec<String> = v.iter().map(|s| s.to_string()).collect();
         parse_line(&t).map(|(_, a)| a)
     }
-    fn ok(v: &[&str]) -> Vec<String> { argv(v).unwrap() }
-    fn words(v: &[&str]) -> Vec<String> { v.iter().map(|s| s.to_string()).collect() }
+    fn ok(v: &[&str]) -> Vec<String> {
+        argv(v).unwrap()
+    }
+    fn words(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
 
     #[test]
     fn 连写的基础命令() {
@@ -729,5 +742,11 @@ mod tests {
         assert!(g.help);
         assert_eq!(rest, words(&["创建邀请码可用三次"]));
         assert_eq!(levenshtein("列出用乎", "列出用户"), 1);
+    }
+
+    #[test]
+    fn 非ascii参数判定为中文路径() {
+        assert!(has_cjk(&words(&["创建用户爱丽丝"])));
+        assert!(!has_cjk(&words(&["user", "create", "alice"])));
     }
 }

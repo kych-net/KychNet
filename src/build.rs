@@ -149,7 +149,7 @@ mod tests {
     fn index_and_page_templates_render() {
         let index = IndexTemplate {
             site: settings(),
-            admin_url: "https://admin.kych.net".into(),
+            admin_url: "https://m.kych.net".into(),
             posts: vec![PostLink {
                 title: "第一篇".into(),
                 href: "/posts/hello.html".into(),
@@ -162,7 +162,7 @@ mod tests {
 
         let page = PageTemplate {
             site: settings(),
-            admin_url: "https://admin.kych.net".into(),
+            admin_url: "https://m.kych.net".into(),
             title: "标题".into(),
             date: "2026-11-06".into(),
             content: "<p>正文</p>".into(),

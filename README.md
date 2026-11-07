@@ -11,7 +11,7 @@
 - 内容前端是纯静态站,由后端编译输出 html.
 - 管理前端是动态的,以 SPA 形式通过 JSON API 读写内容.
 
-后端为单一二进制 `kychnet`,同时提供 HTTP 服务与命令行管理能力,两者共用同一套 service 层.
+后端为单一二进制 `kych-net`,同时提供 HTTP 服务与命令行管理能力,两者共用同一套 service 层.中英文命令行是同一个二进制的两个入口:中文命令先被翻译成英文参数,再交给同一个 clap 解析器.
 
 ## 内容格式
 
@@ -25,7 +25,7 @@
 
 三种格式均不做内容限制,内容作者均为邀请注册的可信用户,因此允许存储型 XSS 是项目明确的取舍。
 
-必须注意:**子域隔离本身并不能阻止攻击**。`www` / `admin` / `api` 同属一个 eTLD+1(同站),`SameSite` Cookie 不会阻止同站跨源请求,CORS 也只阻止读取响应、不阻止带凭据的写请求被发出。因此后端对所有写接口增加了 Origin 白名单校验(仅放行管理端 origin),挡住内容站 XSS 冒用管理员会话发起写操作。这层防护仍以「内容作者可信」为前提;若要允许不可信作者,需要让 `api` 使用完全独立的站点(不同 eTLD+1)并对内容页加 CSP,而不是只靠子域划分。
+必须注意:**子域隔离本身并不能阻止攻击**。`c`(内容站) / `m`(管理端) / `api` 同属一个 eTLD+1(同站),`SameSite` Cookie 不会阻止同站跨源请求,CORS 也只阻止读取响应、不阻止带凭据的写请求被发出。因此后端对所有写接口增加了 Origin 白名单校验(仅放行管理端 origin),挡住内容站 XSS 冒用管理员会话发起写操作。这层防护仍以「内容作者可信」为前提;若要允许不可信作者,需要让 `api` 使用完全独立的站点(不同 eTLD+1)并对内容页加 CSP,而不是只靠子域划分。
 
 ## 界面
 
@@ -75,24 +75,27 @@
 ## 命令行
 
 ```text
-kychnet serve                          # 启动 HTTP 服务
-kychnet build --out dist               # 生成静态站
-kychnet db migrate                     # 执行迁移
+kych-net serve                          # 启动 HTTP 服务
+kych-net build --out dist               # 生成静态站
+kych-net db migrate                     # 执行迁移
 
-kychnet invite create --uses 1 --expires 7d
-kychnet invite list
-kychnet invite revoke <code>
+kych-net invite create --uses 1 --expires 7d
+kych-net invite list
+kych-net invite revoke <code>
 
-kychnet user create --admin          # 创建管理员并输出 TOTP 密钥
-kychnet user create                  # 创建普通成员
-kychnet user list
-kychnet user disable <user>
-kychnet passkey reset <user>
+kych-net user create --admin          # 创建管理员并输出 TOTP 密钥
+kych-net user create                  # 创建普通成员
+kych-net user list
+kych-net user disable <user>
+kych-net user enable <user>
+kych-net passkey reset <user>
 ```
 
-## kych-net（中文命令行）
+## 中文命令行
 
-英文 CLI 叫 `kychnet`，中文入口的二进制叫 `kych-net`。中文命令按中文语序书写，且**连写、不加空格**：
+同一个二进制 `kych-net` 同时提供中英文两套命令。英文命令直接给 clap；中文命令先被翻译成英文参数，再交给同一个 clap 解析器——因此两者走完全相同的执行路径和同一个 service 层，不需要第二个二进制，也不需要在 PATH 里另找程序。
+
+中文命令按中文语序书写，且**连写、不加空格**：
 
 ```text
 kych-net 启动服务
@@ -104,7 +107,9 @@ kych-net 创建用户爱丽丝设为管理员
 kych-net 重置爱丽丝的通行密钥
 ```
 
-项目只保留**用户名**这一个名字（`display_name` 已移除）；用户名支持中文、日文与 emoji，注册、用户列表和通行密钥的展示名都用它。中文不像英文靠空格分词，程序先去掉空白，再按中文短语切出命令名、数量、时长、所属与参数；支持中文数字（`三次`）、中文时长（`七天`、`永不过期`）和多种说法（`运行服务`、`撤销邀请码`、`解禁用户`）。解析后直接交给同一个 `kychnet` 执行，与英文 CLI 共用 service 层。
+项目只保留**用户名**这一个名字（`display_name` 已移除）；用户名支持中文、日文与 emoji，注册、用户列表和通行密钥的展示名都用它。中文不像英文靠空格分词，程序先去掉空白，再按中文短语切出命令名、数量、时长、所属与参数；支持中文数字（`三次`）、中文时长（`七天`、`永不过期`）和多种说法（`运行服务`、`撤销邀请码`、`解禁用户`）。
+
+`kych-net --help` 打印完整帮助：上半是 clap 的英文子命令列表，下半是中文命令一览，两边共用同一份子命令定义。
 
 ### 中文名「跨越晨昏」：在服务器环境变量里设置别名
 
@@ -112,11 +117,11 @@ kych-net 重置爱丽丝的通行密钥
 
 | 场景 | 写入位置 | 内容 |
 | --- | --- | --- |
-| 所有登录用户（推荐） | 新建 `/etc/profile.d/kychnet-alias.sh` | `alias 跨越晨昏='kych-net'` |
+| 所有登录用户（推荐） | 新建 `/etc/profile.d/kych-net-alias.sh` | `alias 跨越晨昏='kych-net'` |
 | 单个用户 | `~/.bashrc` / `~/.zshrc` / `~/.profile` | 同上 |
 | 仅当前会话 | 直接执行 | `alias 跨越晨昏='kych-net'` |
 
-前提是 `kych-net` 所在目录已在服务器环境变量 `PATH` 里（例如装到 `/usr/local/bin`；若放在自定义目录，在同一份脚本里先加 `export PATH=/opt/kychnet:$PATH`）。重新登录后：
+前提是 `kych-net` 所在目录已在服务器环境变量 `PATH` 里（例如装到 `/usr/local/bin`；若放在自定义目录，在同一份脚本里先加 `export PATH=/opt/kych-net:$PATH`）。重新登录后：
 
 ```bash
 alias 跨越晨昏                              # 确认别名已生效
@@ -126,21 +131,21 @@ alias 跨越晨昏                              # 确认别名已生效
 **一处要注意**：`alias` 是 shell 内置命令，**不是环境变量**，不会出现在 `env` 或 `systemctl show -p Environment` 里；systemd 的 `Environment=`、Docker 的 `ENV`、`/etc/environment` 这些只能设置变量的地方写不了 `alias`。服务托管与容器场景改用 PATH 目录里的**同名链接**作为命令别名，效果一样且不依赖 shell：
 
 ```bash
-ln -sfn /opt/kychnet/kych-net /usr/local/bin/跨越晨昏
+ln -sfn /opt/kych-net/kych-net /usr/local/bin/跨越晨昏
 export PATH=/usr/local/bin:$PATH            # 通常已默认包含
 ```
 
-源码见 `src/bin/kych-net.rs`：零新增依赖，由 Cargo 自动发现为第二个二进制，内含单元测试（`cargo test --bin kych-net`）。运行时需能找到 `kychnet`（`KYCHNET_BIN` → 同目录 → PATH）。
+中文解析实现在 `src/cli_cn.rs`：只依赖标准库，不新增任何依赖，内含单元测试（`cargo test cli_cn`）。它把原始参数翻译成英文参数交给 clap，不 fork 子进程，因此中文命令的启动开销与英文命令完全一致。
 
 ## 注册与登录
 
 - 注册必须持有有效邀请码.邀请码可由 CLI 或管理员在管理前端生成,支持设置使用次数与有效期.
 - 邀请码由 CSPRNG 生成、Base32 编码,长度不少于 16 字符(约 80 bit 熵).
-- 注册用户默认为普通成员;管理员通过 `kychnet user create --admin` 创建.
+- 注册用户默认为普通成员;管理员通过 `kych-net user create --admin` 创建.
 - 普通成员可管理内容与个人设置;邀请码、用户管理、站点设置仅管理员可见.
 - 登录支持通行密钥(Passkey)与 TOTP 动态验证码,用户注册后可绑定任一或全部.
 - 会话存放于 HttpOnly + Secure + SameSite Cookie,不落地到前端存储;登录或注册成功后会轮换会话 ID,避免会话固定.
-- 会话记录存在 Postgres(schema `tower_sessions`,表 `session`),由 `serve` 启动时自动建表,每 5 分钟清理过期行;`kychnet db migrate` 不涉及它,但数据库角色需要有建 schema 的权限.换成集中存储后,进程重启不再让所有人掉登录,多实例也能共享会话,内存也不再随会话数无上限增长.代价是每个带 Cookie 的请求多一次按主键的会话读.
+- 会话记录存在 Postgres(schema `tower_sessions`,表 `session`),由 `serve` 启动时自动建表,每 5 分钟清理过期行;`kych-net db migrate` 不涉及它,但数据库角色需要有建 schema 的权限.换成集中存储后,进程重启不再让所有人掉登录,多实例也能共享会话,内存也不再随会话数无上限增长.代价是每个带 Cookie 的请求多一次按主键的会话读.
 - 登录相关接口有限流(按用户名与客户端 IP 双路计数):`login/start` 每用户名 10 次/分钟、`totp/login` 每账号 5 次/15 分钟(成功即清零)、注册每 IP 10 次/分钟,超额返回 429.限流是进程内的,重启清零、多实例各自计数,要跨实例统一得换集中存储.
 - 客户端 IP 默认取 TCP 对端地址;只有确实只经可信 CDN/反代进来时才设 `TRUST_PROXY_HEADERS=1` 改读 `X-Forwarded-For`——这个头任何人都能伪造,信错了等于让攻击者自己挑额度.
 - 绑定 TOTP 时新密钥先进 `pending_secret`,输入正确验证码确认后才替换旧密钥;中途放弃不会把原来能用的 TOTP 打死.
@@ -148,7 +153,7 @@ export PATH=/usr/local/bin:$PATH            # 通常已默认包含
 - 过期的 `auth_flows` 由 `serve` 内的后台任务每 60 秒清理一次;`login_start` 每次调用都会插一行,不清理就会被匿名请求撑爆.
 - 注册改为「凭证通过才落库」:`/api/auth/register` 只读校验邀请码并把用户资料暂存在认证流程里,`/api/auth/register/finish` 校验 Passkey 成功后才在一个事务内扣邀请码、建用户、存凭证.浏览器取消仪式不再消耗邀请名额,也不会留下没有凭证的孤立用户;撞用户名由唯一约束兜底.
 - 修改凭证需要 step-up:`totp/setup`、`totp/confirm` 之外的 `passkey/setup`、`passkey/setup/finish` 要求会话在最近一次真实认证的 5 分钟内,否则返回 403.只拿到旧 cookie 或只读到 `/api/me` 的攻击者无法把受害者的二次验证换绑到自己设备上.`totp/confirm` 不要求 step-up(pending 密钥只能由已 step-up 的 setup 产生),但每账号限 5 次/15 分钟.
-- 管理员启停账号有护栏:不能禁用自己的账号,也不能禁用最后一个可用管理员(同一事务内锁行判断,并发互关时后提交者失败).`kychnet user` CLI 不受此限制,保留为应急入口.
+- 管理员启停账号有护栏:不能禁用自己的账号,也不能禁用最后一个可用管理员(同一事务内锁行判断,并发互关时后提交者失败).`kych-net user` CLI 不受此限制,保留为应急入口.
 - 请求体上限显式声明:全局 2 MiB,头像 257 KB,不再依赖框架默认值.
 
 ## 开发
@@ -173,7 +178,7 @@ cd admin && pnpm install && cp .env.example .env && pnpm dev
 1. [.github/workflows/build.yml](.github/workflows/build.yml) 在 push、PR 和手动触发时运行测试,并编译 Linux 二进制;推送 `v*` 标签时自动创建 Release.
    - `x86_64-unknown-linux-gnu`:依赖系统 glibc,在 Ubuntu 22.04 上构建.
    - `x86_64-unknown-linux-musl`:静态链接,启用 `vendored-openssl` 特性,适配 Alpine 与老版本发行版.
-2. 先执行 `kychnet db migrate`,再执行 `kychnet build --out dist`,生成静态产物;Typst 页面同时产出 `.pdf`.构建会先渲染到内存,全部成功后才清理并重写 `posts/` 与 `index.html`,中途失败不会破坏现有站点.
+2. 先执行 `kych-net db migrate`,再执行 `kych-net build --out dist`,生成静态产物;Typst 页面同时产出 `.pdf`.构建会先渲染到内存,全部成功后才清理并重写 `posts/` 与 `index.html`,中途失败不会破坏现有站点.
 3. `dist/` 同时发布到 Cloudflare Pages 与 EdgeOne Pages.
 4. 管理前端构建为静态产物,单独发布.
 5. 媒体资源放在单一对象存储源,由两家 CDN 回源同一份.

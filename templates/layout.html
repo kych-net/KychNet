@@ -106,13 +106,13 @@
     <script>
       (function () {
         var root = document.documentElement;
-        var saved = localStorage.getItem("kychnet-theme");
+        var saved = localStorage.getItem("kych-net-theme");
         var initial = saved || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
         root.setAttribute("data-theme", initial);
         document.getElementById("theme-toggle").addEventListener("click", function () {
           var next = root.getAttribute("data-theme") === "dark" ? "light" : "dark";
           root.setAttribute("data-theme", next);
-          localStorage.setItem("kychnet-theme", next);
+          localStorage.setItem("kych-net-theme", next);
         });
       })();
     </script>
