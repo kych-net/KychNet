@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import {
   api,
+  CommitDetail,
+  CommitSummary,
   ContentFormat,
   Discussion,
   DiscussionDetail,
@@ -52,6 +54,62 @@ function formatTime(value: string): string {
   return new Date(value).toLocaleString();
 }
 
+function firstLine(value: string): string {
+  return value.split("\n")[0] || "(无提交信息)";
+}
+
+/** PR 与提交详情共用的行级差异展示。 */
+function DiffList({ files }: { files: PrDetail["files"] }) {
+  if (files.length === 0) {
+    return <p className="hint">没有文件差异。</p>;
+  }
+  return (
+    <ul className="diff-list">
+      {files.map((file) => (
+        <li key={file.path} className="diff-file">
+          <div className="diff-file-head">
+            <span className={`diff-status diff-${file.status}`}>
+              {DIFF_STATUS_LABEL[file.status]}
+            </span>
+            <code>{file.path}</code>
+            <span className="diff-stat">
+              <span className="diff-plus">+{file.additions}</span>
+              <span className="diff-minus">-{file.deletions}</span>
+            </span>
+          </div>
+          {file.truncated ? (
+            <p className="hint">文件过大或不是文本，未显示行级差异。</p>
+          ) : file.hunks.length === 0 ? (
+            <p className="hint">没有可见的行级变化。</p>
+          ) : (
+            file.hunks.map((hunk, hunkIndex) => (
+              <div className="diff-hunk" key={hunkIndex}>
+                <div className="diff-hunk-head">{hunk.header}</div>
+                <table className="diff-table">
+                  <tbody>
+                    {hunk.lines.map((line, lineIndex) => (
+                      <tr key={lineIndex} className={`diff-row diff-${line.kind}`}>
+                        <td className="diff-no">{line.old_line ?? ""}</td>
+                        <td className="diff-no">{line.new_line ?? ""}</td>
+                        <td className="diff-sign">
+                          {line.kind === "add" ? "+" : line.kind === "del" ? "-" : " "}
+                        </td>
+                        <td className="diff-text">
+                          <code>{line.text || " "}</code>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ))
+          )}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 export function ProjectsView() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [error, setError] = useState("");
@@ -74,7 +132,12 @@ export function ProjectsView() {
   const [newTitle, setNewTitle] = useState("");
   const [newDescription, setNewDescription] = useState("");
 
-  const [tab, setTab] = useState<"files" | "prs" | "discussions">("files");
+  const [tab, setTab] = useState<"files" | "prs" | "discussions" | "history">("files");
+
+  const [commits, setCommits] = useState<CommitSummary[]>([]);
+  const [commitDetail, setCommitDetail] = useState<CommitDetail | null>(null);
+  const [selectedCommit, setSelectedCommit] = useState<string | null>(null);
+  const [newBranch, setNewBranch] = useState("");
 
   const [prs, setPrs] = useState<PullRequest[]>([]);
   const [prDetail, setPrDetail] = useState<PrDetail | null>(null);
@@ -116,6 +179,10 @@ export function ProjectsView() {
     setError("");
     setNotice("");
     setTab("files");
+    setCommits([]);
+    setCommitDetail(null);
+    setSelectedCommit(null);
+    setNewBranch("");
     setPrs([]);
     setPrDetail(null);
     setSelectedPr(null);
@@ -133,7 +200,7 @@ export function ProjectsView() {
     }
   }
 
-  function switchTab(next: "files" | "prs" | "discussions") {
+  function switchTab(next: "files" | "prs" | "discussions" | "history") {
     setTab(next);
     setError("");
     setNotice("");
@@ -143,6 +210,96 @@ export function ProjectsView() {
     }
     if (next === "discussions") {
       void loadDiscussions(selected).catch((e) => setError((e as Error).message));
+    }
+    if (next === "history") {
+      void loadCommits(selected, branch).catch((e) => setError((e as Error).message));
+    }
+  }
+
+  async function loadCommits(project: Project, ref: string) {
+    const result = await api.commits(project.id, ref, 100, 0);
+    setCommits(result.items);
+    setCommitDetail(null);
+    setSelectedCommit(null);
+  }
+
+  async function openCommit(oid: string) {
+    if (!selected) return;
+    try {
+      const result = await api.commitDetail(selected.id, oid);
+      setCommitDetail(result.item);
+      setSelectedCommit(oid);
+      setError("");
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
+  async function revertCommit() {
+    if (!selected || !commitDetail) return;
+    const short = commitDetail.oid.slice(0, 7);
+    if (!window.confirm(`在 ${branch} 上反向应用提交 ${short}？`)) return;
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      const result = await api.revertCommit(selected.id, {
+        ref: branch,
+        commit: commitDetail.oid,
+      });
+      setNotice(`已生成还原提交 ${result.item.commit.slice(0, 7)}`);
+      await loadCommits(selected, branch);
+      await loadTree(selected, branch, dir);
+      await refreshProjects();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function createBranch(event: React.FormEvent) {
+    event.preventDefault();
+    if (!selected) return;
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      const result = await api.createBranch(selected.id, {
+        name: newBranch.trim(),
+        from: branch,
+      });
+      setBranches(result.branches.length > 0 ? result.branches : [selected.default_branch]);
+      setNotice(`分支 ${newBranch.trim()} 已创建`);
+      setNewBranch("");
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removeBranch(name: string) {
+    if (!selected || name === selected.default_branch) return;
+    if (!window.confirm(`删除分支 ${name}？`)) return;
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      const result = await api.deleteBranch(selected.id, name);
+      const next = result.branches.length > 0 ? result.branches : [selected.default_branch];
+      setBranches(next);
+      setNotice(`分支 ${name} 已删除`);
+      if (branch === name) {
+        const fallback = selected.default_branch;
+        setBranch(fallback);
+        await loadTree(selected, fallback, "");
+        await loadCommits(selected, fallback);
+      }
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -207,16 +364,25 @@ export function ProjectsView() {
 
   async function mergePr() {
     if (!selected || !prDetail) return;
-    if (!window.confirm(`合并 PR #${prDetail.number} 到 ${prDetail.target_branch}？`)) return;
+    const warning = prDetail.overwrites_target
+      ? "\n\n注意：这不是快进合并。服务端会生成双亲 merge commit，并直接使用来源分支的树，" +
+        "目标分支独有的改动会被覆盖。"
+      : "";
+    if (!window.confirm(`合并 PR #${prDetail.number} 到 ${prDetail.target_branch}？${warning}`)) {
+      return;
+    }
     setBusy(true);
     setError("");
     setNotice("");
     try {
       const result = await api.mergePr(selected.id, prDetail.number);
+      const suffix = result.overwrote_target
+        ? "（非快进合并，目标分支已被来源分支覆盖）"
+        : "";
       setNotice(
         result.item.target_branch === selected.default_branch
-          ? `已合并到 ${result.item.target_branch}，并触发整站编译`
-          : `已合并到 ${result.item.target_branch}`,
+          ? `已合并到 ${result.item.target_branch}，并触发整站编译${suffix}`
+          : `已合并到 ${result.item.target_branch}${suffix}`,
       );
       await loadPrs(selected);
       await openPr(prDetail.number);
@@ -515,7 +681,7 @@ export function ProjectsView() {
               </label>
               <p className="hint">
                 项目会出现在 <code>/项目/{newSlug || "<项目名>"}/</code>，仓库地址为 <code>/git/</code>。
-                目前只接受 UTF-8 文本，二进制要等 LFS 实现。
+                源码请使用 UTF-8 文本，二进制文件请通过 Git LFS 推送。
               </p>
               <button type="submit" disabled={busy}>
                 创建
@@ -569,6 +735,13 @@ export function ProjectsView() {
                   onClick={() => switchTab("files")}
                 >
                   文件
+                </button>
+                <button
+                  type="button"
+                  className={tab === "history" ? "active" : ""}
+                  onClick={() => switchTab("history")}
+                >
+                  提交历史
                 </button>
                 <button
                   type="button"
@@ -710,6 +883,109 @@ export function ProjectsView() {
                 </>
               )}
 
+              {tab === "history" && (
+                <div className="collab-layout">
+                  <div className="collab-list">
+                    <div className="collab-create">
+                      <h4>分支</h4>
+                      <div className="row align">
+                        <select
+                          value={branch}
+                          onChange={(e) => {
+                            const next = e.target.value;
+                            setBranch(next);
+                            void loadCommits(selected, next).catch((err) =>
+                              setError((err as Error).message),
+                            );
+                            void loadTree(selected, next, "").catch((err) =>
+                              setError((err as Error).message),
+                            );
+                          }}
+                        >
+                          {branches.map((name) => (
+                            <option key={name} value={name}>
+                              {name}
+                            </option>
+                          ))}
+                        </select>
+                        {branch !== selected.default_branch && (
+                          <button
+                            type="button"
+                            onClick={() => void removeBranch(branch)}
+                            disabled={busy}
+                          >
+                            删除分支
+                          </button>
+                        )}
+                      </div>
+                      <form className="row" onSubmit={createBranch}>
+                        <input
+                          value={newBranch}
+                          onChange={(e) => setNewBranch(e.target.value)}
+                          placeholder="新分支名"
+                        />
+                        <button type="submit" disabled={busy || !newBranch.trim()}>
+                          基于 {branch} 创建
+                        </button>
+                      </form>
+                      <p className="hint">默认分支为 {selected.default_branch}，不能删除。</p>
+                    </div>
+
+                    <ul className="collab-items">
+                      {commits.map((commit) => (
+                        <li key={commit.oid}>
+                          <button
+                            type="button"
+                            className={selectedCommit === commit.oid ? "active" : ""}
+                            onClick={() => void openCommit(commit.oid)}
+                          >
+                            <span>{firstLine(commit.message)}</span>
+                            <small>
+                              {commit.oid.slice(0, 8)} · {commit.author_name} ·{" "}
+                              {formatTime(commit.committed_at)}
+                            </small>
+                          </button>
+                        </li>
+                      ))}
+                      {commits.length === 0 && <li className="hint">暂无提交。</li>}
+                    </ul>
+                  </div>
+
+                  <div className="collab-detail">
+                    {!commitDetail ? (
+                      <p className="hint">选择一个提交查看详情。</p>
+                    ) : (
+                      <>
+                        <div className="collab-detail-head">
+                          <h4>{firstLine(commitDetail.message)}</h4>
+                          <span className="pill">{commitDetail.oid.slice(0, 8)}</span>
+                        </div>
+                        <p className="hint">
+                          {commitDetail.author_name} · {formatTime(commitDetail.committed_at)} ·
+                          父提交{" "}
+                          {commitDetail.parent_oid
+                            ? commitDetail.parent_oid.slice(0, 8)
+                            : "无（根提交）"}
+                        </p>
+                        <pre className="commit-message">{commitDetail.message}</pre>
+                        <div className="row align">
+                          <button
+                            type="button"
+                            onClick={() => void revertCommit()}
+                            disabled={busy}
+                          >
+                            还原此提交
+                          </button>
+                        </div>
+
+                        <h5>文件差异</h5>
+                        <DiffList files={commitDetail.files} />
+                      </>
+                    )}
+                  </div>
+                </div>
+              )}
+
               {tab === "prs" && (
                 <div className="collab-layout">
                   <div className="collab-list">
@@ -827,65 +1103,22 @@ export function ProjectsView() {
                         </div>
                         {prDetail.status === "open" && !prDetail.mergeable && (
                           <p className="hint">
-                            目标分支包含来源分支没有的提交，需要先把目标分支合并进来源分支。
+                            来源分支或目标分支不存在，无法合并。
+                          </p>
+                        )}
+                        {prDetail.status === "open" && prDetail.mergeable && (
+                          <p className="hint">
+                            {prDetail.is_fast_forward
+                              ? "可以快进合并，目标分支不会丢失改动。"
+                              : "不是快进合并：会生成双亲 merge commit 并直接使用来源分支的树，目标分支独有的改动会被覆盖。"}
+                            {prDetail.merge_base
+                              ? ` 合并基点 ${prDetail.merge_base.slice(0, 8)}。`
+                              : " 两个分支没有共同历史。"}
                           </p>
                         )}
 
                         <h5>文件差异</h5>
-                        {prDetail.files.length === 0 ? (
-                          <p className="hint">没有文件差异。</p>
-                        ) : (
-                          <ul className="diff-list">
-                            {prDetail.files.map((file) => (
-                              <li key={file.path} className="diff-file">
-                                <div className="diff-file-head">
-                                  <span className={`diff-status diff-${file.status}`}>
-                                    {DIFF_STATUS_LABEL[file.status]}
-                                  </span>
-                                  <code>{file.path}</code>
-                                  <span className="diff-stat">
-                                    <span className="diff-plus">+{file.additions}</span>
-                                    <span className="diff-minus">-{file.deletions}</span>
-                                  </span>
-                                </div>
-                                {file.truncated ? (
-                                  <p className="hint">文件过大或不是文本，未显示行级差异。</p>
-                                ) : file.hunks.length === 0 ? (
-                                  <p className="hint">没有可见的行级变化。</p>
-                                ) : (
-                                  file.hunks.map((hunk, hunkIndex) => (
-                                    <div className="diff-hunk" key={hunkIndex}>
-                                      <div className="diff-hunk-head">{hunk.header}</div>
-                                      <table className="diff-table">
-                                        <tbody>
-                                          {hunk.lines.map((line, lineIndex) => (
-                                            <tr
-                                              key={lineIndex}
-                                              className={`diff-row diff-${line.kind}`}
-                                            >
-                                              <td className="diff-no">{line.old_line ?? ""}</td>
-                                              <td className="diff-no">{line.new_line ?? ""}</td>
-                                              <td className="diff-sign">
-                                                {line.kind === "add"
-                                                  ? "+"
-                                                  : line.kind === "del"
-                                                    ? "-"
-                                                    : " "}
-                                              </td>
-                                              <td className="diff-text">
-                                                <code>{line.text || " "}</code>
-                                              </td>
-                                            </tr>
-                                          ))}
-                                        </tbody>
-                                      </table>
-                                    </div>
-                                  ))
-                                )}
-                              </li>
-                            ))}
-                          </ul>
-                        )}
+                        <DiffList files={prDetail.files} />
 
                         <h5>评论</h5>
                         <ul className="comment-list">

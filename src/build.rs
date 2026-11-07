@@ -478,11 +478,19 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
             .map(|(path, data)| (path.clone(), data.clone()))
             .collect();
         for (path, data) in &snapshot.files {
+            if crate::git::lfs::is_pointer(data) {
+                tracing::warn!(
+                    project = %snapshot.project.slug,
+                    path = %path,
+                    "跳过 Git LFS 指针文件；构建暂不解析 LFS 内容"
+                );
+                continue;
+            }
             if !crate::git::object::is_text(data) {
                 tracing::warn!(
                     project = %snapshot.project.slug,
                     path = %path,
-                    "跳过非文本项目文件；二进制需要 LFS，目前尚未实现"
+                    "跳过非文本项目文件；二进制请使用 Git LFS"
                 );
                 continue;
             }
