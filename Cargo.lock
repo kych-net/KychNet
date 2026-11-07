@@ -1841,8 +1841,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "kychnet"
-version = "0.1.0"
+name = "kych-net"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "askama",

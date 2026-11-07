@@ -57,7 +57,7 @@ export function Shell({
       <header className="appbar">
         <a
           className="brand"
-          href={siteUrl}
+          href={siteUrl || undefined}
           target="_blank"
           rel="noreferrer"
           title={site.site_name}
@@ -110,9 +110,11 @@ export function Shell({
               <div className="avatar-menu">
                 <button onClick={() => go("profile")}>用户设置</button>
                 {user.is_admin && <button onClick={() => go("contents")}>网站管理</button>}
-                <a href={siteUrl} target="_blank" rel="noreferrer">
-                  前往内容端
-                </a>
+                {siteUrl && (
+                  <a href={siteUrl} target="_blank" rel="noreferrer">
+                    前往内容端
+                  </a>
+                )}
                 <button
                   onClick={async () => {
                     await api.logout().catch(() => undefined);
