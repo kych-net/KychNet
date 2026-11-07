@@ -268,6 +268,71 @@ claude mcp add --transport http kych-net https://kych.net/mcp
 }
 ```
 
+#### Trae
+
+Trae 目前不原生执行 MCP OAuth，直接填远程 `url` 会得到 401。用 `mcp-remote` 作为本地 stdio 桥接，由它完成浏览器 OAuth，再把工具转给 Trae。
+
+先确认本机有 Node.js 22+ 和 `npx`。在 Trae 的 **设置 → MCP → 手动配置** 中加入：
+
+```json
+{
+  "mcpServers": {
+    "kych-net": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "https://kych.net/mcp"]
+    }
+  }
+}
+```
+
+也可以直接编辑全局配置：
+
+- macOS：`~/Library/Application Support/Trae/User/mcp.json`
+- Windows：`%APPDATA%\\Trae\\User\\mcp.json`
+- Linux：`~/.config/Trae/User/mcp.json`
+
+保存后首次连接会在浏览器打开 KychNet 授权页。`mcp-remote` 会在本地缓存 token；不要额外配置 `Authorization` 头。
+
+#### DSH / DeepSeek Harness
+
+DSH 的 MCP 客户端支持 stdio 和 Streamable HTTP，但原生 HTTP 连接不带 MCP OAuth。推荐同样用 `mcp-remote` stdio 桥接。
+
+方式一：安装 MCP Center 插件，用设置页添加（推荐）：
+
+```bash
+dsh plugin --profile web add dsh-mcp-center
+```
+
+重启 `dsh web`，打开 **设置 → MCP Center → ＋ 添加 MCP 服务器**：
+
+- 名称：`kych-net`
+- 类型：`stdio`
+- 命令：`npx`
+- 参数：`-y mcp-remote https://kych.net/mcp`
+
+保存后首次连接会在浏览器打开 KychNet 授权页。
+
+方式二：直接写 Cordis overlay。把下面的 `insert` 合并到 `$DSH_HOME/profiles/<name>/cordis.patch.yml`（只对该 profile 生效），或 `$DSH_HOME/cordis.patch.yml`（本机所有 profile 生效）：
+
+```yaml
+- insert:
+    - id: kych-net
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: kych-net
+        transport: stdio
+        command: npx
+        args:
+          - '-y'
+          - mcp-remote
+          - 'https://kych.net/mcp'
+        env: {}
+```
+
+重启 DSH 后，工具会以 `mcp__kych-net__*` 出现。首次调用会触发 OAuth 授权。
+
+> DSH 和 Trae 的桥接依赖 `mcp-remote` 和 Node.js。桥接只解决 OAuth，不改变 KychNet 的权限模型；登录用户仍然是 Git 提交身份。
+
 ### 自检
 
 未带 token 请求 `/mcp`，应得到 401 和发现地址：
