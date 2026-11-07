@@ -38,11 +38,19 @@ pub async fn read_files(
     while let Some((prefix, tree_oid)) = stack.pop() {
         let tree = read_tree(conn, project_id, tree_oid).await?;
         for (name, entry) in tree.entries {
+            // Tree::parse 已经校验过；这里在拼接完整路径前再复检一次，
+            // 防止未来新增的 tree 构造路径绕开解析层。
+            if !super::object::valid_tree_entry_name(&name) {
+                bail!("tree 对象包含非法条目名: {name:?}");
+            }
             let path = if prefix.is_empty() {
                 name
             } else {
                 format!("{prefix}/{name}")
             };
+            if path.split('/').any(|part| !super::object::valid_tree_entry_name(part)) {
+                bail!("tree 对象拼接出非法路径: {path:?}");
+            }
             match entry {
                 TreeEntry::Dir(oid) => stack.push((path, oid)),
                 TreeEntry::Blob(oid) => {

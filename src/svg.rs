@@ -10,12 +10,20 @@ const FORBIDDEN_ELEMENTS: &[&str] = &[
     "embed",
     "object",
     "image",
+    "style",
 ];
 
 /// 动画类元素。它们能把属性（包括 `href`）改成任意值，是 SVG 里最典型的
 /// XSS 跳板：`<animate attributeName="href" to="javascript:...">` 不需要任何
 /// 事件属性就能触发。头像这种静态图形用不到动画，一律拒绝。
-const ANIMATION_ELEMENTS: &[&str] = &["animate", "animatetransform", "animatecolor", "set"];
+const ANIMATION_ELEMENTS: &[&str] = &[
+    "animate",
+    "animatetransform",
+    "animatecolor",
+    "animatemotion",
+    "discard",
+    "set",
+];
 
 const VECTOR_ELEMENTS: &[&str] = &[
     "path", "circle", "ellipse", "rect", "line", "polyline", "polygon", "text", "textpath",
@@ -28,13 +36,48 @@ const VECTOR_ELEMENTS: &[&str] = &[
 /// - 不含 DTD(实体展开与外部实体)
 /// - 不含会改写属性的动画元素
 /// - 至少包含一个矢量图形元素
+fn contains_dangerous_css(value: &str) -> bool {
+    let compact: String = value
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+    if compact.contains("@import") || compact.contains("expression(") {
+        return true;
+    }
+    let mut rest = compact.as_str();
+    while let Some(index) = rest.find("url(") {
+        let after = &rest[index + 4..];
+        // 头像只允许引用文档内 fragment；其它 url() 一律拒绝。
+        if !after.starts_with('#') {
+            return true;
+        }
+        rest = &after[1..];
+    }
+    false
+}
+
+fn reject_processing_instructions(text: &str) -> Result<()> {
+    let mut rest = text.trim_start();
+    if rest.starts_with("<?xml") {
+        let Some(end) = rest.find("?>") else {
+            bail!("SVG XML 声明未闭合");
+        };
+        rest = &rest[end + 2..];
+    }
+    if rest.contains("<?") {
+        bail!("SVG 不允许包含处理指令");
+    }
+    Ok(())
+}
+
 pub fn validate_svg(input: &[u8]) -> Result<()> {
     if input.len() > MAX_BYTES {
         bail!("SVG 不能超过 256 KB");
     }
     let text = std::str::from_utf8(input).context("SVG 必须是 UTF-8 文本")?;
 
-    if text.contains("data:image/") {
+    if text.to_ascii_lowercase().contains("data:image/") {
         bail!("不允许内嵌位图,头像必须是纯矢量");
     }
 
@@ -45,6 +88,7 @@ pub fn validate_svg(input: &[u8]) -> Result<()> {
     if lowered.contains("<!doctype") || lowered.contains("<!entity") {
         bail!("SVG 不允许包含 DTD 或实体声明");
     }
+    reject_processing_instructions(text)?;
 
     let doc = roxmltree::Document::parse(text).context("内容不是合法的 SVG/XML")?;
     let root = doc.root_element();
@@ -53,7 +97,13 @@ pub fn validate_svg(input: &[u8]) -> Result<()> {
     }
 
     let mut has_vector = false;
-    for node in doc.descendants().filter(|node| node.is_element()) {
+    for node in doc.descendants() {
+        if node.is_pi() {
+            bail!("SVG 不允许包含处理指令");
+        }
+        if !node.is_element() {
+            continue;
+        }
         let tag = node.tag_name().name().to_ascii_lowercase();
         if FORBIDDEN_ELEMENTS.contains(&tag.as_str()) {
             bail!("SVG 不允许包含 <{tag}> 元素");
@@ -69,6 +119,12 @@ pub fn validate_svg(input: &[u8]) -> Result<()> {
             let name = attr.name().to_ascii_lowercase();
             if name.starts_with("on") {
                 bail!("SVG 不允许包含事件属性");
+            }
+            if name == "style" {
+                bail!("SVG 不允许包含 style 属性");
+            }
+            if contains_dangerous_css(attr.value()) {
+                bail!("SVG 不允许包含危险 CSS");
             }
             // 浏览器解析 URL 时会忽略 tab / 换行 / 回车等控制字符，
             // 例如 `java&#10;script:alert(1)` 解码后仍会被当作 javascript: 执行。
@@ -129,6 +185,20 @@ mod tests {
         assert!(validate_svg(svg.as_bytes()).is_err());
         let svg = r#"<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script><rect width="10" height="10"/></svg>"#;
         assert!(validate_svg(svg.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn rejects_style_pi_and_dangerous_css() {
+        let cases = [
+            r#"<?xml-stylesheet href="https://evil.com/x.css"?><svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10"/></svg>"#,
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><style>*{fill:url(https://evil.com/x)}</style><rect width="10" height="10"/></svg>"#,
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10" style="fill:red"/></svg>"#,
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10" fill="url(https://evil.com/x)"/></svg>"#,
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10" fill="url(#ok)"/><animateMotion dur="1s"/></svg>"#,
+        ];
+        for svg in cases {
+            assert!(validate_svg(svg.as_bytes()).is_err(), "应拒绝 {svg}");
+        }
     }
 
     #[test]

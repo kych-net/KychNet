@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use askama::Template;
 use sqlx::PgPool;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use ftml::data::PageRef;
@@ -171,6 +171,33 @@ fn source_filename(slug: &str, format: ContentFormat) -> String {
         .next()
         .unwrap_or(slug)
         .to_string()
+}
+
+/// 把输出 slug 安全地拼到 dist 根下。
+///
+/// slug 来自数据库/项目 tree，构建阶段不能信任它；先拒绝空段、`.`、`..`、
+/// 反斜杠和 NUL，再做词法路径断言。这里不做 canonicalize，因为目标文件
+/// 可能还不存在，词法归一化足以阻止 `../` 越界。
+fn safe_output_path(out: &Path, relative: &str) -> Result<PathBuf> {
+    if relative.is_empty() || relative.starts_with('/') {
+        bail!("非法输出路径: {relative:?}");
+    }
+    let mut target = out.to_path_buf();
+    for part in relative.split('/') {
+        if part.is_empty()
+            || part == "."
+            || part == ".."
+            || part.contains('\\')
+            || part.contains('\0')
+        {
+            bail!("非法输出路径: {relative:?}");
+        }
+        target.push(part);
+    }
+    if !target.starts_with(out) {
+        bail!("输出路径越界: {relative:?}");
+    }
+    Ok(target)
 }
 
 /// 管理端触发的重建运行在 UMask=0077 的服务进程里，新文件默认 600/700，
@@ -373,7 +400,7 @@ fn project_file_title(body: &str, path: &str) -> String {
 }
 
 fn write_raw(out: &Path, slug: &str, data: &[u8]) -> Result<()> {
-    let target = out.join(slug);
+    let target = safe_output_path(out, slug)?;
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
         make_parent_dirs_public(out, parent)?;
@@ -387,7 +414,7 @@ fn write_style(out: &Path, content: &Content) -> Result<()> {
     if !service::valid_style_slug(&content.slug) {
         bail!("非法 CSS 路径: {}", content.slug);
     }
-    let target = out.join(&content.slug);
+    let target = safe_output_path(out, &content.slug)?;
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
         make_parent_dirs_public(out, parent)?;
@@ -505,7 +532,13 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
                 Some(format) => {
                     let slug = project_page_slug(&snapshot.project.slug, path);
                     if !seen_slugs.insert(slug.clone()) {
-                        bail!("项目 {path} 与其他文件输出到同一个路径: {slug}");
+                        tracing::warn!(
+                            project = %snapshot.project.slug,
+                            path = %path,
+                            slug = %slug,
+                            "项目文件输出路径冲突，保留先到者并跳过"
+                        );
+                        continue;
                     }
                     let body = String::from_utf8(data.clone())
                         .with_context(|| format!("项目文件不是 UTF-8: {path}"))?;
@@ -566,7 +599,13 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
             .unwrap_or(&content.slug)
             .replace('/', ":");
         let base = project_style_base(&content.slug);
-        let (styles, body) = parse_page_styles_with_base(&content.body, base)?;
+        let (styles, body) = match parse_page_styles_with_base(&content.body, base) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(slug = %content.slug, %error, "页面 CSS 声明非法，跳过该页");
+                continue;
+            }
+        };
         let ctx = render::DocContext {
             page: &page,
             title: &content.title,
@@ -582,8 +621,14 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
                 main_path,
             ),
             None => render::render_doc(content.format(), &body, &cfg.content_root, &ctx),
-        }
-        .with_context(|| format!("渲染 {} 失败", content.slug))?;
+        };
+        let rendered = match rendered {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(slug = %content.slug, %error, "页面渲染失败，跳过该页");
+                continue;
+            }
+        };
 
         let date = content.updated_at.format("%Y-%m-%d").to_string();
         let pdf_url = if rendered.pdf.is_some() {
@@ -601,17 +646,28 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
             tree: tree_html.clone(),
             styles,
         };
+        let html = match page.render() {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(slug = %content.slug, %error, "页面模板渲染失败，跳过该页");
+                continue;
+            }
+        };
         pages.push(BuiltPage {
             slug: content.slug.clone(),
             title: content.title.clone(),
             date,
-            html: page.render()?,
+            html,
             pdf: rendered.pdf,
         });
     }
 
     // /项目/ 索引页由项目列表自动生成，不允许被普通内容占用。
     if !snapshots.is_empty() {
+        let index_slug = format!("{}/index.html", crate::project::PROJECT_NAMESPACE);
+        if !seen_slugs.insert(index_slug.clone()) {
+            tracing::warn!(slug = %index_slug, "项目索引与普通内容路径冲突，跳过项目索引");
+        } else {
         let html = IndexTemplate {
             site: settings.clone(),
             admin_url: cfg.admin_origin.clone(),
@@ -621,12 +677,13 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
         }
         .render()?;
         pages.push(BuiltPage {
-            slug: format!("{}/index.html", crate::project::PROJECT_NAMESPACE),
+            slug: index_slug,
             title: "项目".to_string(),
             date: String::new(),
             html,
             pdf: None,
         });
+        }
     }
 
     // 只有数据库里没有主页内容时才回退到自动文章列表。
@@ -671,7 +728,7 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
     }
 
     for page in &pages {
-        let target = out.join(&page.slug);
+        let target = safe_output_path(out, &page.slug)?;
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
             make_parent_dirs_public(out, parent)?;
@@ -679,7 +736,7 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
         std::fs::write(&target, &page.html)?;
         make_public(&target, false)?;
         if let Some(pdf) = &page.pdf {
-            let pdf_target = out.join(pdf_path(&page.slug));
+            let pdf_target = safe_output_path(out, &pdf_path(&page.slug))?;
             if let Some(parent) = pdf_target.parent() {
                 std::fs::create_dir_all(parent)?;
                 make_parent_dirs_public(out, parent)?;
@@ -692,7 +749,7 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
         write_raw(out, slug, data)?;
     }
     if let Some(index_html) = index_html {
-        let index_path = out.join(service::HOME_SLUG);
+        let index_path = safe_output_path(out, service::HOME_SLUG)?;
         std::fs::write(&index_path, index_html)?;
         make_public(&index_path, false)?;
     }
@@ -796,7 +853,7 @@ pub async fn run_one(
 
     std::fs::create_dir_all(out)?;
     make_public(out, true)?;
-    let target = out.join(&content.slug);
+    let target = safe_output_path(out, &content.slug)?;
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
         make_parent_dirs_public(out, parent)?;
@@ -804,7 +861,7 @@ pub async fn run_one(
     std::fs::write(&target, html)?;
     make_public(&target, false)?;
     if let Some(pdf) = rendered.pdf {
-        let pdf_target = out.join(pdf_path(&content.slug));
+        let pdf_target = safe_output_path(out, &pdf_path(&content.slug))?;
         if let Some(parent) = pdf_target.parent() {
             std::fs::create_dir_all(parent)?;
             make_parent_dirs_public(out, parent)?;
@@ -821,9 +878,9 @@ fn remove_output(out: &Path, slug: &str) -> Result<()> {
         return Ok(());
     }
     let is_page = service::valid_content_slug(slug);
-    let html = out.join(slug);
+    let html = safe_output_path(out, slug)?;
     let pdf = if is_page {
-        Some(out.join(pdf_path(slug)))
+        Some(safe_output_path(out, &pdf_path(slug))?)
     } else {
         None
     };
@@ -981,6 +1038,15 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn safe_output_path_rejects_escape() {
+        let base = Path::new("/tmp/dist");
+        assert_eq!(safe_output_path(base, "a/b.html").unwrap(), Path::new("/tmp/dist/a/b.html"));
+        for bad in ["", "/abs.html", "../x.html", "a/../../x.html", "a//b.html", "a\\b.html"] {
+            assert!(safe_output_path(base, bad).is_err(), "应拒绝 {bad:?}");
+        }
+    }
+
     #[test]
     fn generated_files_are_readable_by_nginx() {
         use std::os::unix::fs::PermissionsExt;

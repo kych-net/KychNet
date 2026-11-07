@@ -3,8 +3,8 @@
 //! 设计要点：
 //! - **同进程挂载**：`rmcp` 的 Streamable HTTP 服务是一个 Tower service，
 //!   直接 `nest_service` 到 axum 子路由后 merge 进主 Router，不新增部署单元；
-//! - **只读**：只暴露查询类工具，不暴露任何写操作。写接口有 step-up、
-//!   邀请码、Origin 白名单等多重护栏，MCP 一开始不应绕过它们；
+//! - **读写**：内容与项目文件写入需要 MCP_TOKEN；项目提交身份取第一个可用管理员。
+//!   写操作仍走 service/project 层的路径校验，并在写入后触发构建；
 //! - **鉴权**：`MCP_TOKEN` 未设置时整个 `/mcp` 路由不存在（而不是返回 404），
 //!   设置后要求 `Authorization: Bearer <token>`。比较走常量时间，避免时序侧信道；
 //! - **限流**：复用 `rate::RateLimiter`，按客户端 IP 独立计数，
@@ -33,7 +33,8 @@ use serde::Deserialize;
 use serde_json::json;
 use sqlx::PgPool;
 
-use crate::models::{ContentFormat, SiteSettings};
+use crate::models::{ContentFormat, SiteSettings, User};
+use crate::project;
 use crate::rate::RateLimiter;
 use crate::service;
 
@@ -50,6 +51,10 @@ pub struct KychMcp {
     pool: PgPool,
     content_root: PathBuf,
     site_url: String,
+    /// 写项目文件时作为 Git 提交身份；没有管理员时项目写工具不可用。
+    actor: Option<User>,
+    build_out_dir: PathBuf,
+    exe: PathBuf,
 }
 
 /// 单条搜索结果（SQL 查询 + 摘要截取共用）。
@@ -63,12 +68,63 @@ struct SearchRow {
 
 #[tool_router]
 impl KychMcp {
-    pub fn new(pool: PgPool, content_root: PathBuf, site_url: String) -> Self {
+    pub fn new(
+        pool: PgPool,
+        content_root: PathBuf,
+        site_url: String,
+        actor: Option<User>,
+        build_out_dir: PathBuf,
+        exe: PathBuf,
+    ) -> Self {
         Self {
             pool,
             content_root,
             site_url,
+            actor,
+            build_out_dir,
+            exe,
         }
+    }
+
+    fn actor(&self) -> Result<&User, McpError> {
+        self.actor
+            .as_ref()
+            .ok_or_else(|| McpError::internal_error("MCP 没有可用于写入的管理员账号", None))
+    }
+
+    async fn run_build(&self, only: Option<&str>) -> Result<(), McpError> {
+        let mut command = tokio::process::Command::new(&self.exe);
+        command
+            .arg("build")
+            .arg("--out")
+            .arg(&self.build_out_dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if let Some(slug) = only {
+            command.arg("--only").arg(slug);
+        }
+        let output = command
+            .output()
+            .await
+            .map_err(|e| McpError::internal_error(format!("构建进程启动失败: {e}"), None))?;
+        if !output.status.success() {
+            let mut text = String::from_utf8_lossy(&output.stdout).to_string();
+            text.push_str(&String::from_utf8_lossy(&output.stderr));
+            let tail: String = text.chars().rev().take(2000).collect::<String>().chars().rev().collect();
+            return Err(McpError::internal_error(
+                format!("编译失败: {tail}"),
+                None,
+            ));
+        }
+        Ok(())
+    }
+
+    async fn find_project(&self, slug: &str) -> Result<project::Project, McpError> {
+        project::find_project_by_slug(&self.pool, slug)
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(|| McpError::invalid_params(format!("项目不存在: {slug}"), None))
     }
 
     /// 把用户输入的页面路径归一化成数据库里的输出路径。
@@ -203,12 +259,148 @@ impl KychMcp {
             .to_string(),
         ))
     }
+    #[tool(
+        description = "新增或更新一篇内容并自动编译该页。format 支持 markdown/html/typst/wikidot/css；slug 使用 /xef/index、/reff/93df/l.html 或 /css/theme 形式。"
+    )]
+    async fn save_content(
+        &self,
+        Parameters(params): Parameters<SaveContentParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let requested = ContentFormat::parse(params.format.trim().to_ascii_lowercase().as_str())
+            .ok_or_else(|| McpError::invalid_params(format!("未知格式: {}", params.format), None))?;
+        let (slug, format) = service::normalize_content_path(&params.slug, requested)
+            .map_err(|e| McpError::invalid_params(format!("路径非法: {e}"), None))?;
+        let item = service::upsert_content(
+            &self.pool,
+            &slug,
+            &params.title,
+            format.as_str(),
+            &params.body,
+            params.published,
+        )
+        .await
+        .map_err(internal_error)?;
+        self.run_build(Some(&slug)).await?;
+        Ok(text_result(json!({ "item": item, "built": true }).to_string()))
+    }
+
+    #[tool(description = "删除一篇内容并清理静态产物；网站主页 index.html 不允许删除。")]
+    async fn delete_content(
+        &self,
+        Parameters(params): Parameters<DeleteContentParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let (slug, _) = service::normalize_content_path(&params.slug, ContentFormat::Html)
+            .map_err(|e| McpError::invalid_params(format!("路径非法: {e}"), None))?;
+        if slug == service::HOME_SLUG {
+            return Err(McpError::invalid_params("网站主页不能删除，只能编辑", None));
+        }
+        let row: Option<(uuid::Uuid, String)> =
+            sqlx::query_as("SELECT id, slug FROM contents WHERE slug = $1")
+                .bind(&slug)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(internal_error)?;
+        let Some((id, slug)) = row else {
+            return Err(McpError::invalid_params(format!("页面不存在: {}", params.slug), None));
+        };
+        sqlx::query("DELETE FROM contents WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(internal_error)?;
+        self.run_build(Some(&slug)).await?;
+        Ok(text_result(json!({ "deleted": slug }).to_string()))
+    }
+
+    #[tool(description = "列出所有项目（slug、标题、默认分支、更新时间）。")]
+    async fn list_projects(&self) -> Result<CallToolResult, McpError> {
+        let projects = project::list_projects(&self.pool)
+            .await
+            .map_err(internal_error)?;
+        Ok(text_result(json!({ "projects": projects }).to_string()))
+    }
+
+    #[tool(description = "列出项目某个目录下的文件；branch 省略时用默认分支，path 省略表示根目录。")]
+    async fn list_project_files(
+        &self,
+        Parameters(params): Parameters<ProjectListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = self.find_project(&params.project).await?;
+        let branch = params.branch.unwrap_or_else(|| p.default_branch.clone());
+        let path = params.path.unwrap_or_default();
+        let items = project::list_dir(&self.pool, p.id, &branch, &path)
+            .await
+            .map_err(internal_error)?;
+        Ok(text_result(json!({ "project": p.slug, "branch": branch, "path": path, "items": items }).to_string()))
+    }
+
+    #[tool(description = "读取项目中的单个 UTF-8 文件内容。")]
+    async fn read_project_file(
+        &self,
+        Parameters(params): Parameters<ProjectReadParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = self.find_project(&params.project).await?;
+        let branch = params.branch.unwrap_or_else(|| p.default_branch.clone());
+        let item = project::read_file(&self.pool, p.id, &branch, &params.path)
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(|| McpError::invalid_params(format!("文件不存在: {}", params.path), None))?;
+        Ok(text_result(json!({ "project": p.slug, "branch": branch, "file": item }).to_string()))
+    }
+
+    #[tool(description = "新增或更新项目文件并提交；默认分支的修改会自动触发整站构建。")]
+    async fn write_project_file(
+        &self,
+        Parameters(params): Parameters<ProjectWriteParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = self.find_project(&params.project).await?;
+        let branch = params.branch.unwrap_or_else(|| p.default_branch.clone());
+        let result = project::write_file(
+            &self.pool,
+            self.actor()?,
+            p.id,
+            &branch,
+            &params.path,
+            &params.content,
+            params.message.as_deref(),
+            params.base_oid.as_deref(),
+        )
+        .await
+        .map_err(internal_error)?;
+        if branch == p.default_branch {
+            self.run_build(None).await?;
+        }
+        Ok(text_result(json!({ "project": p.slug, "branch": branch, "item": result }).to_string()))
+    }
+
+    #[tool(description = "删除项目文件并提交；默认分支的修改会自动触发整站构建。")]
+    async fn delete_project_file(
+        &self,
+        Parameters(params): Parameters<ProjectDeleteParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = self.find_project(&params.project).await?;
+        let branch = params.branch.unwrap_or_else(|| p.default_branch.clone());
+        let result = project::delete_file(
+            &self.pool,
+            self.actor()?,
+            p.id,
+            &branch,
+            &params.path,
+            params.message.as_deref(),
+        )
+        .await
+        .map_err(internal_error)?;
+        if branch == p.default_branch {
+            self.run_build(None).await?;
+        }
+        Ok(text_result(json!({ "project": p.slug, "branch": branch, "item": result }).to_string()))
+    }
 }
 
 #[tool_handler(
     name = "kych-net",
     version = "0.3.0",
-    instructions = "KychNet 个人站点的内容只读接口。查询内容用 search_content 定位页面，再用 get_page 读全文；list_pages 可枚举全部已发布页面。"
+    instructions = "KychNet 内容与项目接口。查询内容用 search_content/get_page；写内容用 save_content/delete_content；项目用 list_projects、list_project_files、read_project_file、write_project_file、delete_project_file。"
 )]
 impl ServerHandler for KychMcp {}
 
@@ -222,6 +414,53 @@ struct GetPageParams {
 struct SearchParams {
     /// 搜索词（大小写不敏感的子串匹配）。
     query: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SaveContentParams {
+    slug: String,
+    title: String,
+    format: String,
+    body: String,
+    #[serde(default = "default_true")]
+    published: bool,
+}
+
+fn default_true() -> bool { true }
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct DeleteContentParams { slug: String }
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ProjectListParams {
+    project: String,
+    branch: Option<String>,
+    path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ProjectReadParams {
+    project: String,
+    path: String,
+    branch: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ProjectWriteParams {
+    project: String,
+    path: String,
+    content: String,
+    branch: Option<String>,
+    message: Option<String>,
+    base_oid: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ProjectDeleteParams {
+    project: String,
+    path: String,
+    branch: Option<String>,
+    message: Option<String>,
 }
 
 fn text_result(payload: String) -> CallToolResult {

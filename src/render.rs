@@ -122,8 +122,12 @@ impl<'t> Includer<'t> for MapIncluder<'_> {
     }
 }
 
+const INCLUDE_EXPANSION_BUDGET: usize = 8 * 1024 * 1024;
+const INCLUDE_TOTAL_LIMIT: usize = 16 * 1024 * 1024;
+
 fn render_wikidot(body: &str, ctx: &DocContext) -> Result<Rendered> {
     let mut text = body.to_string();
+    let mut cumulative_growth = 0usize;
     let mut settings = WikitextSettings::from_mode(WikitextMode::Page, Layout::Wikidot);
     settings.use_true_ids = false;
     settings.isolate_user_ids = true;
@@ -131,6 +135,10 @@ fn render_wikidot(body: &str, ctx: &DocContext) -> Result<Rendered> {
 
     // 支持 include 的递归展开，同时限制深度，避免 A include B、B include A 时无限增长。
     for _ in 0..8 {
+        if text.len() > INCLUDE_TOTAL_LIMIT {
+            anyhow::bail!("Wikidot include 展开超过总大小上限");
+        }
+        let before = text.len();
         let (next, _pages) = ftml::include(
             &text,
             &settings,
@@ -141,6 +149,13 @@ fn render_wikidot(body: &str, ctx: &DocContext) -> Result<Rendered> {
         )?;
         if next == text {
             break;
+        }
+        if next.len() > INCLUDE_TOTAL_LIMIT {
+            anyhow::bail!("Wikidot include 展开超过总大小上限");
+        }
+        cumulative_growth = cumulative_growth.saturating_add(next.len().saturating_sub(before));
+        if cumulative_growth > INCLUDE_EXPANSION_BUDGET {
+            anyhow::bail!("Wikidot include 展开超过累计增长上限");
         }
         text = next;
     }

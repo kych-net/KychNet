@@ -1430,10 +1430,18 @@ pub async fn serve(cfg: Config) -> Result<()> {
     // /mcp 不沾会话、CORS、Origin 白名单这些浏览器侧的层，鉴权与限流由
     // mcp::router 自带（Bearer token + 按 IP 限流），口径与 client_ip 一致。
     let app = if let Some(token) = cfg.mcp_token.clone() {
+        let mcp_actor = sqlx::query_as::<_, User>(
+            "SELECT * FROM users WHERE is_admin AND NOT disabled ORDER BY created_at LIMIT 1",
+        )
+        .fetch_optional(&state_pool_for_mcp)
+        .await?;
         let mcp_state = crate::mcp::KychMcp::new(
             state_pool_for_mcp.clone(),
             cfg.content_root.clone(),
             cfg.site_url.clone(),
+            mcp_actor,
+            cfg.build_out_dir.clone(),
+            std::env::current_exe()?,
         );
         app.merge(crate::mcp::router(
             mcp_state,
