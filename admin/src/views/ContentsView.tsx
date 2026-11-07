@@ -1,10 +1,26 @@
 import { useEffect, useState } from "react";
 import { api, Content, ContentFormat, editorPath } from "../api";
+import { CodeEditor } from "../components/CodeEditor";
 
 type Props = {
   editContentId?: string | null;
   onEditHandled?: () => void;
 };
+
+function formatLabel(format: ContentFormat): string {
+  switch (format) {
+    case "markdown":
+      return "Markdown";
+    case "html":
+      return "HTML";
+    case "typst":
+      return "Typst";
+    case "wikidot":
+      return "Wikidot";
+    case "css":
+      return "CSS";
+  }
+}
 
 function extensionFor(format: ContentFormat): string {
   return format === "markdown" ? ".md" : format === "typst" ? ".typ" : format === "wikidot" ? ".wj" : format === "css" ? ".css" : ".html";
@@ -140,10 +156,15 @@ export function ContentsView({ editContentId, onEditHandled }: Props) {
           CSS 文件必须使用 <code>/css/xxx</code> 路径和 CSS 格式；页面正文最前面写
           <code>---</code>、<code>css: /css/xxx.css</code>、<code>---</code> 才会加载它。
         </p>
-        <label>
-          正文
-          <textarea value={body} onChange={(e) => setBody(e.target.value)} rows={16} />
-        </label>
+        <div className="editor-shell">
+          <div className="editor-toolbar">
+            <span>正文</span>
+            <span>
+              {formatLabel(format)} · {body.length} 字符
+            </span>
+          </div>
+          <CodeEditor value={body} format={format} onChange={setBody} />
+        </div>
         <div className="row align">
           <label className="checkbox">
             <input
