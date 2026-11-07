@@ -37,7 +37,9 @@
 | wikidot | ftml 解析 Wikidot 语法并渲染 HTML,支持 `[[include]]`;项目因此按 AGPL-3.0 分发 |
 | css | 原样写入 `/css/*.css`,供页面显式引用 |
 
-这些格式均不做内容限制,内容作者均为邀请注册的可信用户,因此允许存储型 XSS 是项目明确的取舍。
+这些格式均不做内容限制,内容作者均为邀请注册的可信用户,因此允许存储型 XSS 是项目明确的取舍.
+
+内容不保存单独的标题字段:页面标题直接在正文里写,例如 HTML 的 `<h1>…</h1>`、Markdown 的 `# …`、Wikidot 的 `+ …`、Typst 的 `= …`.页面 `<title>`、目录树、首页回退列表、API/MCP 的展示名统一使用源文件名.
 
 必须注意:**子域隔离本身并不能阻止攻击**。`c`(内容站) / `m`(管理端) / `kych.net`(API) 同属一个 eTLD+1(同站),`SameSite` Cookie 不会阻止同站跨源请求,CORS 也只阻止读取响应、不阻止带凭据的写请求被发出。因此后端对所有写接口增加了 Origin 白名单校验(仅放行管理端 origin),挡住内容站 XSS 冒用管理员会话发起写操作。这层防护仍以「内容作者可信」为前提;若要允许不可信作者,需要让 `api` 使用完全独立的站点(不同 eTLD+1)并对内容页加 CSP,而不是只靠子域划分。
 
@@ -89,7 +91,7 @@
 │   ├── collab.rs        # 分支/PR/讨论协作
 │   └── git/             # PostgreSQL Git、LFS、smart HTTP
 ├── templates/           # Askama 模板(layout / index / page)
-├── migrations/          # SQLx 迁移(当前 0001–0010)
+├── migrations/          # SQLx 迁移(当前 0001–0011)
 └── admin/               # 管理前端(独立 Vite 工程)
 ```
 

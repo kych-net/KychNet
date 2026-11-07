@@ -29,7 +29,6 @@ export type ContentFormat = "markdown" | "html" | "typst" | "wikidot" | "css";
 export type Content = {
   id: string;
   slug: string;
-  title: string;
   format: ContentFormat;
   body: string;
   published: boolean;
@@ -319,7 +318,6 @@ export const api = {
   saveContent: (payload: {
     id?: string;
     slug: string;
-    title: string;
     format: ContentFormat;
     body: string;
     published: boolean;

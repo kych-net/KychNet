@@ -519,20 +519,18 @@ pub async fn update_content(
     pool: &PgPool,
     id: Uuid,
     slug: &str,
-    title: &str,
     format: &str,
     body: &str,
     published: bool,
 ) -> Result<Content> {
     let result = sqlx::query_as::<_, Content>(
         "UPDATE contents
-         SET slug = $2, title = $3, format = $4, body = $5, published = $6, updated_at = now()
+         SET slug = $2, format = $3, body = $4, published = $5, updated_at = now()
          WHERE id = $1
          RETURNING *",
     )
     .bind(id)
     .bind(slug)
-    .bind(title)
     .bind(format)
     .bind(body)
     .bind(published)
@@ -552,22 +550,20 @@ pub async fn update_content(
 pub async fn upsert_content(
     pool: &PgPool,
     slug: &str,
-    title: &str,
     format: &str,
     body: &str,
     published: bool,
 ) -> Result<Content> {
     let content = sqlx::query_as::<_, Content>(
-        "INSERT INTO contents (id, slug, title, format, body, published)
-         VALUES ($1, $2, $3, $4, $5, $6)
+        "INSERT INTO contents (id, slug, format, body, published)
+         VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (slug) DO UPDATE
-         SET title = EXCLUDED.title, format = EXCLUDED.format,
-             body = EXCLUDED.body, published = EXCLUDED.published, updated_at = now()
+         SET format = EXCLUDED.format, body = EXCLUDED.body,
+             published = EXCLUDED.published, updated_at = now()
          RETURNING *",
     )
     .bind(Uuid::new_v4())
     .bind(slug)
-    .bind(title)
     .bind(format)
     .bind(body)
     .bind(published)

@@ -31,8 +31,7 @@ struct PostLink {
 struct PageTemplate {
     site: SiteSettings,
     admin_url: String,
-    title: String,
-    date: String,
+    filename: String,
     content: String,
     pdf_url: String,
     tree: String,
@@ -57,7 +56,6 @@ struct TreeNode {
 
 struct TreeFile {
     name: String,
-    title: String,
     url: String,
 }
 
@@ -69,7 +67,6 @@ impl TreeNode {
             if index + 1 == parts.len() {
                 node.files.push(TreeFile {
                     name: source_filename(slug, content.format()),
-                    title: content.title.clone(),
                     url: content_url(slug),
                 });
             } else {
@@ -103,8 +100,6 @@ impl TreeNode {
         for file in &self.files {
             out.push_str("<li class=\"file\"><a href=\"");
             out.push_str(&escape_html(&file.url));
-            out.push_str("\" title=\"");
-            out.push_str(&escape_html(&file.title));
             out.push_str("\">");
             out.push_str(&escape_html(&file.name));
             out.push_str("</a></li>");
@@ -367,37 +362,7 @@ fn project_style_base(slug: &str) -> Option<&str> {
     Some(slug.rsplit_once('/').map(|(base, _)| base).unwrap_or(slug))
 }
 
-/// 项目文件的标题：优先读头部 `title:`，否则用文件名。
-fn project_file_title(body: &str, path: &str) -> String {
-    let lines: Vec<&str> = body.lines().collect();
-    if lines.first().map(|line| line.trim()) == Some("---") {
-        if let Some(end) = lines
-            .iter()
-            .enumerate()
-            .skip(1)
-            .take(60)
-            .find(|(_, line)| line.trim() == "---")
-            .map(|(index, _)| index)
-        {
-            for line in &lines[1..end] {
-                if let Some(value) = line.trim().strip_prefix("title:") {
-                    let value = value.trim();
-                    if !value.is_empty() {
-                        return value.to_string();
-                    }
-                }
-            }
-        }
-    }
-    let stem = path
-        .rsplit('/')
-        .next()
-        .unwrap_or(path)
-        .rsplit_once('.')
-        .map(|(stem, _)| stem)
-        .unwrap_or(path);
-    stem.to_string()
-}
+
 
 fn write_raw(out: &Path, slug: &str, data: &[u8]) -> Result<()> {
     let target = safe_output_path(out, slug)?;
@@ -542,11 +507,9 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
                     }
                     let body = String::from_utf8(data.clone())
                         .with_context(|| format!("项目文件不是 UTF-8: {path}"))?;
-                    let title = project_file_title(&body, path);
                     contents.push(Content {
                         id: Uuid::new_v4(),
                         slug: slug.clone(),
-                        title,
                         format: format.as_str().to_string(),
                         body,
                         published: true,
@@ -606,9 +569,10 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
                 continue;
             }
         };
+        let filename = source_filename(&content.slug, content.format());
         let ctx = render::DocContext {
             page: &page,
-            title: &content.title,
+            title: &filename,
             includes: &wikidot_includes,
         };
         let rendered = match project_typst.get(&content.slug) {
@@ -639,8 +603,7 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
         let page = PageTemplate {
             site: settings.clone(),
             admin_url: cfg.admin_origin.clone(),
-            title: content.title.clone(),
-            date: date.clone(),
+            filename,
             content: rendered.html,
             pdf_url,
             tree: tree_html.clone(),
@@ -655,7 +618,7 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
         };
         pages.push(BuiltPage {
             slug: content.slug.clone(),
-            title: content.title.clone(),
+            title: source_filename(&content.slug, content.format()),
             date,
             html,
             pdf: rendered.pdf,
@@ -826,14 +789,14 @@ pub async fn run_one(
         .strip_suffix(".html")
         .unwrap_or(&content.slug)
         .replace('/', ":");
+    let filename = source_filename(&content.slug, content.format());
     let ctx = render::DocContext {
         page: &page,
-        title: &content.title,
+        title: &filename,
         includes: &wikidot_includes,
     };
     let rendered = render::render_doc(content.format(), &body, &cfg.content_root, &ctx)
         .with_context(|| format!("渲染 {} 失败", content.slug))?;
-    let date = content.updated_at.format("%Y-%m-%d").to_string();
     let pdf_url = if rendered.pdf.is_some() {
         format!("/{}", encode_path(&pdf_path(&content.slug)))
     } else {
@@ -842,8 +805,7 @@ pub async fn run_one(
     let html = PageTemplate {
         site: settings.clone(),
         admin_url: cfg.admin_origin.clone(),
-        title: content.title.clone(),
-        date,
+        filename,
         content: rendered.html,
         pdf_url,
         tree: tree_html,
@@ -975,8 +937,7 @@ mod tests {
         let page = PageTemplate {
             site: settings(),
             admin_url: "https://m.kych.net".into(),
-            title: "标题".into(),
-            date: "2026-11-06".into(),
+            filename: "index.md".into(),
             content: "<p>正文</p>".into(),
             pdf_url: "/demo.pdf".into(),
             tree,
@@ -1002,10 +963,9 @@ mod tests {
     #[test]
     fn tree_renders_directories_and_files() {
         let mut tree = TreeNode::default();
-        let content = |slug: &str, title: &str| Content {
+        let content = |slug: &str, _title: &str| Content {
             id: uuid::Uuid::new_v4(),
             slug: slug.to_string(),
-            title: title.to_string(),
             format: "markdown".into(),
             body: String::new(),
             published: true,

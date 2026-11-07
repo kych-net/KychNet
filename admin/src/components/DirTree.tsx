@@ -3,7 +3,6 @@ import { Content, sourcePath } from "../api";
 
 type FileNode = {
   name: string;
-  title: string;
   content: Content;
 };
 
@@ -23,7 +22,7 @@ function buildTree(items: Content[]): Node {
     }
     const path = sourcePath(item);
     const name = path.slice(path.lastIndexOf("/") + 1);
-    node.files.push({ name, title: item.title, content: item });
+    node.files.push({ name, content: item });
   }
   return root;
 }
@@ -61,7 +60,6 @@ function DirNode({ name, node, onEdit }: DirProps) {
                 <button
                   className="dir-file"
                   type="button"
-                  title={file.title}
                   onClick={() => onEdit(file.content)}
                 >
                   {file.name}
@@ -99,7 +97,6 @@ export function DirTree({ items, onEdit }: Props) {
             <button
               className="dir-file"
               type="button"
-              title={file.title}
               onClick={() => onEdit(file.content)}
             >
               {file.name}

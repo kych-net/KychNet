@@ -918,7 +918,17 @@ async fn contents(
     session: Session,
 ) -> ApiResult<Json<serde_json::Value>> {
     current_user(&state, &session).await?;
-    let items = service::list_contents(&state.pool).await?;
+    let items: Vec<serde_json::Value> = service::list_contents(&state.pool)
+        .await?
+        .into_iter()
+        .map(|content| {
+            let mut value = json!(content);
+            if let Some(object) = value.as_object_mut() {
+                object.insert("filename".to_string(), json!(content.filename()));
+            }
+            value
+        })
+        .collect();
     Ok(Json(json!({ "items": items })))
 }
 
@@ -934,7 +944,6 @@ struct ContentRequest {
     #[serde(default)]
     id: Option<Uuid>,
     slug: String,
-    title: String,
     format: String,
     body: String,
     #[serde(default)]
@@ -997,9 +1006,6 @@ async fn save_content(
     //   /eoe/index.md -> eoe/index.html
     // 同一路径只有一条记录，因此 .html/.md/.typ 天然互斥。
     let (slug, format) = service::normalize_content_path(&req.slug, format)?;
-    if req.title.trim().is_empty() || req.title.chars().count() > 200 {
-        api_bail!("标题需为 1-200 个字符");
-    }
     let existing = if let Some(id) = req.id {
         Some(
             service::find_content_by_id(&state.pool, id)
@@ -1019,7 +1025,6 @@ async fn save_content(
             &state.pool,
             id,
             &slug,
-            &req.title,
             format.as_str(),
             &req.body,
             req.published,
@@ -1029,7 +1034,6 @@ async fn save_content(
         service::upsert_content(
             &state.pool,
             &slug,
-            &req.title,
             format.as_str(),
             &req.body,
             req.published,
