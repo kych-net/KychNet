@@ -59,6 +59,19 @@ pub fn render_doc(
     root: &Path,
     ctx: &DocContext,
 ) -> Result<Rendered> {
+    render_doc_with_project(format, body, root, ctx, &HashMap::new(), "main.typ")
+}
+
+/// 渲染项目文件。`files` 是项目根下的完整文件快照，Typst 的相对 include
+/// 会优先从这里读取；读不到再回退到磁盘上的全站内容目录。
+pub fn render_doc_with_project(
+    format: ContentFormat,
+    body: &str,
+    root: &Path,
+    ctx: &DocContext,
+    files: &HashMap<String, Vec<u8>>,
+    main_path: &str,
+) -> Result<Rendered> {
     match format {
         ContentFormat::Markdown => Ok(Rendered {
             html: render_markdown(body),
@@ -68,7 +81,7 @@ pub fn render_doc(
             html: body.to_string(),
             pdf: None,
         }),
-        ContentFormat::Typst => render_typst(body, root),
+        ContentFormat::Typst => render_typst(body, root, files, main_path),
         ContentFormat::Wikidot => render_wikidot(body, ctx),
         ContentFormat::Css => bail!("CSS 文件不是页面，不能走页面渲染"),
     }
@@ -167,14 +180,21 @@ struct TypstWorld {
     root: PathBuf,
     main: FileId,
     source: Source,
+    /// 项目仓库文件，key 是相对项目根的路径。
+    files: HashMap<String, Vec<u8>>,
     book: LazyHash<FontBook>,
     fonts: Vec<Font>,
     library: LazyHash<Library>,
 }
 
 impl TypstWorld {
-    fn new(body: &str, root: &Path) -> Self {
-        let main = FileId::new(None, VirtualPath::new("main.typ"));
+    fn new(
+        body: &str,
+        root: &Path,
+        main_path: &str,
+        files: &HashMap<String, Vec<u8>>,
+    ) -> Self {
+        let main = FileId::new(None, VirtualPath::new(main_path));
         let source = Source::new(main, body.to_string());
 
         let mut book = FontBook::new();
@@ -195,10 +215,22 @@ impl TypstWorld {
             root: root.to_path_buf(),
             main,
             source,
+            files: files.clone(),
             book: LazyHash::new(book),
             fonts,
             library: LazyHash::new(library),
         }
+    }
+
+    /// 项目仓库文件优先于磁盘内容目录。
+    fn memory_file(&self, id: FileId) -> Option<&Vec<u8>> {
+        let key = id
+            .vpath()
+            .as_rooted_path()
+            .to_string_lossy()
+            .trim_start_matches('/')
+            .to_string();
+        self.files.get(&key)
     }
 
     /// 把 Typst 的虚拟路径安全地解析到内容根目录内。
@@ -256,6 +288,11 @@ impl World for TypstWorld {
         if id == self.main {
             return Ok(self.source.clone());
         }
+        if let Some(data) = self.memory_file(id) {
+            let text = String::from_utf8(data.to_vec())
+                .map_err(|_| FileError::NotFound(id.vpath().as_rooted_path().to_path_buf()))?;
+            return Ok(Source::new(id, text));
+        }
         let path = self.path_for(id)?;
         let text = std::fs::read_to_string(&path)
             .map_err(|_| FileError::NotFound(path.clone()))?;
@@ -265,6 +302,9 @@ impl World for TypstWorld {
     fn file(&self, id: FileId) -> FileResult<Bytes> {
         if id == self.main {
             return Ok(Bytes::new(self.source.text().as_bytes().to_vec()));
+        }
+        if let Some(data) = self.memory_file(id) {
+            return Ok(Bytes::new(data.to_vec()));
         }
         let path = self.path_for(id)?;
         let data = std::fs::read(&path).map_err(|_| FileError::NotFound(path.clone()))?;
@@ -280,8 +320,13 @@ impl World for TypstWorld {
     }
 }
 
-fn render_typst(body: &str, root: &Path) -> Result<Rendered> {
-    let world = TypstWorld::new(body, root);
+fn render_typst(
+    body: &str,
+    root: &Path,
+    files: &HashMap<String, Vec<u8>>,
+    main_path: &str,
+) -> Result<Rendered> {
+    let world = TypstWorld::new(body, root, main_path, files);
 
     let paged = typst::compile::<PagedDocument>(&world)
         .output
@@ -392,7 +437,7 @@ mod tests {
         symlink(base.join("secret.txt"), content.join("link.txt")).expect("创建符号链接");
         std::fs::write(content.join("normal.txt"), "fine").expect("写入普通文件");
 
-        let world = TypstWorld::new("", &content);
+        let world = TypstWorld::new("", &content, "main.typ", &HashMap::new());
         // 普通文件仍然可以解析。
         let ok = world.path_for(FileId::new(None, VirtualPath::new("normal.txt")));
         assert!(ok.is_ok(), "普通文件应通过: {ok:?}");

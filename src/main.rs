@@ -2,9 +2,12 @@ mod api;
 mod auth;
 mod build;
 mod cli_cn;
+mod collab;
 mod config;
 mod db;
+mod git;
 mod models;
+mod project;
 mod rate;
 mod render;
 mod service;
@@ -62,6 +65,12 @@ enum Command {
     Passkey {
         #[command(subcommand)]
         command: PasskeyCommand,
+    },
+    /// 清理项目仓库中的不可达对象与孤立 LFS 文件
+    Gc {
+        /// 项目名（slug）
+        #[arg(long)]
+        project: String,
     },
 }
 
@@ -275,6 +284,22 @@ async fn main() -> Result<()> {
                     service::delete_passkeys(&pool, user.id).await
                 }
             }
+        }
+        Command::Gc { project } => {
+            let pool = db::connect(&cfg.database_url).await?;
+            let project = project::find_project_by_slug(&pool, &project)
+                .await?
+                .context("项目不存在")?;
+            let stats = git::gc::run(&pool, &cfg.lfs_root, &project).await?;
+            println!(
+                "已清理项目 {}：对象 {}、提交 {}、路径记录 {}、LFS {}",
+                project.slug,
+                stats.objects_removed,
+                stats.commits_removed,
+                stats.paths_removed,
+                stats.lfs_removed
+            );
+            Ok(())
         }
     }
 }

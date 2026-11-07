@@ -107,6 +107,16 @@ pub fn normalize_content_path(
         bail!("目录路径请显式写出文件名，例如 /xef/index");
     }
 
+    // /项目/ 是项目仓库的命名空间，普通内容不能写进去，避免同一路径有两个来源。
+    let first_segment = trimmed
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    if first_segment == crate::project::PROJECT_NAMESPACE {
+        bail!("/项目/ 下的内容由项目仓库管理，请从「项目」入口编辑");
+    }
+
     if requested == ContentFormat::Css {
         let raw = trimmed.trim_start_matches('/');
         let mut parts: Vec<String> = raw.split('/').map(str::to_string).collect();
