@@ -72,6 +72,34 @@ impl ContentFormat {
             _ => None,
         }
     }
+
+    /// 数据库与 API 使用的格式名。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Markdown => "markdown",
+            Self::Html => "html",
+            Self::Typst => "typst",
+        }
+    }
+
+    /// 源文件扩展名；三种格式最终都输出 `.html`。
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Markdown => ".md",
+            Self::Html => ".html",
+            Self::Typst => ".typ",
+        }
+    }
+
+    /// 从源文件扩展名推断格式，扩展名不区分大小写。
+    pub fn from_extension(ext: &str) -> Option<Self> {
+        match ext.to_ascii_lowercase().as_str() {
+            "md" => Some(Self::Markdown),
+            "html" => Some(Self::Html),
+            "typ" => Some(Self::Typst),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, FromRow)]

@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { api, avatarUrl, SiteSettings, User } from "../api";
+import { api, avatarUrl, Content, SiteSettings, User } from "../api";
+import { DirTree } from "./DirTree";
 import { Theme } from "../theme";
 import { ContentsView } from "../views/ContentsView";
 import { InvitesView } from "../views/InvitesView";
@@ -37,15 +38,44 @@ export function Shell({
   const [view, setView] = useState<View>("contents");
   const [menuOpen, setMenuOpen] = useState(false);
   const [avatarFailed, setAvatarFailed] = useState(false);
+  const [treeOpen, setTreeOpen] = useState(false);
+  const [contents, setContents] = useState<Content[]>([]);
+  const [editContentId, setEditContentId] = useState<string | null>(null);
   const initial = user.username.slice(0, 1).toUpperCase();
 
   useEffect(() => {
     setAvatarFailed(false);
   }, [avatarVersion, user.id]);
 
+  useEffect(() => {
+    void loadContents();
+  }, []);
+
+  async function loadContents() {
+    try {
+      setContents((await api.contents()).items);
+    } catch {
+      // 目录树加载失败不阻塞主界面；用户仍可从内容列表操作。
+    }
+  }
+
+  function toggleTree() {
+    if (!treeOpen) {
+      void loadContents();
+    }
+    setTreeOpen((value) => !value);
+  }
+
   function go(next: View) {
     setView(next);
     setMenuOpen(false);
+    setTreeOpen(false);
+  }
+
+  function editFromTree(content: Content) {
+    setEditContentId(content.id);
+    setView("contents");
+    setTreeOpen(false);
   }
 
   function switchTheme() {
@@ -68,6 +98,10 @@ export function Shell({
             <span className="brand-mark">{site.site_name.slice(0, 1)}</span>
           )}
         </a>
+
+        <button className="dir-tree-toggle" type="button" onClick={toggleTree}>
+          目录
+        </button>
 
         <nav className="appnav">
           <button className={view === "contents" ? "active" : ""} onClick={() => go("contents")}>
@@ -127,10 +161,22 @@ export function Shell({
             )}
           </div>
         </div>
+
+        {treeOpen && (
+          <div className="dir-tree-panel">
+            <div className="dir-tree-title">目录</div>
+            <DirTree items={contents} onEdit={editFromTree} />
+          </div>
+        )}
       </header>
 
       <main className="appmain">
-        {view === "contents" && <ContentsView />}
+        {view === "contents" && (
+          <ContentsView
+            editContentId={editContentId}
+            onEditHandled={() => setEditContentId(null)}
+          />
+        )}
         {view === "invites" && user.is_admin && <InvitesView />}
         {view === "users" && user.is_admin && <UsersView />}
         {view === "settings" && user.is_admin && <SettingsView />}

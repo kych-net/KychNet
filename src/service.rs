@@ -4,7 +4,7 @@ use rand::RngCore;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::models::{Content, Invite, SiteSettings, User};
+use crate::models::{Content, ContentFormat, Invite, SiteSettings, User};
 
 /// 使用 CSPRNG 生成 16 字节、Base32(Crockford) 编码的邀请码(约 80 bit 熵)。
 pub fn generate_invite_code() -> String {
@@ -34,28 +34,123 @@ pub fn parse_expiry(spec: &str) -> Result<Option<DateTime<Utc>>> {
     Ok(Some(Utc::now() + duration))
 }
 
-/// 校验 slug 是否可作为静态页面的文件名与 URL 路径段。
-///
-/// 规则：**允许任意 Unicode 字母与数字**（中文、日文、西里尔字母等）外加 `-` 与 `_`，
-/// 除此之外一律视为特殊字符并拒绝。被拒绝的包括：路径分隔符 `/` `\`、点号 `.`
-/// （`.` / `..` 会造成路径穿越）、空白与控制字符、以及 URL 里有特殊含义的
-/// `?` `#` `%` `:` `&` `=` `<` `>` `|` `*` `"` 等。这样既能用中文 slug，
-/// 又保证 slug 拼进 `dist/posts/<slug>.html` 时不会越出目录或生成非法 URL。
-///
-/// 长度按 UTF-8 字节计，上限 180：中文一个字占 3 字节，拼上 `.html` / `.pdf`
-/// 后缀后仍落在常见文件系统 255 字节的文件名限制内。
-///
-/// 这条规则必须在「写入 API」与「构建」两处共用：如果只在构建时校验，
-/// 一条含 `/` 或 `..` 的脏数据就会让整站构建永久失败。
-///
-/// 注意：`char::is_alphanumeric()` 不接受组合音标（如 `e` + U+0301），
-/// 因此带变音符号的文字请使用 NFC 预组合形式（如 `é`）。
-pub fn valid_slug(slug: &str) -> bool {
-    !slug.is_empty()
-        && slug.len() <= 180
-        && slug
+/// 网站主页在数据库里的固定路径。它可编辑，但不可删除。
+pub const HOME_SLUG: &str = "index.html";
+
+const MAX_PATH_BYTES: usize = 512;
+const MAX_SEGMENT_BYTES: usize = 200;
+
+/// 路径段只允许 Unicode 字母/数字、`-` 和 `_`。
+fn valid_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment.len() <= MAX_SEGMENT_BYTES
+        && segment
             .chars()
             .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+}
+
+/// 校验数据库里已经归一化的输出路径，例如 `index.html`、`xef/index.html`。
+pub fn valid_content_slug(slug: &str) -> bool {
+    let Some(stem) = slug.strip_suffix(".html") else {
+        return false;
+    };
+    if slug.len() > MAX_PATH_BYTES {
+        return false;
+    }
+    let segments: Vec<&str> = stem.split('/').collect();
+    if segments.is_empty() || segments.iter().any(|s| !valid_segment(s)) {
+        return false;
+    }
+    // `/api` 与 `/api/...` 是后端保留路径，不能作为内容页。
+    !segments[0].eq_ignore_ascii_case("api")
+}
+
+/// 把用户输入的路径归一化成数据库里的输出路径，并从扩展名推断格式。
+///
+/// 规则：
+/// - 允许 `/xef/`（目录主页 → `xef/index.html`）；
+/// - 允许 `/reff/93df/l.html`（页面）；
+/// - 允许 `/eoe/index.md`、`/eoe/index.typ`，但最终都存成 `.html`；
+/// - 同一路径只能存在一条记录，因此 `.html/.md/.typ` 天然互斥；
+/// - 扩展名和请求格式不一致时直接报错，避免静默改格式；
+/// - `/api` 与 `/api/...` 保留，拒绝写入。
+pub fn normalize_content_path(
+    input: &str,
+    requested: ContentFormat,
+) -> Result<(String, ContentFormat)> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        bail!("路径不能为空");
+    }
+    if trimmed
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control())
+    {
+        bail!("路径不能包含空白或控制字符");
+    }
+
+    let mut raw = trimmed.trim_start_matches('/').to_string();
+    if trimmed.ends_with('/') {
+        raw.push_str("index");
+    }
+    if raw.is_empty() {
+        raw.push_str("index");
+    }
+
+    let mut parts: Vec<String> = raw.split('/').map(str::to_string).collect();
+    if parts.iter().any(|s| s.is_empty() || s == "." || s == "..") {
+        bail!("路径不能包含空段、`.` 或 `..`");
+    }
+
+    let last = parts.last_mut().expect("parts 至少有一个元素");
+    let lower = last.to_ascii_lowercase();
+    let (base, inferred) = match lower.rsplit_once('.') {
+        Some((base, ext)) => match ContentFormat::from_extension(ext) {
+            Some(format) => (base.to_string(), Some(format)),
+            // 未知扩展名保留下来，交给 valid_segment 拒绝。
+            None => (last.clone(), None),
+        },
+        None => (last.clone(), None),
+    };
+
+    if base.is_empty() {
+        bail!("路径缺少文件名");
+    }
+    let last_display = last.clone();
+    *last = base;
+
+    let slug = format!("{}.html", parts.join("/"));
+    // 主页固定叫 index.html，但允许用 Markdown/Typst 编辑它；
+    // 其他路径的 .html 扩展名仍然强制对应 HTML 格式。
+    if let Some(inferred) = inferred {
+        if inferred != requested && slug != HOME_SLUG {
+            bail!(
+                "扩展名与格式不一致：{} 应对应 {}",
+                last_display,
+                inferred.as_str()
+            );
+        }
+    }
+    if slug.len() > MAX_PATH_BYTES {
+        bail!("路径不能超过 {MAX_PATH_BYTES} 字节");
+    }
+    if !valid_content_slug(&slug) {
+        bail!("路径只能包含 Unicode 字母/数字、-、_ 和 /，且不能使用 /api 保留路径");
+    }
+    let format = if slug == HOME_SLUG {
+        requested
+    } else {
+        inferred.unwrap_or(requested)
+    };
+    Ok((slug, format))
+}
+
+/// 输出路径对应的源文件路径，用于编辑器和目录树展示。
+pub fn source_path(slug: &str, format: ContentFormat) -> String {
+    match slug.strip_suffix(".html") {
+        Some(stem) => format!("{stem}{}", format.extension()),
+        None => slug.to_string(),
+    }
 }
 
 /// 邀请码可用性校验，抽成纯函数供独立调用与注册事务共用。
@@ -393,7 +488,10 @@ pub async fn upsert_content(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_expiry, valid_slug};
+    use super::{
+        normalize_content_path, parse_expiry, source_path, valid_content_slug, HOME_SLUG,
+    };
+    use crate::models::ContentFormat;
 
     #[test]
     fn parses_expiry_specs() {
@@ -411,53 +509,122 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_directory_and_file_paths() {
+        assert_eq!(
+            normalize_content_path("/xef/", ContentFormat::Markdown).unwrap(),
+            ("xef/index.html".to_string(), ContentFormat::Markdown)
+        );
+        assert_eq!(
+            normalize_content_path("/reff/93df/l.html", ContentFormat::Html).unwrap(),
+            ("reff/93df/l.html".to_string(), ContentFormat::Html)
+        );
+        assert_eq!(
+            normalize_content_path("/eoe/index.md", ContentFormat::Markdown).unwrap(),
+            ("eoe/index.html".to_string(), ContentFormat::Markdown)
+        );
+        assert_eq!(
+            normalize_content_path("/eoe/", ContentFormat::Typst).unwrap(),
+            ("eoe/index.html".to_string(), ContentFormat::Typst)
+        );
+        assert_eq!(
+            normalize_content_path("你好/世界.html", ContentFormat::Html).unwrap(),
+            ("你好/世界.html".to_string(), ContentFormat::Html)
+        );
+        assert_eq!(
+            normalize_content_path("/", ContentFormat::Markdown).unwrap(),
+            (HOME_SLUG.to_string(), ContentFormat::Markdown)
+        );
+        assert_eq!(
+            normalize_content_path("index.html", ContentFormat::Markdown).unwrap(),
+            (HOME_SLUG.to_string(), ContentFormat::Markdown)
+        );
+        assert_eq!(
+            normalize_content_path("index.md", ContentFormat::Markdown).unwrap(),
+            (HOME_SLUG.to_string(), ContentFormat::Markdown)
+        );
+    }
+
+    #[test]
+    fn rejects_extension_format_mismatch() {
+        assert!(normalize_content_path("/eoe/index.md", ContentFormat::Html).is_err());
+        assert!(normalize_content_path("/eoe/index.typ", ContentFormat::Markdown).is_err());
+        assert!(normalize_content_path("/eoe/index.html", ContentFormat::Typst).is_err());
+    }
+
+    #[test]
+    fn rejects_protected_and_unsafe_paths() {
+        for (path, format) in [
+            ("/api", ContentFormat::Html),
+            ("/api/index.html", ContentFormat::Html),
+            ("/API/foo", ContentFormat::Html),
+            ("/a//b", ContentFormat::Html),
+            ("/a/../b", ContentFormat::Html),
+            ("/a/./b", ContentFormat::Html),
+            ("/a b", ContentFormat::Html),
+            ("/a.txt", ContentFormat::Html),
+            ("/a\\b", ContentFormat::Html),
+        ] {
+            assert!(
+                normalize_content_path(path, format).is_err(),
+                "应当拒绝: {path:?}"
+            );
+        }
+        // apiary 不是保留路径。
+        assert!(normalize_content_path("/apiary/x", ContentFormat::Html).is_ok());
+    }
+
+    #[test]
     fn allows_unicode_letters_and_digits() {
         for slug in [
-            "hello",
-            "a-b_c123",
-            "你好世界",
-            "日本語_2026",
-            "Русский",
-            "café-notes",
-            "２０２６",
+            "hello.html",
+            "a-b_c123.html",
+            "你好世界.html",
+            "日本語_2026.html",
+            "Русский.html",
+            "café-notes.html",
+            "２０２６.html",
+            "xef/index.html",
+            "reff/93df/l.html",
+            "apiary.html",
         ] {
-            assert!(valid_slug(slug), "应当允许: {slug:?}");
+            assert!(valid_content_slug(slug), "应当允许: {slug:?}");
         }
     }
 
     #[test]
-    fn rejects_special_characters() {
+    fn rejects_invalid_stored_slugs() {
         for slug in [
             "",
+            ".html",
+            "index",
             "a/b",
-            "a\\b",
-            "..",
-            "a.b",
-            "a b",
-            "a?b=1",
-            "a#b",
-            "a%20b",
-            "a:b",
-            "a<b>",
-            "a|b",
-            "a*b",
-            "a\"b",
-            "a&b",
-            "a\nb",
-            "a\tb",
-            "a\0b",
-            "😀",
-            "a/b/../../etc",
+            "a/b/",
+            "a//b.html",
+            "a/../b.html",
+            "a.b.html",
+            "a b.html",
+            "a?b.html",
+            "a#b.html",
+            "api.html",
+            "API/index.html",
+            "😀.html",
         ] {
-            assert!(!valid_slug(slug), "应当拒绝: {slug:?}");
+            assert!(!valid_content_slug(slug), "应当拒绝: {slug:?}");
         }
     }
 
     #[test]
-    fn enforces_byte_length_limit() {
-        assert!(valid_slug(&"a".repeat(180)));
-        assert!(!valid_slug(&"a".repeat(181)));
-        assert!(valid_slug(&"中".repeat(60))); // 正好 180 字节
-        assert!(!valid_slug(&"中".repeat(61))); // 183 字节,超限
+    fn enforces_segment_and_path_length() {
+        assert!(valid_content_slug(&format!("{}.html", "a".repeat(200))));
+        assert!(!valid_content_slug(&format!("{}.html", "a".repeat(201))));
+        assert!(valid_content_slug(&format!("{}/index.html", "a".repeat(200))));
+        assert!(!valid_content_slug(&format!("{}/index.html", "a".repeat(400))));
+    }
+
+    #[test]
+    fn derives_source_path_for_editor() {
+        assert_eq!(source_path("index.html", ContentFormat::Markdown), "index.md");
+        assert_eq!(source_path("eoe/index.html", ContentFormat::Typst), "eoe/index.typ");
+        assert_eq!(source_path("reff/93df/l.html", ContentFormat::Html), "reff/93df/l.html");
     }
 }
