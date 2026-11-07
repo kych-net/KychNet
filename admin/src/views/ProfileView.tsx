@@ -1,6 +1,6 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { startRegistration } from "@simplewebauthn/browser";
-import { api, avatarUrl, isStepUpRequired, User } from "../api";
+import { api, avatarUrl, GitToken, isStepUpRequired, User } from "../api";
 import { StepUpDialog } from "../components/StepUpDialog";
 
 type Props = {
@@ -22,6 +22,42 @@ export function ProfileView({ user, avatarVersion, onUserChange, onAvatarChange 
   const [totpCode, setTotpCode] = useState("");
   const [stepUpOpen, setStepUpOpen] = useState(false);
   const [pendingAction, setPendingAction] = useState<(() => Promise<void>) | null>(null);
+
+  const [tokens, setTokens] = useState<GitToken[]>([]);
+  const [tokenName, setTokenName] = useState("");
+  const [newToken, setNewToken] = useState("");
+
+  useEffect(() => {
+    api
+      .gitTokens()
+      .then((data) => setTokens(data.items))
+      .catch((e) => setError((e as Error).message));
+  }, []);
+
+  async function createToken(event: React.FormEvent) {
+    event.preventDefault();
+    setError("");
+    try {
+      const result = await api.createGitToken(tokenName);
+      setTokens((items) => [result.item, ...items]);
+      setNewToken(result.token);
+      setTokenName("");
+      setNotice("令牌已创建，请立即复制保存，之后无法再次查看");
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
+  async function revokeToken(id: string) {
+    setError("");
+    try {
+      await api.revokeGitToken(id);
+      setTokens((items) => items.filter((item) => item.id !== id));
+      setNotice("令牌已吊销");
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
 
   const initial = user.username.slice(0, 1).toUpperCase();
 
@@ -158,6 +194,44 @@ export function ProfileView({ user, avatarVersion, onUserChange, onAvatarChange 
         </>
       ) : (
         <button onClick={setupTotp}>生成 TOTP 密钥</button>
+      )}
+
+      <h3>Git 访问令牌</h3>
+      <p className="hint">
+        推送到 /git/&lt;项目&gt;.git 时需要令牌；克隆与拉取匿名即可。
+      </p>
+      <form onSubmit={createToken} className="row align">
+        <input
+          value={tokenName}
+          onChange={(e) => setTokenName(e.target.value)}
+          placeholder="令牌名称，如 笔记本"
+        />
+        <button type="submit">创建令牌</button>
+      </form>
+      {newToken && (
+        <p>
+          新令牌: <span className="mono">{newToken}</span>
+        </p>
+      )}
+      {tokens.length > 0 && (
+        <ul className="token-list">
+          {tokens.map((token) => (
+            <li key={token.id}>
+              <span>
+                {token.name}
+                <span className="hint">
+                  {" "}
+                  {token.last_used_at
+                    ? `最近使用 ${new Date(token.last_used_at).toLocaleString()}`
+                    : "尚未使用"}
+                </span>
+              </span>
+              <button className="danger" onClick={() => revokeToken(token.id)}>
+                吊销
+              </button>
+            </li>
+          ))}
+        </ul>
       )}
 
       <StepUpDialog

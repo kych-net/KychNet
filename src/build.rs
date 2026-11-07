@@ -1,8 +1,9 @@
 use anyhow::{bail, Context, Result};
 use askama::Template;
 use sqlx::PgPool;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
+use uuid::Uuid;
 
 use ftml::data::PageRef;
 
@@ -214,6 +215,14 @@ fn make_parent_dirs_public(out: &Path, parent: &Path) -> Result<()> {
 ///
 /// 返回 (链接列表, 去掉声明头后的正文)。格式未知或没有声明时原样返回。
 pub(crate) fn parse_page_styles(body: &str) -> Result<(Vec<String>, String)> {
+    parse_page_styles_with_base(body, None)
+}
+
+/// `base` 为 Some 时用于项目文件：相对 CSS 路径按 `/项目/<项目>/` 解析。
+fn parse_page_styles_with_base(
+    body: &str,
+    base: Option<&str>,
+) -> Result<(Vec<String>, String)> {
     let lines: Vec<&str> = body.lines().collect();
     if lines.first().map(|line| line.trim()) != Some("---") {
         return Ok((Vec::new(), body.to_string()));
@@ -243,9 +252,15 @@ pub(crate) fn parse_page_styles(body: &str) -> Result<(Vec<String>, String)> {
             if token.is_empty() {
                 continue;
             }
-            let (slug, _) = service::normalize_content_path(token, ContentFormat::Css)
-                .with_context(|| format!("页面 CSS 声明非法: {token}"))?;
-            let href = format!("/{slug}");
+            let href = match base {
+                Some(base) => project_style_href(base, token)
+                    .with_context(|| format!("项目 CSS 声明非法: {token}"))?,
+                None => {
+                    let (slug, _) = service::normalize_content_path(token, ContentFormat::Css)
+                        .with_context(|| format!("页面 CSS 声明非法: {token}"))?;
+                    format!("/{slug}")
+                }
+            };
             if !styles.contains(&href) {
                 styles.push(href);
             }
@@ -261,6 +276,113 @@ pub(crate) fn parse_page_styles(body: &str) -> Result<(Vec<String>, String)> {
     Ok((styles, stripped))
 }
 
+/// 项目页面的 CSS 可以写相对路径，例如 `css: theme.css`；
+/// 以 `/` 开头时仍按全站绝对路径解析。
+fn project_style_href(base: &str, token: &str) -> Result<String> {
+    let raw = if token.starts_with('/') {
+        token.trim_start_matches('/').to_string()
+    } else {
+        format!("{}/{}", base.trim_end_matches('/'), token.trim_start_matches('/'))
+    };
+    let mut parts = Vec::new();
+    for segment in raw.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            bail!("CSS 路径不能包含空段、. 或 ..");
+        }
+        if segment.chars().any(|ch| ch.is_control() || ch == '\\' || ch == '\0') {
+            bail!("CSS 路径包含非法字符");
+        }
+        parts.push(segment);
+    }
+    let joined = parts.join("/");
+    if !joined.to_ascii_lowercase().ends_with(".css") {
+        bail!("CSS 路径必须以 .css 结尾");
+    }
+    Ok(format!("/{joined}"))
+}
+
+/// 项目页面在内容站的输出路径。
+fn project_page_slug(project_slug: &str, path: &str) -> String {
+    let stem = match path.rsplit_once('.') {
+        Some((stem, _)) => stem,
+        None => path,
+    };
+    format!("{}/{}/{}.html", crate::project::PROJECT_NAMESPACE, project_slug, stem)
+}
+
+fn project_asset_slug(project_slug: &str, path: &str) -> String {
+    format!("{}/{}/{}", crate::project::PROJECT_NAMESPACE, project_slug, path)
+}
+
+fn project_home_slug(project_slug: &str, files: &BTreeMap<String, Vec<u8>>) -> Option<String> {
+    for name in ["index.md", "index.html", "index.typ", "index.wj"] {
+        if files.contains_key(name) {
+            return Some(project_page_slug(project_slug, name));
+        }
+    }
+    files
+        .keys()
+        .find(|path| {
+            path.rsplit_once('.')
+                .and_then(|(_, ext)| ContentFormat::from_extension(ext))
+                .is_some_and(|format| format != ContentFormat::Css)
+        })
+        .map(|path| project_page_slug(project_slug, path))
+}
+
+fn project_style_base(slug: &str) -> Option<&str> {
+    let mut parts = slug.splitn(3, '/');
+    let namespace = parts.next()?;
+    let project = parts.next()?;
+    if namespace != crate::project::PROJECT_NAMESPACE || project.is_empty() {
+        return None;
+    }
+    Some(slug.rsplit_once('/').map(|(base, _)| base).unwrap_or(slug))
+}
+
+/// 项目文件的标题：优先读头部 `title:`，否则用文件名。
+fn project_file_title(body: &str, path: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    if lines.first().map(|line| line.trim()) == Some("---") {
+        if let Some(end) = lines
+            .iter()
+            .enumerate()
+            .skip(1)
+            .take(60)
+            .find(|(_, line)| line.trim() == "---")
+            .map(|(index, _)| index)
+        {
+            for line in &lines[1..end] {
+                if let Some(value) = line.trim().strip_prefix("title:") {
+                    let value = value.trim();
+                    if !value.is_empty() {
+                        return value.to_string();
+                    }
+                }
+            }
+        }
+    }
+    let stem = path
+        .rsplit('/')
+        .next()
+        .unwrap_or(path)
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(path);
+    stem.to_string()
+}
+
+fn write_raw(out: &Path, slug: &str, data: &[u8]) -> Result<()> {
+    let target = out.join(slug);
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+        make_parent_dirs_public(out, parent)?;
+    }
+    std::fs::write(&target, data)?;
+    make_public(&target, false)?;
+    Ok(())
+}
+
 fn write_style(out: &Path, content: &Content) -> Result<()> {
     if !service::valid_style_slug(&content.slug) {
         bail!("非法 CSS 路径: {}", content.slug);
@@ -272,6 +394,15 @@ fn write_style(out: &Path, content: &Content) -> Result<()> {
     }
     std::fs::write(&target, &content.body)?;
     make_public(&target, false)?;
+    Ok(())
+}
+
+/// /项目/ 完全由仓库生成，整站构建时整体重建，避免删除/改名后的旧文件残留。
+fn clean_project_output(root: &Path) -> Result<()> {
+    let dir = root.join(crate::project::PROJECT_NAMESPACE);
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir)?;
+    }
     Ok(())
 }
 
@@ -332,6 +463,77 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
     }
     styles.sort_by(|a, b| a.slug.cmp(&b.slug));
 
+    // 项目仓库是 /项目/ 下内容的唯一来源：把默认分支的文件编译成普通页面。
+    let snapshots = crate::project::snapshots(pool).await?;
+    let mut project_styles = Vec::new();
+    let mut project_assets = Vec::new();
+    let mut project_typst: HashMap<String, (HashMap<String, Vec<u8>>, String)> = HashMap::new();
+    let mut project_links = Vec::new();
+    let mut seen_slugs: HashSet<String> = contents.iter().map(|item| item.slug.clone()).collect();
+
+    for snapshot in &snapshots {
+        let files_map: HashMap<String, Vec<u8>> = snapshot
+            .files
+            .iter()
+            .map(|(path, data)| (path.clone(), data.clone()))
+            .collect();
+        for (path, data) in &snapshot.files {
+            if !crate::git::object::is_text(data) {
+                tracing::warn!(
+                    project = %snapshot.project.slug,
+                    path = %path,
+                    "跳过非文本项目文件；二进制需要 LFS，目前尚未实现"
+                );
+                continue;
+            }
+            let extension = path.rsplit_once('.').map(|(_, ext)| ext).unwrap_or_default();
+            match ContentFormat::from_extension(extension) {
+                Some(ContentFormat::Css) => {
+                    project_styles.push((
+                        project_asset_slug(&snapshot.project.slug, path),
+                        data.clone(),
+                    ));
+                }
+                Some(format) => {
+                    let slug = project_page_slug(&snapshot.project.slug, path);
+                    if !seen_slugs.insert(slug.clone()) {
+                        bail!("项目 {path} 与其他文件输出到同一个路径: {slug}");
+                    }
+                    let body = String::from_utf8(data.clone())
+                        .with_context(|| format!("项目文件不是 UTF-8: {path}"))?;
+                    let title = project_file_title(&body, path);
+                    contents.push(Content {
+                        id: Uuid::new_v4(),
+                        slug: slug.clone(),
+                        title,
+                        format: format.as_str().to_string(),
+                        body,
+                        published: true,
+                        created_at: snapshot.committed_at,
+                        updated_at: snapshot.committed_at,
+                    });
+                    if format == ContentFormat::Typst {
+                        project_typst.insert(slug, (files_map.clone(), path.clone()));
+                    }
+                }
+                None => {
+                    project_assets.push((
+                        project_asset_slug(&snapshot.project.slug, path),
+                        data.clone(),
+                    ));
+                }
+            }
+        }
+        if let Some(home) = project_home_slug(&snapshot.project.slug, &snapshot.files) {
+            project_links.push(PostLink {
+                title: snapshot.project.title.clone(),
+                href: content_url(&home),
+                date: snapshot.committed_at.format("%Y-%m-%d").to_string(),
+            });
+        }
+    }
+    project_links.sort_by(|a, b| a.title.cmp(&b.title));
+
     let mut tree = TreeNode::default();
     let mut wikidot_includes = HashMap::new();
     for content in &contents {
@@ -355,14 +557,25 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
             .strip_suffix(".html")
             .unwrap_or(&content.slug)
             .replace('/', ":");
-        let (styles, body) = parse_page_styles(&content.body)?;
+        let base = project_style_base(&content.slug);
+        let (styles, body) = parse_page_styles_with_base(&content.body, base)?;
         let ctx = render::DocContext {
             page: &page,
             title: &content.title,
             includes: &wikidot_includes,
         };
-        let rendered = render::render_doc(content.format(), &body, &cfg.content_root, &ctx)
-            .with_context(|| format!("渲染 {} 失败", content.slug))?;
+        let rendered = match project_typst.get(&content.slug) {
+            Some((files, main_path)) => render::render_doc_with_project(
+                content.format(),
+                &body,
+                &cfg.content_root,
+                &ctx,
+                files,
+                main_path,
+            ),
+            None => render::render_doc(content.format(), &body, &cfg.content_root, &ctx),
+        }
+        .with_context(|| format!("渲染 {} 失败", content.slug))?;
 
         let date = content.updated_at.format("%Y-%m-%d").to_string();
         let pdf_url = if rendered.pdf.is_some() {
@@ -389,6 +602,25 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
         });
     }
 
+    // /项目/ 索引页由项目列表自动生成，不允许被普通内容占用。
+    if !snapshots.is_empty() {
+        let html = IndexTemplate {
+            site: settings.clone(),
+            admin_url: cfg.admin_origin.clone(),
+            posts: project_links,
+            tree: tree_html.clone(),
+            styles: Vec::new(),
+        }
+        .render()?;
+        pages.push(BuiltPage {
+            slug: format!("{}/index.html", crate::project::PROJECT_NAMESPACE),
+            title: "项目".to_string(),
+            date: String::new(),
+            html,
+            pdf: None,
+        });
+    }
+
     // 只有数据库里没有主页内容时才回退到自动文章列表。
     // 正常情况下 index.html 是内容，且 API 禁止删除。
     let index_html = if pages.iter().any(|page| page.slug == service::HOME_SLUG) {
@@ -405,10 +637,10 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
         links.sort_by(|a, b| b.date.cmp(&a.date));
         Some(
             IndexTemplate {
-                site: settings,
+                site: settings.clone(),
                 admin_url: cfg.admin_origin.clone(),
                 posts: links,
-                tree: tree_html,
+                tree: tree_html.clone(),
                 styles: Vec::new(),
             }
             .render()?,
@@ -421,9 +653,13 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
     make_public(out, true)?;
     clean_generated(out)?;
     clean_styles(out)?;
+    clean_project_output(out)?;
 
     for style in &styles {
         write_style(out, style)?;
+    }
+    for (slug, data) in &project_styles {
+        write_raw(out, slug, data)?;
     }
 
     for page in &pages {
@@ -443,6 +679,9 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
             std::fs::write(&pdf_target, pdf)?;
             make_public(&pdf_target, false)?;
         }
+    }
+    for (slug, data) in &project_assets {
+        write_raw(out, slug, data)?;
     }
     if let Some(index_html) = index_html {
         let index_path = out.join(service::HOME_SLUG);
