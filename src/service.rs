@@ -586,6 +586,10 @@ mod tests {
             normalize_content_path("index.md", ContentFormat::Markdown).unwrap(),
             (HOME_SLUG.to_string(), ContentFormat::Markdown)
         );
+        assert_eq!(
+            normalize_content_path("/wiki.wj", ContentFormat::Wikidot).unwrap(),
+            ("wiki.html".to_string(), ContentFormat::Wikidot)
+        );
     }
 
     #[test]
@@ -670,5 +674,6 @@ mod tests {
         assert_eq!(source_path("index.html", ContentFormat::Markdown), "index.md");
         assert_eq!(source_path("eoe/index.html", ContentFormat::Typst), "eoe/index.typ");
         assert_eq!(source_path("reff/93df/l.html", ContentFormat::Html), "reff/93df/l.html");
+        assert_eq!(source_path("wiki.html", ContentFormat::Wikidot), "wiki.wj");
     }
 }

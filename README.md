@@ -22,8 +22,9 @@
 | markdown | pulldown-cmark,保留 raw HTML 透传 |
 | html | 原样注入模板,不做转义与过滤 |
 | typst | typst 编译为 HTML,并同时输出 PDF 供下载 |
+| wikidot | ftml 解析 Wikidot 语法并渲染 HTML,支持 `[[include]]`;项目因此按 AGPL-3.0 分发 |
 
-三种格式均不做内容限制,内容作者均为邀请注册的可信用户,因此允许存储型 XSS 是项目明确的取舍。
+这些格式均不做内容限制,内容作者均为邀请注册的可信用户,因此允许存储型 XSS 是项目明确的取舍。
 
 必须注意:**子域隔离本身并不能阻止攻击**。`c`(内容站) / `m`(管理端) / `api` 同属一个 eTLD+1(同站),`SameSite` Cookie 不会阻止同站跨源请求,CORS 也只阻止读取响应、不阻止带凭据的写请求被发出。因此后端对所有写接口增加了 Origin 白名单校验(仅放行管理端 origin),挡住内容站 XSS 冒用管理员会话发起写操作。这层防护仍以「内容作者可信」为前提;若要允许不可信作者,需要让 `api` 使用完全独立的站点(不同 eTLD+1)并对内容页加 CSP,而不是只靠子域划分。
 
@@ -190,6 +191,7 @@ cd admin && pnpm install && cp .env.example .env && pnpm dev
 - 内容路径允许嵌套目录,路径段只允许 Unicode 字母/数字、`-` `_`;目录主页用结尾 `/` 表示,例如 `/xef/` 归一化为 `xef/index.html`.页面可写 `/reff/93df/l.html`,也可写 `.md/.typ` 由扩展名决定格式,但最终都输出 `.html`,同一路径只保留一条.`/api` 与 `/api/...` 保留;`index.html` 固定为网站主页,可编辑不可删除.路径总长上限 512 字节、单段上限 200 字节;链接中的非 ASCII 路径段按 `%XX` 编码,磁盘文件名保持原始 UTF-8.
 - 模板与 API 共用同一套领域模型,避免两端口径漂移.
 - Typst 在当前进程内编译,由 `VirtualPath::resolve(root)` 加 canonicalize 双重校验把文件读取限制在 `CONTENT_ROOT` 内,避免内容作者通过 `#include` 读到构建机上的任意文件;父目录校验之外还会对目标文件本身做 `symlink_metadata` 判断,内容目录里的符号链接一律拒绝(否则 `link.png -> /etc/passwd` 会被 `fs::read` 跟进去).生产仍建议放进断网容器并加 CPU/内存限额,构建机上的 `.env` 与云凭据不要落在可读目录.
+- Wikidot 由 [ftml](https://docs.rs/ftml) 渲染,`[[include]]` 在构建时从数据库预取 Wikidot 页面并限制 8 层递归;`ftml` 是 AGPL-3.0,因此本项目也按 AGPL-3.0 分发,见 `LICENSE`.
 - 编译缓存尚未实现;目前每篇 Typst 内容会分别编译 `PagedDocument`(出 PDF)与 `HtmlDocument`(出 HTML)各一次.
 - 静态产物保持平台中立:只用相对路径、不写死域名,重定向与 404 分别在各平台配置.
 - 静态资源使用哈希文件名并长缓存,HTML 短缓存;压缩交给 CDN.
