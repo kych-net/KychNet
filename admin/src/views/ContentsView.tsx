@@ -181,6 +181,7 @@ export function ContentsView({ editContentId, onEditHandled }: Props) {
         </div>
       </form>
 
+      <div className="table-wrap">
       <table>
         <thead>
           <tr>
@@ -210,6 +211,7 @@ export function ContentsView({ editContentId, onEditHandled }: Props) {
           ))}
         </tbody>
       </table>
+      </div>
     </section>
   );
 }

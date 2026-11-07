@@ -326,6 +326,11 @@ button:disabled {
   margin-bottom: 0.75rem;
 }
 
+.table-wrap {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
 table {
   width: 100%;
   border-collapse: collapse;
@@ -485,4 +490,155 @@ td button {
 .dir-file::before {
   content: "· ";
   color: var(--border);
+}
+
+
+/* ---------- 移动端 / 窄屏 ---------- */
+@media (max-width: 720px) {
+  .shell .appbar {
+    flex-wrap: wrap;
+    gap: 0.5rem 0.65rem;
+    padding: 0.5rem 0.8rem;
+  }
+  .brand img {
+    height: 1.8rem;
+  }
+  .brand-mark {
+    width: 1.8rem;
+    height: 1.8rem;
+  }
+  .appnav {
+    order: 5;
+    flex: 1 0 100%;
+    justify-content: flex-start;
+    overflow-x: auto;
+    gap: 0.15rem;
+    padding-bottom: 0.1rem;
+    scrollbar-width: none;
+  }
+  .appnav::-webkit-scrollbar {
+    display: none;
+  }
+  .appnav button {
+    flex: 0 0 auto;
+    white-space: nowrap;
+    padding: 0.45rem 0.65rem;
+  }
+  .appactions {
+    margin-left: auto;
+    gap: 0.45rem;
+  }
+  .theme-button {
+    padding: 0.35rem 0.55rem;
+    font-size: 0.8rem;
+  }
+  .appmain {
+    padding: 0.85rem 0.75rem 3rem;
+  }
+  .appmain section {
+    padding: 1rem 0.85rem;
+    border-radius: 8px;
+  }
+  section h2 {
+    font-size: 1.05rem;
+  }
+  .row {
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+  .row > label {
+    min-width: 0;
+    width: 100%;
+  }
+  .row.align {
+    align-items: stretch;
+  }
+  .row.align > button {
+    width: 100%;
+    margin-bottom: 0.35rem;
+  }
+  .row.align > .checkbox {
+    margin-bottom: 0.35rem;
+  }
+  label input,
+  label select,
+  label textarea,
+  input,
+  select,
+  textarea {
+    font-size: 16px;
+  }
+  button {
+    min-height: 2.4rem;
+  }
+  .table-wrap {
+    margin-top: 1rem;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+  }
+  .table-wrap table {
+    margin-top: 0;
+    min-width: 36rem;
+  }
+  .table-wrap th,
+  .table-wrap td {
+    white-space: nowrap;
+  }
+  .table-wrap td:first-child {
+    white-space: normal;
+    min-width: 8rem;
+  }
+  .dir-tree-panel {
+    left: 0.8rem;
+    width: calc(100vw - 1.6rem);
+    max-height: calc(100vh - 8rem);
+  }
+  .avatar-menu {
+    right: 0;
+  }
+  .auth {
+    max-width: none;
+    margin: 2rem 0.85rem;
+    padding: 1.25rem;
+  }
+  .auth h1 {
+    font-size: 1.25rem;
+  }
+  .tabs {
+    gap: 0.35rem;
+  }
+  .tabs button {
+    padding: 0.5rem 0.35rem;
+    font-size: 0.85rem;
+  }
+  .editor-toolbar {
+    font-size: 0.75rem;
+  }
+  .editor-shell .cm-editor {
+    min-height: 15rem;
+  }
+  .code-editor .cm-scroller {
+    max-height: 45vh;
+  }
+  .build-log {
+    font-size: 0.75rem;
+  }
+}
+
+@media (max-width: 380px) {
+  .appbar {
+    padding-left: 0.6rem;
+    padding-right: 0.6rem;
+  }
+  .appactions {
+    gap: 0.3rem;
+  }
+  .theme-button {
+    padding-left: 0.4rem;
+    padding-right: 0.4rem;
+  }
+  .avatar {
+    width: 1.95rem;
+    height: 1.95rem;
+  }
 }
