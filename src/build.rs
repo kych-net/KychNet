@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 use askama::Template;
 use sqlx::PgPool;
+use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::models::SiteSettings;
+use crate::models::{Content, ContentFormat, SiteSettings};
 use crate::{config::Config, render, service};
 
 #[derive(Template)]
@@ -12,6 +13,7 @@ struct IndexTemplate {
     site: SiteSettings,
     admin_url: String,
     posts: Vec<PostLink>,
+    tree: String,
 }
 
 struct PostLink {
@@ -29,6 +31,7 @@ struct PageTemplate {
     date: String,
     content: String,
     pdf_url: String,
+    tree: String,
 }
 
 /// 一篇已经渲染完成的页面，先留在内存里，等全部成功后再统一落盘。
@@ -40,15 +43,90 @@ struct BuiltPage {
     pdf: Option<Vec<u8>>,
 }
 
-/// 把 slug 编码成 URL 路径段：非 ASCII 字节转成 `%XX`，ASCII 字母数字与 `-` `_` 原样保留。
-///
-/// slug 现在允许中文等 Unicode 字符，磁盘上的文件名保持原始 UTF-8，
-/// 但 HTML 里的链接必须是合法 URL；静态服务器收到请求后会解码再按原始文件名查找，
-/// 两端因此一致。不做编码的话，部分 CDN 会把原始多字节路径当成找不到资源。
-fn url_path_segment(slug: &str) -> String {
-    let mut out = String::with_capacity(slug.len());
-    for &byte in slug.as_bytes() {
-        if byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' {
+/// 目录树节点。目录和文件分开存：目录名没有扩展名，文件名保留源格式扩展名。
+#[derive(Default)]
+struct TreeNode {
+    dirs: BTreeMap<String, TreeNode>,
+    files: Vec<TreeFile>,
+}
+
+struct TreeFile {
+    name: String,
+    title: String,
+    url: String,
+}
+
+impl TreeNode {
+    fn insert(&mut self, slug: &str, content: &Content) {
+        let parts: Vec<&str> = slug.split('/').collect();
+        let mut node = self;
+        for (index, part) in parts.iter().enumerate() {
+            if index + 1 == parts.len() {
+                node.files.push(TreeFile {
+                    name: source_filename(slug, content.format()),
+                    title: content.title.clone(),
+                    url: content_url(slug),
+                });
+            } else {
+                node = node.dirs.entry((*part).to_string()).or_default();
+            }
+        }
+    }
+
+    fn sort(&mut self) {
+        self.files.sort_by(|a, b| a.name.cmp(&b.name));
+        for dir in self.dirs.values_mut() {
+            dir.sort();
+        }
+    }
+
+    fn render(&self) -> String {
+        let mut out = String::from("<ul class=\"dir-tree\">");
+        self.render_into(&mut out);
+        out.push_str("</ul>");
+        out
+    }
+
+    fn render_into(&self, out: &mut String) {
+        for (name, dir) in &self.dirs {
+            out.push_str("<li class=\"dir\"><button class=\"dir-toggle\" type=\"button\" aria-expanded=\"false\">");
+            out.push_str(&escape_html(name));
+            out.push_str("</button><ul class=\"dir-children\" hidden>");
+            dir.render_into(out);
+            out.push_str("</ul></li>");
+        }
+        for file in &self.files {
+            out.push_str("<li class=\"file\"><a href=\"");
+            out.push_str(&escape_html(&file.url));
+            out.push_str("\" title=\"");
+            out.push_str(&escape_html(&file.title));
+            out.push_str("\">");
+            out.push_str(&escape_html(&file.name));
+            out.push_str("</a></li>");
+        }
+    }
+}
+
+fn escape_html(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// 把单个路径段编码成 URL 片段：非 ASCII 字节转成 `%XX`，ASCII 字母数字与 `-` `_` 原样保留。
+fn encode_segment(segment: &str) -> String {
+    let mut out = String::with_capacity(segment.len());
+    for &byte in segment.as_bytes() {
+        if byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' || byte == b'.' {
             out.push(byte as char);
         } else {
             out.push_str(&format!("%{byte:02X}"));
@@ -57,28 +135,73 @@ fn url_path_segment(slug: &str) -> String {
     out
 }
 
+fn encode_path(path: &str) -> String {
+    path.split('/')
+        .map(encode_segment)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// 输出路径对应的公开 URL。目录主页会得到 `/xef/`，主页得到 `/`。
+fn content_url(slug: &str) -> String {
+    if slug == service::HOME_SLUG {
+        return "/".to_string();
+    }
+    if let Some(dir) = slug.strip_suffix("/index.html") {
+        return format!("/{}/", encode_path(dir));
+    }
+    format!("/{}", encode_path(slug))
+}
+
+fn pdf_path(slug: &str) -> String {
+    match slug.strip_suffix(".html") {
+        Some(stem) => format!("{stem}.pdf"),
+        None => format!("{slug}.pdf"),
+    }
+}
+
+fn source_filename(slug: &str, format: ContentFormat) -> String {
+    service::source_path(slug, format)
+        .rsplit('/')
+        .next()
+        .unwrap_or(slug)
+        .to_string()
+}
+
 pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
     let settings = service::get_settings(pool).await?;
-    let contents = service::list_published(pool).await?;
+    let all = service::list_published(pool).await?;
 
-    // 先把所有页面渲染到内存。旧实现边渲染边写盘，一旦某篇 Typst 编译失败，
-    // 就会留下半套站点；现在任何一篇失败都不会触碰磁盘。
+    let contents: Vec<Content> = all
+        .into_iter()
+        .filter(|content| {
+            if service::valid_content_slug(&content.slug) {
+                true
+            } else {
+                // 历史脏数据不该让整站构建永久失败。新增数据已在 save_content 拦住，
+                // 这里只作兜底：跳过并告警，索引和目录树里也不会出现它。
+                tracing::warn!("跳过非法 slug: {:?}", content.slug);
+                false
+            }
+        })
+        .collect();
+
+    let mut tree = TreeNode::default();
+    for content in &contents {
+        tree.insert(&content.slug, content);
+    }
+    tree.sort();
+    let tree_html = tree.render();
+
+    // 先把所有页面渲染到内存。任何一篇 Typst 编译失败都不会触碰磁盘。
     let mut pages = Vec::new();
-    for content in contents {
-        if !service::valid_slug(&content.slug) {
-            // 历史脏数据不该让整站构建永久失败。新增数据已在 save_content 拦住，
-            // 这里只作兜底：跳过并告警，索引里也不会出现它。
-            tracing::warn!("跳过非法 slug: {:?}", content.slug);
-            continue;
-        }
-
+    for content in &contents {
         let rendered = render::render(content.format(), &content.body, &cfg.content_root)
             .with_context(|| format!("渲染 {} 失败", content.slug))?;
 
         let date = content.updated_at.format("%Y-%m-%d").to_string();
-        let encoded_slug = url_path_segment(&content.slug);
         let pdf_url = if rendered.pdf.is_some() {
-            format!("/posts/{encoded_slug}.pdf")
+            format!("/{}", encode_path(&pdf_path(&content.slug)))
         } else {
             String::new()
         };
@@ -89,51 +212,99 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
             date: date.clone(),
             content: rendered.html,
             pdf_url,
+            tree: tree_html.clone(),
         };
-        let html = page.render()?;
-
         pages.push(BuiltPage {
-            slug: content.slug,
-            title: content.title,
+            slug: content.slug.clone(),
+            title: content.title.clone(),
             date,
-            html,
+            html: page.render()?,
             pdf: rendered.pdf,
         });
     }
 
-    let mut links: Vec<PostLink> = pages
-        .iter()
-        .map(|page| PostLink {
-            title: page.title.clone(),
-            href: format!("/posts/{}.html", url_path_segment(&page.slug)),
-            date: page.date.clone(),
-        })
-        .collect();
-    links.sort_by(|a, b| b.date.cmp(&a.date));
-
-    let index = IndexTemplate {
-        site: settings,
-        admin_url: cfg.admin_origin.clone(),
-        posts: links,
+    // 只有数据库里没有主页内容时才回退到自动文章列表。
+    // 正常情况下 index.html 是内容，且 API 禁止删除。
+    let index_html = if pages.iter().any(|page| page.slug == service::HOME_SLUG) {
+        None
+    } else {
+        let mut links: Vec<PostLink> = pages
+            .iter()
+            .map(|page| PostLink {
+                title: page.title.clone(),
+                href: content_url(&page.slug),
+                date: page.date.clone(),
+            })
+            .collect();
+        links.sort_by(|a, b| b.date.cmp(&a.date));
+        Some(
+            IndexTemplate {
+                site: settings,
+                admin_url: cfg.admin_origin.clone(),
+                posts: links,
+                tree: tree_html,
+            }
+            .render()?,
+        )
     };
-    let index_html = index.render()?;
 
-    // 全部渲染成功后才清理旧产物：删除内容或改 slug 后，旧 .html / .pdf 不再残留。
-    // 只清理本程序生成的 posts/ 与 index.html，不动目录里可能存在的其它资源。
+    // 全部渲染成功后才清理旧产物：删除内容、改路径后，旧 .html / .pdf 不再残留。
+    // 只删除本程序生成的文件，保留目录里可能存在的其它资源。
     std::fs::create_dir_all(out)?;
-    let posts_dir = out.join("posts");
-    if posts_dir.exists() {
-        std::fs::remove_dir_all(&posts_dir)?;
-    }
-    std::fs::create_dir_all(&posts_dir)?;
+    clean_generated(out)?;
 
     for page in &pages {
-        std::fs::write(posts_dir.join(format!("{}.html", page.slug)), &page.html)?;
+        let target = out.join(&page.slug);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&target, &page.html)?;
         if let Some(pdf) = &page.pdf {
-            std::fs::write(posts_dir.join(format!("{}.pdf", page.slug)), pdf)?;
+            let pdf_target = out.join(pdf_path(&page.slug));
+            if let Some(parent) = pdf_target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(pdf_target, pdf)?;
         }
     }
-    std::fs::write(out.join("index.html"), index_html)?;
+    if let Some(index_html) = index_html {
+        std::fs::write(out.join(service::HOME_SLUG), index_html)?;
+    }
+    Ok(())
+}
+
+/// 删除 dist 下旧的 HTML/PDF 产物，并移除因此变空的目录；其它资源保留。
+fn clean_generated(root: &Path) -> Result<()> {
+    fn clean_dir(dir: &Path) -> Result<bool> {
+        let mut empty = true;
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                if clean_dir(&path)? {
+                    std::fs::remove_dir(&path)?;
+                } else {
+                    empty = false;
+                }
+            } else if file_type.is_file() {
+                let keep = match path.extension().and_then(|ext| ext.to_str()) {
+                    Some(ext) if ext.eq_ignore_ascii_case("html") || ext.eq_ignore_ascii_case("pdf") => {
+                        std::fs::remove_file(&path)?;
+                        false
+                    }
+                    _ => true,
+                };
+                if keep {
+                    empty = false;
+                }
+            } else {
+                empty = false;
+            }
+        }
+        Ok(empty)
+    }
+    clean_dir(root)?;
     Ok(())
 }
 
@@ -147,14 +318,16 @@ mod tests {
 
     #[test]
     fn index_and_page_templates_render() {
+        let tree = "<ul class=\"dir-tree\"></ul>".to_string();
         let index = IndexTemplate {
             site: settings(),
             admin_url: "https://m.kych.net".into(),
             posts: vec![PostLink {
                 title: "第一篇".into(),
-                href: "/posts/hello.html".into(),
+                href: "/hello.html".into(),
                 date: "2026-11-06".into(),
             }],
+            tree: tree.clone(),
         };
         let html = index.render().unwrap();
         assert!(html.contains("第一篇"));
@@ -166,7 +339,8 @@ mod tests {
             title: "标题".into(),
             date: "2026-11-06".into(),
             content: "<p>正文</p>".into(),
-            pdf_url: "/posts/demo.pdf".into(),
+            pdf_url: "/demo.pdf".into(),
+            tree,
         };
         let html = page.render().unwrap();
         assert!(html.contains("<p>正文</p>"));
@@ -175,9 +349,51 @@ mod tests {
     }
 
     #[test]
-    fn encodes_unicode_slug_for_url() {
-        assert_eq!(url_path_segment("你好"), "%E4%BD%A0%E5%A5%BD");
-        assert_eq!(url_path_segment("café"), "caf%C3%A9");
-        assert_eq!(url_path_segment("a-b_1"), "a-b_1");
+    fn encodes_unicode_segments_for_url() {
+        assert_eq!(content_url("你好.html"), "/%E4%BD%A0%E5%A5%BD.html");
+        assert_eq!(content_url("café.html"), "/caf%C3%A9.html");
+        assert_eq!(content_url("a-b_1.html"), "/a-b_1.html");
+        assert_eq!(content_url("index.html"), "/");
+        assert_eq!(content_url("xef/index.html"), "/xef/");
+        assert_eq!(content_url("reff/93df/l.html"), "/reff/93df/l.html");
+        assert_eq!(content_url("你好/index.html"), "/%E4%BD%A0%E5%A5%BD/");
+    }
+
+    #[test]
+    fn tree_renders_directories_and_files() {
+        let mut tree = TreeNode::default();
+        let content = |slug: &str, title: &str| Content {
+            id: uuid::Uuid::new_v4(),
+            slug: slug.to_string(),
+            title: title.to_string(),
+            format: "markdown".into(),
+            body: String::new(),
+            published: true,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        tree.insert("index.html", &content("index.html", "主页"));
+        tree.insert("xef/index.html", &content("xef/index.html", "xef"));
+        tree.insert("xef/a.html", &content("xef/a.html", "A"));
+        tree.sort();
+        let html = tree.render();
+        assert!(html.contains("dir-toggle"));
+        assert!(html.contains("href=\"/xef/\""));
+        assert!(html.contains("href=\"/xef/a.html\""));
+        assert!(html.contains("index.md"));
+    }
+
+    #[test]
+    fn cleans_only_generated_files() {
+        let base = std::env::temp_dir().join(format!("kych-net-build-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("old")).unwrap();
+        std::fs::write(base.join("old/page.html"), "old").unwrap();
+        std::fs::write(base.join("old/page.pdf"), "old").unwrap();
+        std::fs::write(base.join("asset.png"), "keep").unwrap();
+        clean_generated(&base).unwrap();
+        assert!(!base.join("old").exists());
+        assert!(base.join("asset.png").exists());
+        std::fs::remove_dir_all(&base).ok();
     }
 }

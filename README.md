@@ -29,8 +29,8 @@
 
 ## 界面
 
-- 内容端顶栏:左侧站点图标,中间为可编辑导航链接(管理端「站点设置」维护),右侧为主题切换与管理端入口.
-- 管理端顶栏:左侧站点图标,中间为功能导航(内容/邀请码/用户/站点设置),右侧为头像菜单(用户设置/网站管理/前往内容端)与主题切换.
+- 内容端顶栏:左侧站点图标,图标右侧为目录树按钮,中间为可编辑导航链接(管理端「站点设置」维护),右侧为主题切换与管理端入口.
+- 管理端顶栏:左侧站点图标,图标右侧为目录树按钮,中间为功能导航(内容/邀请码/用户/站点设置),右侧为头像菜单(用户设置/网站管理/前往内容端)与主题切换.
 - 两端共用浅色、深色两套主题,基于 CSS 变量实现,选择持久化在 localStorage.
 - 用户头像为上传的 SVG 文件,由服务端校验确为纯矢量:必须是合法 XML 且根元素为 `svg`,至少包含一个矢量图形,禁止内嵌/外链位图、`<script>`、`<foreignObject>`、事件属性、DTD 与实体声明、`<animate>`/`<set>` 等属性动画元素,`href` 只允许指向文档内图元(`#xxx`);内容上限 256 KB,传输上限 257 KB.
 
@@ -178,7 +178,7 @@ cd admin && pnpm install && cp .env.example .env && pnpm dev
 1. [.github/workflows/build.yml](.github/workflows/build.yml) 在 push、PR 和手动触发时运行测试,并编译 Linux 二进制;推送 `v*` 标签时自动创建 Release.
    - `x86_64-unknown-linux-gnu`:依赖系统 glibc,在 Ubuntu 22.04 上构建.
    - `x86_64-unknown-linux-musl`:静态链接,启用 `vendored-openssl` 特性,适配 Alpine 与老版本发行版.
-2. 先执行 `kych-net db migrate`,再执行 `kych-net build --out dist`,生成静态产物;Typst 页面同时产出 `.pdf`.构建会先渲染到内存,全部成功后才清理并重写 `posts/` 与 `index.html`,中途失败不会破坏现有站点.
+2. 先执行 `kych-net db migrate`,再执行 `kych-net build --out dist`,生成静态产物;Typst 页面同时产出 `.pdf`.构建会先渲染到内存,全部成功后才清理旧的 `.html/.pdf` 并写入新路径(不再统一放 `posts/`),中途失败不会破坏现有站点.
 3. `dist/` 同时发布到 Cloudflare Pages 与 EdgeOne Pages.
 4. 管理前端构建为静态产物,单独发布.
 5. 媒体资源放在单一对象存储源,由两家 CDN 回源同一份.
@@ -187,7 +187,7 @@ cd admin && pnpm install && cp .env.example .env && pnpm dev
 
 - 内容以数据库为唯一事实源,构建直接读库,不调用线上 API.
 - 站点名称、图标与顶栏导航存于 `site_settings`,由管理端编辑,构建时读取.
-- 内容 slug 允许任意 Unicode 字母与数字(中文、日文等)以及 `-` `_`;禁止空格、标点、路径分隔符 `/` `\`、点号 `.`、URL 保留字符(`?` `#` `%` 等)与控制字符,UTF-8 长度上限 180 字节.写入时即校验,避免脏数据卡死构建.链接中的非 ASCII slug 会按 `%XX` 编码,磁盘文件名仍是原始 UTF-8;带变音符号的文字请使用 NFC 预组合形式.
+- 内容路径允许嵌套目录,路径段只允许 Unicode 字母/数字、`-` `_`;目录主页用结尾 `/` 表示,例如 `/xef/` 归一化为 `xef/index.html`.页面可写 `/reff/93df/l.html`,也可写 `.md/.typ` 由扩展名决定格式,但最终都输出 `.html`,同一路径只保留一条.`/api` 与 `/api/...` 保留;`index.html` 固定为网站主页,可编辑不可删除.路径总长上限 512 字节、单段上限 200 字节;链接中的非 ASCII 路径段按 `%XX` 编码,磁盘文件名保持原始 UTF-8.
 - 模板与 API 共用同一套领域模型,避免两端口径漂移.
 - Typst 在当前进程内编译,由 `VirtualPath::resolve(root)` 加 canonicalize 双重校验把文件读取限制在 `CONTENT_ROOT` 内,避免内容作者通过 `#include` 读到构建机上的任意文件;父目录校验之外还会对目标文件本身做 `symlink_metadata` 判断,内容目录里的符号链接一律拒绝(否则 `link.png -> /etc/passwd` 会被 `fs::read` 跟进去).生产仍建议放进断网容器并加 CPU/内存限额,构建机上的 `.env` 与云凭据不要落在可读目录.
 - 编译缓存尚未实现;目前每篇 Typst 内容会分别编译 `PagedDocument`(出 PDF)与 `HtmlDocument`(出 HTML)各一次.

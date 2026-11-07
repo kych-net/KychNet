@@ -760,22 +760,22 @@ async fn save_content(
     Json(req): Json<ContentRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
     current_user(&state, &session).await?;
-    if crate::models::ContentFormat::parse(&req.format).is_none() {
+    let Some(format) = crate::models::ContentFormat::parse(&req.format) else {
         api_bail!("format 只能是 markdown、html 或 typst");
-    }
-    // slug 直接拼进 dist/posts/<slug>.html，必须在写入时就校验。
-    // 过去只在 build 阶段 bail，一条 `a/b` 就会让整站永久构建失败。
-    if !service::valid_slug(&req.slug) {
-        api_bail!("slug 只能包含 Unicode 字母/数字、- 和 _,不能含空格、标点、路径分隔符等特殊字符,且不超过 180 字节");
-    }
+    };
+    // 路径在这里归一化成输出路径：
+    //   /xef/ -> xef/index.html
+    //   /eoe/index.md -> eoe/index.html
+    // 同一路径只有一条记录，因此 .html/.md/.typ 天然互斥。
+    let (slug, format) = service::normalize_content_path(&req.slug, format)?;
     if req.title.trim().is_empty() || req.title.chars().count() > 200 {
         api_bail!("标题需为 1-200 个字符");
     }
     let content = service::upsert_content(
         &state.pool,
-        &req.slug,
+        &slug,
         &req.title,
-        &req.format,
+        format.as_str(),
         &req.body,
         req.published,
     )
@@ -789,6 +789,13 @@ async fn delete_content(
     Path(id): Path<Uuid>,
 ) -> ApiResult<StatusCode> {
     current_user(&state, &session).await?;
+    let slug: Option<String> = sqlx::query_scalar("SELECT slug FROM contents WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await?;
+    if slug.as_deref() == Some(service::HOME_SLUG) {
+        api_reject!(StatusCode::FORBIDDEN, "网站主页不能删除，只能编辑");
+    }
     sqlx::query("DELETE FROM contents WHERE id = $1")
         .bind(id)
         .execute(&state.pool)
