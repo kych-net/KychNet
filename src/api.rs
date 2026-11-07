@@ -29,6 +29,7 @@ use crate::auth::{self, Auth};
 use crate::build;
 use crate::config::Config;
 use crate::models::{ContentFormat, SiteSettings, User};
+use crate::oauth;
 use crate::rate::RateLimiter;
 use crate::render;
 use crate::service;
@@ -61,19 +62,19 @@ const AVATAR_MAX_BODY_BYTES: usize = 256 * 1024 + 1024;
 const SESSION_TTL: time::Duration = time::Duration::hours(8);
 
 #[derive(Clone)]
-struct AppState {
-    pool: PgPool,
-    auth: Arc<Auth>,
-    site_url: String,
-    limits: RateLimiter,
-    trust_proxy_headers: bool,
+pub(crate) struct AppState {
+    pub(crate) pool: PgPool,
+    pub(crate) auth: Arc<Auth>,
+    pub(crate) site_url: String,
+    pub(crate) limits: RateLimiter,
+    pub(crate) trust_proxy_headers: bool,
     /// 预览 Markdown / Wikidot 时需要的字体与资源根目录。
-    content_root: PathBuf,
+    pub(crate) content_root: PathBuf,
     /// 管理端触发整站重建的协调器。构建独立成子进程跑，serve 自身
     /// 不引入 Typst 渲染逻辑（见 `BuildCtl` 注释）。
-    build_ctl: Arc<BuildCtl>,
+    pub(crate) build_ctl: Arc<BuildCtl>,
     /// Git LFS 二进制对象的落盘根目录。
-    lfs_root: PathBuf,
+    pub(crate) lfs_root: PathBuf,
 }
 
 /// 一次构建的执行结果快照。
@@ -379,6 +380,8 @@ macro_rules! api_reject {
 #[derive(Clone)]
 struct OriginPolicy {
     admin_origin: String,
+    /// OAuth 授权页/表单运行在 API 裸域上，允许该 origin 提交登录与同意表单。
+    self_origin: String,
 }
 
 /// 拒绝来自管理端以外 Origin 的状态变更请求。
@@ -410,7 +413,11 @@ async fn guard_origin(
         return next.run(req).await;
     };
 
-    if origin.trim_end_matches('/') == policy.admin_origin.trim_end_matches('/') {
+    let origin = origin.trim_end_matches('/');
+    if origin == policy.admin_origin.trim_end_matches('/')
+        || (req.uri().path().starts_with("/oauth/")
+            && origin == policy.self_origin.trim_end_matches('/'))
+    {
         return next.run(req).await;
     }
 
@@ -1311,6 +1318,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
 
     let origin_policy = OriginPolicy {
         admin_origin: cfg.admin_origin.clone(),
+        self_origin: format!("https://{}", cfg.rp_id),
     };
 
     // MCP 路由需要的共享资源先克隆出来：state 在 with_state 时会被 move，
@@ -1320,6 +1328,14 @@ pub async fn serve(cfg: Config) -> Result<()> {
 
     let app = Router::new()
         .route("/api/health", get(|| async { Json(json!({"ok": true})) }))
+        .route("/.well-known/oauth-protected-resource", get(oauth::protected_resource))
+        .route("/.well-known/oauth-protected-resource/mcp", get(oauth::protected_resource))
+        .route("/.well-known/oauth-authorization-server", get(oauth::authorization_server))
+        .route("/oauth/register", post(oauth::register))
+        .route("/oauth/authorize", get(oauth::authorize))
+        .route("/oauth/login", post(oauth::login))
+        .route("/oauth/approve", post(oauth::approve))
+        .route("/oauth/token", post(oauth::token))
         .route("/api/auth/register", post(register))
         .route("/api/auth/register/finish", post(finish_registration))
         .route("/api/auth/login/start", post(login_start))
@@ -1430,32 +1446,20 @@ pub async fn serve(cfg: Config) -> Result<()> {
         ))
         .layer(TraceLayer::new_for_http());
 
-    // MCP 只读内容接口：设置 MCP_TOKEN 才挂载。merge 放在主应用 layer 链之后，
-    // /mcp 不沾会话、CORS、Origin 白名单这些浏览器侧的层，鉴权与限流由
-    // mcp::router 自带（Bearer token + 按 IP 限流），口径与 client_ip 一致。
-    let app = if let Some(token) = cfg.mcp_token.clone() {
-        let mcp_actor = sqlx::query_as::<_, User>(
-            "SELECT * FROM users WHERE is_admin AND NOT disabled ORDER BY created_at LIMIT 1",
-        )
-        .fetch_optional(&state_pool_for_mcp)
-        .await?;
-        let mcp_state = crate::mcp::KychMcp::new(
-            state_pool_for_mcp.clone(),
-            cfg.content_root.clone(),
-            cfg.site_url.clone(),
-            mcp_actor,
-            cfg.build_out_dir.clone(),
-            std::env::current_exe()?,
-        );
-        app.merge(crate::mcp::router(
-            mcp_state,
-            token,
-            state_limits_for_mcp,
-            cfg.trust_proxy_headers,
-        ))
-    } else {
-        app
-    };
+    // MCP Streamable HTTP：鉴权由 MCP 自己按 OAuth access token 校验。
+    let mcp_state = crate::mcp::KychMcp::new(
+        state_pool_for_mcp.clone(),
+        cfg.content_root.clone(),
+        cfg.site_url.clone(),
+        cfg.build_out_dir.clone(),
+        std::env::current_exe()?,
+    );
+    let app = app.merge(crate::mcp::router(
+        mcp_state,
+        state_pool_for_mcp.clone(),
+        state_limits_for_mcp,
+        cfg.trust_proxy_headers,
+    ));
 
     let listener = tokio::net::TcpListener::bind(&cfg.bind).await?;
     tracing::info!("API 监听 {}", cfg.bind);
