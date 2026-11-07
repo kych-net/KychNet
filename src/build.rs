@@ -170,6 +170,38 @@ fn source_filename(slug: &str, format: ContentFormat) -> String {
         .to_string()
 }
 
+/// 管理端触发的重建运行在 UMask=0077 的服务进程里，新文件默认 600/700，
+/// nginx 会直接 403。这里在写完后显式修正为 755/644。
+#[cfg(unix)]
+fn make_public(path: &Path, directory: bool) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = std::fs::metadata(path)?.permissions();
+    permissions.set_mode(if directory { 0o755 } else { 0o644 });
+    std::fs::set_permissions(path, permissions)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_public(_path: &Path, _directory: bool) -> Result<()> {
+    Ok(())
+}
+
+fn make_parent_dirs_public(out: &Path, parent: &Path) -> Result<()> {
+    let mut current = Some(parent);
+    while let Some(dir) = current {
+        if dir == out {
+            make_public(dir, true)?;
+            break;
+        }
+        if !dir.starts_with(out) {
+            break;
+        }
+        make_public(dir, true)?;
+        current = dir.parent();
+    }
+    Ok(())
+}
+
 pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
     let settings = service::get_settings(pool).await?;
     let all = service::list_published(pool).await?;
@@ -271,24 +303,31 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
     // 全部渲染成功后才清理旧产物：删除内容、改路径后，旧 .html / .pdf 不再残留。
     // 只删除本程序生成的文件，保留目录里可能存在的其它资源。
     std::fs::create_dir_all(out)?;
+    make_public(out, true)?;
     clean_generated(out)?;
 
     for page in &pages {
         let target = out.join(&page.slug);
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
+            make_parent_dirs_public(out, parent)?;
         }
         std::fs::write(&target, &page.html)?;
+        make_public(&target, false)?;
         if let Some(pdf) = &page.pdf {
             let pdf_target = out.join(pdf_path(&page.slug));
             if let Some(parent) = pdf_target.parent() {
                 std::fs::create_dir_all(parent)?;
+                make_parent_dirs_public(out, parent)?;
             }
-            std::fs::write(pdf_target, pdf)?;
+            std::fs::write(&pdf_target, pdf)?;
+            make_public(&pdf_target, false)?;
         }
     }
     if let Some(index_html) = index_html {
-        std::fs::write(out.join(service::HOME_SLUG), index_html)?;
+        let index_path = out.join(service::HOME_SLUG);
+        std::fs::write(&index_path, index_html)?;
+        make_public(&index_path, false)?;
     }
     Ok(())
 }
@@ -414,6 +453,23 @@ mod tests {
         clean_generated(&base).unwrap();
         assert!(!base.join("old").exists());
         assert!(base.join("asset.png").exists());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_files_are_readable_by_nginx() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("kych-net-perm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("nested")).unwrap();
+        std::fs::write(base.join("nested/page.html"), "x").unwrap();
+        std::fs::set_permissions(base.join("nested/page.html"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(base.join("nested"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        make_parent_dirs_public(&base, &base.join("nested")).unwrap();
+        make_public(&base.join("nested/page.html"), false).unwrap();
+        assert_eq!(std::fs::metadata(base.join("nested")).unwrap().permissions().mode() & 0o777, 0o755);
+        assert_eq!(std::fs::metadata(base.join("nested/page.html")).unwrap().permissions().mode() & 0o777, 0o644);
         std::fs::remove_dir_all(&base).ok();
     }
 }
