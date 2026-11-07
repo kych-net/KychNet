@@ -174,7 +174,7 @@ export PATH=/usr/local/bin:$PATH            # 通常已默认包含
 {
   "mcpServers": {
     "kych-net": {
-      "url": "https://api.kych.net/mcp",
+      "url": "https://kych.net/mcp",
       "headers": { "Authorization": "Bearer <MCP_TOKEN>" }
     }
   }
