@@ -3,8 +3,8 @@
 //! MCP 客户端先访问 `/mcp` 得到 401 和资源元数据，再通过动态注册拿 client_id，
 //! 走授权码 + PKCE，最后用 access token 调 `/mcp`。不再接受任何静态 token。
 
-use axum::extract::{Query, State};
-use axum::http::{header, StatusCode};
+use axum::extract::{ConnectInfo, Query, State};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::{Form, Json};
 use base64::Engine;
@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tower_sessions::Session;
 use url::Url;
+use std::net::SocketAddr;
 use uuid::Uuid;
 
 use crate::api::AppState;
@@ -27,11 +28,42 @@ const OAUTH_ORIGIN: &str = "https://kych.net";
 const SCOPES: &str = "content:read content:write project:read project:write";
 const ACCESS_TTL_SECS: i64 = 3600;
 const REFRESH_TTL_SECS: i64 = 30 * 24 * 3600;
+const OAUTH_LOGIN_PER_IP: (u32, u64) = (10, 60);
+const OAUTH_LOGIN_PER_USER: (u32, u64) = (5, 900);
+const OAUTH_REGISTER_PER_IP: (u32, u64) = (10, 60);
 
 fn random_token(bytes: usize) -> String {
     let mut raw = vec![0u8; bytes];
     OsRng.fill_bytes(&mut raw);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
+}
+
+fn oauth_ip(state: &AppState, headers: &HeaderMap, peer: SocketAddr) -> String {
+    if state.trust_proxy_headers {
+        if let Some(value) = headers
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok())
+        {
+            if let Some(first) = value.split(',').next().map(str::trim) {
+                if !first.is_empty() {
+                    return first.to_ascii_lowercase();
+                }
+            }
+        }
+    }
+    peer.ip().to_string()
+}
+
+fn too_many(retry_after: std::time::Duration) -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(
+            header::RETRY_AFTER,
+            retry_after.as_secs().max(1).to_string(),
+        )],
+        "请求过于频繁，请稍后再试",
+    )
+        .into_response()
 }
 
 fn hash_token(token: &str) -> Vec<u8> {
@@ -88,11 +120,15 @@ fn login_page(f: &OAuthFields, error: Option<&str>) -> Html<String> {
     let error = error
         .map(|message| format!("<p class=\"error\">{}</p>", html_escape(message)))
         .unwrap_or_default();
+    let next = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("next", &authorize_query(f))
+        .finish();
     page(
         "登录 KychNet MCP",
         &format!(
-            r#"<h1>登录 KychNet MCP</h1><p class="muted">客户端正在请求访问站点。请使用管理员或成员账号登录。</p>{error}<form method="post" action="/oauth/login">{hidden}<label>用户名<input name="username" autocomplete="username" required></label><label>动态验证码<input name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{{6}}" required></label><button type="submit">登录并继续</button></form>"#,
-            hidden = hidden_fields(f)
+            r#"<h1>登录 KychNet MCP</h1><p class="muted">客户端正在请求访问站点。请使用管理员或成员账号登录。</p>{error}<form method="post" action="/oauth/login">{hidden}<label>用户名<input name="username" autocomplete="username" required></label><label>动态验证码<input name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{{6}}" required></label><button type="submit">登录并继续</button></form><p class="muted">使用通行密钥：<a href="https://m.kych.net/?{next}">先在管理端登录，再返回授权</a></p>"#,
+            hidden = hidden_fields(f),
+            next = html_escape(&next),
         ),
     )
 }
@@ -275,9 +311,26 @@ pub async fn authorize(
 
 pub async fn login(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     session: Session,
     Form(form): Form<LoginForm>,
 ) -> Response {
+    let ip = oauth_ip(&state, &headers, peer);
+    if let Some(retry_after) = state
+        .limits
+        .check(&format!("oauth:login:ip:{ip}"), OAUTH_LOGIN_PER_IP.0, std::time::Duration::from_secs(OAUTH_LOGIN_PER_IP.1))
+    {
+        return too_many(retry_after);
+    }
+    let user_key = form.username.trim().to_lowercase();
+    if let Some(retry_after) = state.limits.check(
+        &format!("oauth:login:user:{user_key}"),
+        OAUTH_LOGIN_PER_USER.0,
+        std::time::Duration::from_secs(OAUTH_LOGIN_PER_USER.1),
+    ) {
+        return too_many(retry_after);
+    }
     let fields = form.fields();
     if let Err(error) = validate_authorize(&state, &fields).await {
         return (StatusCode::BAD_REQUEST, Html(html_escape(&error))).into_response();
@@ -387,8 +440,17 @@ fn valid_redirect_uri(raw: &str) -> bool {
 
 pub async fn register(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<RegisterRequest>,
 ) -> Response {
+    let ip = oauth_ip(&state, &headers, peer);
+    if let Some(retry_after) = state
+        .limits
+        .check(&format!("oauth:register:ip:{ip}"), OAUTH_REGISTER_PER_IP.0, std::time::Duration::from_secs(OAUTH_REGISTER_PER_IP.1))
+    {
+        return too_many(retry_after);
+    }
     if req.redirect_uris.is_empty() || req.redirect_uris.len() > 5 {
         return (StatusCode::BAD_REQUEST, Json(json!({"error":"invalid_redirect_uri"}))).into_response();
     }
@@ -590,6 +652,34 @@ pub async fn authorization_server() -> Json<Value> {
         "token_endpoint_auth_methods_supported": ["none"],
         "scopes_supported": SCOPES.split(' ').collect::<Vec<_>>()
     }))
+}
+
+/// 清理过期授权码、失效 token 和长期未使用的客户端；启动时执行一次即可。
+pub async fn gc(pool: &PgPool) -> anyhow::Result<()> {
+    sqlx::query(
+        "DELETE FROM oauth_codes
+         WHERE expires_at < now() - interval '1 day'
+            OR (used_at IS NOT NULL AND used_at < now() - interval '1 day')",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "DELETE FROM oauth_tokens
+         WHERE (access_expires_at < now()
+                AND (refresh_expires_at IS NULL OR refresh_expires_at < now()))
+            OR (revoked_at IS NOT NULL AND revoked_at < now() - interval '30 days')",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "DELETE FROM oauth_clients c
+         WHERE c.created_at < now() - interval '90 days'
+           AND NOT EXISTS (SELECT 1 FROM oauth_tokens t WHERE t.client_id = c.client_id)
+           AND NOT EXISTS (SELECT 1 FROM oauth_codes k WHERE k.client_id = c.client_id)",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]

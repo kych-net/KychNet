@@ -24,6 +24,15 @@ function withTimeout<T>(promise: Promise<T>, milliseconds: number): Promise<T> {
   });
 }
 
+function completeLogin(user: User, onLogin: (user: User) => void) {
+  onLogin(user);
+  // OAuth 授权页会带 next 参数把用户送到管理端登录；只允许回跳本站授权地址。
+  const next = new URLSearchParams(window.location.search).get("next");
+  if (next && next.startsWith("https://kych.net/oauth/authorize?")) {
+    window.location.assign(next);
+  }
+}
+
 function loginError(error: unknown): string {
   if (error instanceof DOMException) {
     if (error.name === "NotAllowedError") {
@@ -84,7 +93,7 @@ export function AuthPage({ onLogin }: Props) {
     setBusy(true);
     try {
       if (method === "totp") {
-        onLogin(await api.totpLogin(username, code));
+        completeLogin(await api.totpLogin(username, code), onLogin);
       } else {
         const started = await api.loginStart(username);
         // webauthn-rs 返回 { publicKey: {...} }，SimpleWebAuthn 需要里面的 publicKey 对象
@@ -93,7 +102,7 @@ export function AuthPage({ onLogin }: Props) {
           startAuthentication({ optionsJSON: options }),
           60_000,
         );
-        onLogin(await api.loginFinish(started.flow_id, credential));
+        completeLogin(await api.loginFinish(started.flow_id, credential), onLogin);
       }
     } catch (e) {
       console.error("登录失败", e);

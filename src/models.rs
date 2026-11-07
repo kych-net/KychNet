@@ -21,6 +21,8 @@ pub struct NavLink {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SiteSettings {
     pub site_name: String,
+    #[serde(default)]
+    pub description: String,
     pub logo_url: String,
     pub nav: Vec<NavLink>,
 }
@@ -29,6 +31,7 @@ impl Default for SiteSettings {
     fn default() -> Self {
         Self {
             site_name: "KychNet".into(),
+            description: "KychNet 个人站点".into(),
             logo_url: String::new(),
             nav: vec![
                 NavLink {

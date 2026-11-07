@@ -15,6 +15,7 @@ use crate::{config::Config, render, service};
 struct IndexTemplate {
     site: SiteSettings,
     admin_url: String,
+    canonical: String,
     posts: Vec<PostLink>,
     tree: String,
     styles: Vec<String>,
@@ -31,6 +32,7 @@ struct PostLink {
 struct PageTemplate {
     site: SiteSettings,
     admin_url: String,
+    canonical: String,
     filename: String,
     content: String,
     pdf_url: String,
@@ -364,6 +366,70 @@ fn project_style_base(slug: &str) -> Option<&str> {
 
 
 
+const STATIC_FILES: &[(&str, &[u8])] = &[
+    ("robots.txt", include_bytes!("../static/robots.txt")),
+    ("404.html", include_bytes!("../static/404.html")),
+    ("favicon.ico", include_bytes!("../static/favicon.ico")),
+    ("favicon.svg", include_bytes!("../static/favicon.svg")),
+    ("files--static/media/ui.svg", include_bytes!("../static/files--static/media/ui.svg")),
+];
+
+fn install_static(out: &Path) -> Result<()> {
+    for (slug, data) in STATIC_FILES {
+        write_raw(out, slug, data)?;
+    }
+    Ok(())
+}
+
+fn write_sitemap(out: &Path, cfg: &Config, pages: &[BuiltPage]) -> Result<()> {
+    let base = cfg.site_url.trim_end_matches('/');
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n",
+    );
+    let mut seen = std::collections::HashSet::new();
+    for page in pages {
+        let loc = format!("{base}{}", content_url(&page.slug));
+        if !seen.insert(loc.clone()) {
+            continue;
+        }
+        let lastmod = if page.date.is_empty() {
+            chrono::Utc::now().format("%Y-%m-%d").to_string()
+        } else {
+            page.date.clone()
+        };
+        xml.push_str(&format!(
+            "  <url><loc>{}</loc><lastmod>{}</lastmod></url>\n",
+            escape_html(&loc),
+            lastmod
+        ));
+    }
+    xml.push_str("</urlset>\n");
+    write_raw(out, "sitemap.xml", xml.as_bytes())
+}
+
+/// 清理 macOS 在资源文件旁生成的 AppleDouble (`._*`)。
+fn remove_appledouble(out: &Path) -> Result<()> {
+    fn walk(dir: &Path) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                walk(&path)?;
+            } else if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("._"))
+            {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+        Ok(())
+    }
+    walk(out)?;
+    Ok(())
+}
+
 fn write_raw(out: &Path, slug: &str, data: &[u8]) -> Result<()> {
     let target = safe_output_path(out, slug)?;
     if let Some(parent) = target.parent() {
@@ -603,6 +669,7 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
         let page = PageTemplate {
             site: settings.clone(),
             admin_url: cfg.admin_origin.clone(),
+            canonical: format!("{}{}", cfg.site_url.trim_end_matches('/'), content_url(&content.slug)),
             filename,
             content: rendered.html,
             pdf_url,
@@ -634,6 +701,7 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
         let html = IndexTemplate {
             site: settings.clone(),
             admin_url: cfg.admin_origin.clone(),
+            canonical: format!("{}{}", cfg.site_url.trim_end_matches('/'), content_url(&index_slug)),
             posts: project_links,
             tree: tree_html.clone(),
             styles: Vec::new(),
@@ -667,6 +735,7 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
             IndexTemplate {
                 site: settings.clone(),
                 admin_url: cfg.admin_origin.clone(),
+                canonical: cfg.site_url.clone(),
                 posts: links,
                 tree: tree_html.clone(),
                 styles: Vec::new(),
@@ -716,6 +785,9 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
         std::fs::write(&index_path, index_html)?;
         make_public(&index_path, false)?;
     }
+    install_static(out)?;
+    write_sitemap(out, cfg, &pages)?;
+    remove_appledouble(out)?;
     Ok(())
 }
 
@@ -805,6 +877,7 @@ pub async fn run_one(
     let html = PageTemplate {
         site: settings.clone(),
         admin_url: cfg.admin_origin.clone(),
+        canonical: format!("{}{}", cfg.site_url.trim_end_matches('/'), content_url(&content.slug)),
         filename,
         content: rendered.html,
         pdf_url,
@@ -922,6 +995,7 @@ mod tests {
         let index = IndexTemplate {
             site: settings(),
             admin_url: "https://m.kych.net".into(),
+            canonical: "https://c.kych.net/".into(),
             posts: vec![PostLink {
                 title: "第一篇".into(),
                 href: "/hello.html".into(),
@@ -937,6 +1011,7 @@ mod tests {
         let page = PageTemplate {
             site: settings(),
             admin_url: "https://m.kych.net".into(),
+            canonical: "https://c.kych.net/demo/".into(),
             filename: "index.md".into(),
             content: "<p>正文</p>".into(),
             pdf_url: "/demo.pdf".into(),

@@ -4,6 +4,14 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>{% block title %}{{ site.site_name }}{% endblock %}</title>
+    {% if !site.description.is_empty() %}
+    <meta name="description" content="{{ site.description }}" />
+    <meta property="og:description" content="{{ site.description }}" />
+    {% endif %}
+    <meta property="og:site_name" content="{{ site.site_name }}" />
+    <link rel="canonical" href="{{ canonical }}" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="alternate icon" href="/favicon.ico" />
     <link rel="stylesheet" href="/fonts/lxgw-wenkai-screen/lxgwwenkaiscreen.css" />
     {% for href in styles %}
     <link rel="stylesheet" href="{{ href }}" />
@@ -136,6 +144,10 @@
       .content img { max-width: 100%; }
       .content table { border-collapse: collapse; }
       .content pre { overflow-x: auto; padding: 1rem; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+      .wj-code-copy { display: inline-flex; align-items: center; gap: .3rem; border: 0; background: transparent; color: var(--muted); cursor: pointer; font: inherit; }
+      .wj-code-copy:hover { color: var(--text); }
+      .wj-code-copy .wj-sprite { width: 1rem; height: 1rem; }
+      .wj-code-copy.copied { color: #16a34a; }
       footer { display: none; }
 
       @media (max-width: 640px) {
@@ -241,6 +253,21 @@
           var next = root.getAttribute("data-theme") === "dark" ? "light" : "dark";
           root.setAttribute("data-theme", next);
           localStorage.setItem("kych-net-theme", next);
+        });
+      })();
+    </script>
+    <script>
+      (function () {
+        document.addEventListener("click", function (event) {
+          var button = event.target.closest && event.target.closest("wj-code-copy");
+          if (!button) return;
+          var code = button.closest("wj-code");
+          var source = code && code.querySelector("pre code");
+          if (!source || !navigator.clipboard) return;
+          navigator.clipboard.writeText(source.innerText).then(function () {
+            button.classList.add("copied");
+            setTimeout(function () { button.classList.remove("copied"); }, 1200);
+          }).catch(function () {});
         });
       })();
     </script>

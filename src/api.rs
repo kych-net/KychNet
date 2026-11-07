@@ -1185,6 +1185,9 @@ async fn put_settings(
     if site.site_name.trim().is_empty() || site.site_name.chars().count() > 64 {
         api_bail!("站点名称需为 1-64 个字符");
     }
+    if site.description.chars().count() > 300 {
+        api_bail!("站点描述最多 300 个字符");
+    }
     if site.nav.len() > 12 {
         api_bail!("导航链接最多 12 条");
     }
@@ -1255,6 +1258,9 @@ pub async fn serve(cfg: Config) -> Result<()> {
     let pool = crate::db::connect(&cfg.database_url).await?;
     crate::db::migrate(&pool).await?;
     spawn_flow_pruner(pool.clone());
+    if let Err(error) = oauth::gc(&pool).await {
+        tracing::warn!(%error, "OAuth 过期数据清理失败");
+    }
 
     let auth = Arc::new(Auth::new(&cfg.rp_id, &cfg.rp_origin)?);
     let state = AppState {

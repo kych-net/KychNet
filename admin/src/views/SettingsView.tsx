@@ -7,6 +7,7 @@ function formatTime(ts: number): string {
 
 export function SettingsView() {
   const [siteName, setSiteName] = useState("");
+  const [description, setDescription] = useState("");
   const [logoUrl, setLogoUrl] = useState("");
   const [nav, setNav] = useState<NavLink[]>([]);
   const [error, setError] = useState("");
@@ -19,6 +20,7 @@ export function SettingsView() {
       .getSettings()
       .then((result) => {
         setSiteName(result.site.site_name);
+        setDescription(result.site.description);
         setLogoUrl(result.site.logo_url);
         setNav(result.site.nav);
       })
@@ -57,7 +59,7 @@ export function SettingsView() {
     event.preventDefault();
     setError("");
     try {
-      await api.saveSettings({ site_name: siteName, logo_url: logoUrl, nav });
+      await api.saveSettings({ site_name: siteName, description, logo_url: logoUrl, nav });
       setNotice("站点设置已保存,重新构建后生效");
     } catch (e) {
       setError((e as Error).message);
@@ -85,6 +87,15 @@ export function SettingsView() {
             />
           </label>
         </div>
+        <label>
+          站点描述
+          <input
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            maxLength={300}
+            placeholder="用于 meta description / Open Graph，最多 300 字"
+          />
+        </label>
 
         <h3>顶栏链接</h3>
         {nav.map((link, index) => (
