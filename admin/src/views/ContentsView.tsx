@@ -15,6 +15,7 @@ export function ContentsView({ editContentId, onEditHandled }: Props) {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
 
+  const [contentId, setContentId] = useState<string | null>(null);
   const [slug, setSlug] = useState("");
   const [title, setTitle] = useState("");
   const [format, setFormat] = useState<ContentFormat>("markdown");
@@ -48,8 +49,16 @@ export function ContentsView({ editContentId, onEditHandled }: Props) {
     event.preventDefault();
     setError("");
     try {
-      const result = await api.saveContent({ slug, title, format, body, published });
+      const result = await api.saveContent({
+        id: contentId ?? undefined,
+        slug,
+        title,
+        format,
+        body,
+        published,
+      });
       // 服务端会把 /xef/、/eoe/index.md 归一化成输出路径，这里回显源文件路径。
+      setContentId(result.item.id);
       setSlug(editorPath(result.item));
       setNotice("内容已保存");
       await refresh();
@@ -68,6 +77,7 @@ export function ContentsView({ editContentId, onEditHandled }: Props) {
   }
 
   function edit(item: Content) {
+    setContentId(item.id);
     setSlug(editorPath(item));
     setTitle(item.title);
     setFormat(item.format);
@@ -78,6 +88,17 @@ export function ContentsView({ editContentId, onEditHandled }: Props) {
   function changeFormat(next: ContentFormat) {
     setFormat(next);
     setSlug((current) => current.replace(/\.(html|md|typ)$/i, extensionFor(next)));
+  }
+
+  function newContent() {
+    setContentId(null);
+    setSlug("");
+    setTitle("");
+    setFormat("markdown");
+    setBody("");
+    setPublished(false);
+    setError("");
+    setNotice("");
   }
 
   return (
@@ -129,6 +150,9 @@ export function ContentsView({ editContentId, onEditHandled }: Props) {
             发布
           </label>
           <button type="submit">保存</button>
+          <button type="button" onClick={newContent}>
+            新建内容
+          </button>
         </div>
       </form>
 

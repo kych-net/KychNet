@@ -746,6 +746,9 @@ async fn contents(
 
 #[derive(Deserialize)]
 struct ContentRequest {
+    /// 编辑已有内容时带 id，改名才会更新原记录而不是新建一条。
+    #[serde(default)]
+    id: Option<Uuid>,
     slug: String,
     title: String,
     format: String,
@@ -771,15 +774,34 @@ async fn save_content(
     if req.title.trim().is_empty() || req.title.chars().count() > 200 {
         api_bail!("标题需为 1-200 个字符");
     }
-    let content = service::upsert_content(
-        &state.pool,
-        &slug,
-        &req.title,
-        format.as_str(),
-        &req.body,
-        req.published,
-    )
-    .await?;
+    let content = if let Some(id) = req.id {
+        let existing = service::find_content_by_id(&state.pool, id)
+            .await?
+            .context("内容不存在")?;
+        if existing.slug == service::HOME_SLUG && slug != service::HOME_SLUG {
+            api_reject!(StatusCode::FORBIDDEN, "网站主页路径不能修改");
+        }
+        service::update_content(
+            &state.pool,
+            id,
+            &slug,
+            &req.title,
+            format.as_str(),
+            &req.body,
+            req.published,
+        )
+        .await?
+    } else {
+        service::upsert_content(
+            &state.pool,
+            &slug,
+            &req.title,
+            format.as_str(),
+            &req.body,
+            req.published,
+        )
+        .await?
+    };
     Ok(Json(json!({ "item": content })))
 }
 

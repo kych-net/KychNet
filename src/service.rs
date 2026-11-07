@@ -459,6 +459,50 @@ pub async fn list_published(pool: &PgPool) -> Result<Vec<Content>> {
     .await?)
 }
 
+pub async fn find_content_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Content>> {
+    Ok(
+        sqlx::query_as::<_, Content>("SELECT * FROM contents WHERE id = $1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?,
+    )
+}
+
+/// 按 id 更新内容，允许修改路径。路径唯一冲突时返回可读错误。
+pub async fn update_content(
+    pool: &PgPool,
+    id: Uuid,
+    slug: &str,
+    title: &str,
+    format: &str,
+    body: &str,
+    published: bool,
+) -> Result<Content> {
+    let result = sqlx::query_as::<_, Content>(
+        "UPDATE contents
+         SET slug = $2, title = $3, format = $4, body = $5, published = $6, updated_at = now()
+         WHERE id = $1
+         RETURNING *",
+    )
+    .bind(id)
+    .bind(slug)
+    .bind(title)
+    .bind(format)
+    .bind(body)
+    .bind(published)
+    .fetch_one(pool)
+    .await;
+
+    match result {
+        Ok(content) => Ok(content),
+        Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("23505") => {
+            bail!("路径已被占用")
+        }
+        Err(sqlx::Error::RowNotFound) => bail!("内容不存在"),
+        Err(error) => Err(error.into()),
+    }
+}
+
 pub async fn upsert_content(
     pool: &PgPool,
     slug: &str,
