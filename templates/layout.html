@@ -47,6 +47,52 @@
         background: var(--accent); color: #fff;
         font-weight: 700; font-size: 0.9rem;
       }
+      .dir-tree-toggle {
+        border: 1px solid var(--border);
+        background: transparent;
+        color: var(--text);
+        border-radius: 6px;
+        padding: 0.3rem 0.7rem;
+        font: inherit;
+        font-size: 0.9rem;
+        cursor: pointer;
+      }
+      .dir-tree-panel {
+        position: absolute;
+        top: 100%;
+        left: 1.5rem;
+        z-index: 20;
+        width: min(24rem, calc(100vw - 3rem));
+        max-height: 70vh;
+        overflow: auto;
+        padding: 0.9rem 1rem;
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 0 0 10px 10px;
+        box-shadow: 0 12px 30px rgba(0, 0, 0, 0.12);
+      }
+      .dir-tree-title { color: var(--muted); font-size: 0.8rem; margin-bottom: 0.4rem; }
+      .dir-tree, .dir-children { list-style: none; margin: 0; padding-left: 0.9rem; }
+      .dir-tree { padding-left: 0; }
+      .dir-tree li { margin: 0.15rem 0; }
+      .dir-toggle {
+        border: 0;
+        background: transparent;
+        color: var(--text);
+        font: inherit;
+        font-size: 0.9rem;
+        cursor: pointer;
+        padding: 0.1rem 0;
+      }
+      .dir-toggle::before { content: "▸ "; color: var(--muted); }
+      .dir-toggle[aria-expanded="true"]::before { content: "▾ "; }
+      .dir-tree .file a {
+        color: var(--muted);
+        text-decoration: none;
+        font-size: 0.9rem;
+      }
+      .dir-tree .file a:hover { color: var(--accent); }
+      .dir-tree .file a::before { content: "· "; color: var(--border); }
       .nav { display: flex; gap: 1.25rem; flex: 1; justify-content: center; }
       .nav a { color: var(--muted); text-decoration: none; font-size: 0.95rem; }
       .nav a:hover { color: var(--text); }
@@ -90,6 +136,7 @@
         <img src="{{ site.logo_url }}" alt="{{ site.site_name }}" />
         {% endif %}
       </a>
+      <button id="dir-tree-toggle" class="dir-tree-toggle" type="button" aria-expanded="false" aria-controls="dir-tree-panel">目录</button>
       <nav class="nav">
         {% for link in site.nav %}
         <a href="{{ link.href }}">{{ link.label }}</a>
@@ -98,6 +145,10 @@
       <div class="actions">
         <button id="theme-toggle" type="button" aria-label="切换主题">主题</button>
         <a class="btn" href="{{ admin_url }}">管理端</a>
+      </div>
+      <div id="dir-tree-panel" class="dir-tree-panel" hidden>
+        <div class="dir-tree-title">目录</div>
+        {{ tree|safe }}
       </div>
     </header>
     <main>
@@ -113,6 +164,27 @@
           var next = root.getAttribute("data-theme") === "dark" ? "light" : "dark";
           root.setAttribute("data-theme", next);
           localStorage.setItem("kych-net-theme", next);
+        });
+      })();
+    </script>
+    <script>
+      (function () {
+        var toggle = document.getElementById("dir-tree-toggle");
+        var panel = document.getElementById("dir-tree-panel");
+        if (!toggle || !panel) return;
+        toggle.addEventListener("click", function () {
+          var open = panel.hidden;
+          panel.hidden = !open;
+          toggle.setAttribute("aria-expanded", String(open));
+        });
+        panel.addEventListener("click", function (event) {
+          var button = event.target.closest(".dir-toggle");
+          if (!button) return;
+          var children = button.parentElement.querySelector(".dir-children");
+          if (!children) return;
+          var open = children.hidden;
+          children.hidden = !open;
+          button.setAttribute("aria-expanded", String(open));
         });
       })();
     </script>

@@ -37,6 +37,17 @@ export type Content = {
   updated_at: string;
 };
 
+/** 输出路径对应的源文件路径，用于编辑器展示。 */
+export function sourcePath(item: { slug: string; format: ContentFormat }): string {
+  const ext = item.format === "markdown" ? ".md" : item.format === "typst" ? ".typ" : ".html";
+  return item.slug.replace(/\.html$/, ext);
+}
+
+/** 编辑器里显示的绝对路径，例如 /eoe/index.md。 */
+export function editorPath(item: { slug: string; format: ContentFormat }): string {
+  return `/${sourcePath(item)}`;
+}
+
 export type BuildRecord = {
   started_at: number;
   finished_at: number | null;
