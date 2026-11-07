@@ -6,6 +6,7 @@ mod collab;
 mod config;
 mod db;
 mod git;
+mod mcp;
 mod models;
 mod project;
 mod rate;

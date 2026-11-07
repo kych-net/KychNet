@@ -17,6 +17,8 @@ pub struct Config {
     pub trust_proxy_headers: bool,
     /// Git LFS 二进制对象的落盘根目录。
     pub lfs_root: PathBuf,
+    /// MCP 服务（`/mcp`）的 Bearer token。未设置时整个 MCP 路由不挂载。
+    pub mcp_token: Option<String>,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -51,6 +53,9 @@ impl Config {
             build_out_dir: PathBuf::from(env_or("BUILD_OUT_DIR", "dist")),
             trust_proxy_headers: env_flag("TRUST_PROXY_HEADERS"),
             lfs_root: PathBuf::from(env_or("LFS_ROOT", "lfs")),
+            // 空字符串与未设置同等对待：MCP 暴露的是真实业务数据，
+            // 不存在「不带 token 开放」的合理场景。
+            mcp_token: std::env::var("MCP_TOKEN").ok().filter(|t| !t.is_empty()),
         })
     }
 }
