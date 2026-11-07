@@ -57,7 +57,7 @@ export function ContentsView({ editContentId, onEditHandled }: Props) {
         body,
         published,
       });
-      // 服务端会把 /xef/、/eoe/index.md 归一化成输出路径，这里回显源文件路径。
+      // 服务端会把 /xef/index、/eoe/index.md 归一化成输出路径，这里回显源文件路径。
       setContentId(result.item.id);
       setSlug(editorPath(result.item));
       setNotice(published ? "内容已保存，并已自动编译当前页" : "内容已保存（草稿，暂不生成页面）");
@@ -114,7 +114,7 @@ export function ContentsView({ editContentId, onEditHandled }: Props) {
             <input
               value={slug}
               onChange={(e) => setSlug(e.target.value)}
-              placeholder="/xef/ 或 /reff/93df/l.html"
+              placeholder="/xef/index 或 /reff/93df/l.html"
               required
             />
           </label>
@@ -133,7 +133,7 @@ export function ContentsView({ editContentId, onEditHandled }: Props) {
           </label>
         </div>
         <p className="hint">
-          目录主页用 <code>/eoe/</code>；页面用 <code>/reff/93df/l.html</code>。
+          目录主页必须写 <code>/eoe/index</code>，不再接受 <code>/eoe/</code>；普通页面用 <code>/reff/93df/l.html</code>。
           <code>.html/.md/.typ/.wj</code> 最终都输出同一个 <code>.html</code>，同一路径只保留一条内容。
           <code>/api</code> 是保留路径；<code>/index.html</code> 是主页，只能编辑不能删除。
         </p>
