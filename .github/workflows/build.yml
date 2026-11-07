@@ -48,16 +48,16 @@ jobs:
       - name: Package
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/kychnet dist/kychnet
+          cp target/${{ matrix.target }}/release/kych-net dist/kych-net
           cp .env.example dist/.env.example
-          tar -czf kychnet-${{ matrix.target }}.tar.gz -C dist .
-          sha256sum kychnet-${{ matrix.target }}.tar.gz > SHA256SUMS-${{ matrix.target }}
+          tar -czf kych-net-${{ matrix.target }}.tar.gz -C dist .
+          sha256sum kych-net-${{ matrix.target }}.tar.gz > SHA256SUMS-${{ matrix.target }}
 
       - uses: actions/upload-artifact@v4
         with:
-          name: kychnet-${{ matrix.target }}
+          name: kych-net-${{ matrix.target }}
           path: |
-            kychnet-${{ matrix.target }}.tar.gz
+            kych-net-${{ matrix.target }}.tar.gz
             SHA256SUMS-${{ matrix.target }}
 
       - name: Release
@@ -65,5 +65,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            kychnet-${{ matrix.target }}.tar.gz
+            kych-net-${{ matrix.target }}.tar.gz
             SHA256SUMS-${{ matrix.target }}
