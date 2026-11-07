@@ -152,6 +152,7 @@ export const api = {
 
   contents: () => request<{ items: Content[] }>("/contents"),
   saveContent: (payload: {
+    id?: string;
     slug: string;
     title: string;
     format: ContentFormat;
