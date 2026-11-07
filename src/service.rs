@@ -68,7 +68,7 @@ pub fn valid_content_slug(slug: &str) -> bool {
 /// 把用户输入的路径归一化成数据库里的输出路径，并从扩展名推断格式。
 ///
 /// 规则：
-/// - 允许 `/xef/`（目录主页 → `xef/index.html`）；
+/// - 目录主页必须显式写文件名，例如 `/xef/index`；
 /// - 允许 `/reff/93df/l.html`（页面）；
 /// - 允许 `/eoe/index.md`、`/eoe/index.typ`，但最终都存成 `.html`；
 /// - 同一路径只能存在一条记录，因此 `.html/.md/.typ` 天然互斥；
@@ -89,13 +89,10 @@ pub fn normalize_content_path(
         bail!("路径不能包含空白或控制字符");
     }
 
-    let mut raw = trimmed.trim_start_matches('/').to_string();
     if trimmed.ends_with('/') {
-        raw.push_str("index");
+        bail!("目录路径请显式写出文件名，例如 /xef/index");
     }
-    if raw.is_empty() {
-        raw.push_str("index");
-    }
+    let raw = trimmed.trim_start_matches('/').to_string();
 
     let mut parts: Vec<String> = raw.split('/').map(str::to_string).collect();
     if parts.iter().any(|s| s.is_empty() || s == "." || s == "..") {
@@ -555,7 +552,7 @@ mod tests {
     #[test]
     fn normalizes_directory_and_file_paths() {
         assert_eq!(
-            normalize_content_path("/xef/", ContentFormat::Markdown).unwrap(),
+            normalize_content_path("/xef/index", ContentFormat::Markdown).unwrap(),
             ("xef/index.html".to_string(), ContentFormat::Markdown)
         );
         assert_eq!(
@@ -567,17 +564,16 @@ mod tests {
             ("eoe/index.html".to_string(), ContentFormat::Markdown)
         );
         assert_eq!(
-            normalize_content_path("/eoe/", ContentFormat::Typst).unwrap(),
+            normalize_content_path("/eoe/index", ContentFormat::Typst).unwrap(),
             ("eoe/index.html".to_string(), ContentFormat::Typst)
         );
         assert_eq!(
             normalize_content_path("你好/世界.html", ContentFormat::Html).unwrap(),
             ("你好/世界.html".to_string(), ContentFormat::Html)
         );
-        assert_eq!(
-            normalize_content_path("/", ContentFormat::Markdown).unwrap(),
-            (HOME_SLUG.to_string(), ContentFormat::Markdown)
-        );
+        assert!(normalize_content_path("/", ContentFormat::Markdown).is_err());
+        assert!(normalize_content_path("/xef/", ContentFormat::Markdown).is_err());
+        assert!(normalize_content_path("/eoe/index/", ContentFormat::Typst).is_err());
         assert_eq!(
             normalize_content_path("index.html", ContentFormat::Markdown).unwrap(),
             (HOME_SLUG.to_string(), ContentFormat::Markdown)

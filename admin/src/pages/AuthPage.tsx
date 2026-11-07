@@ -1,10 +1,28 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { startAuthentication, startRegistration } from "@simplewebauthn/browser";
 import { api, User } from "../api";
 
 type Props = {
   onLogin: (user: User) => void;
 };
+
+function withTimeout<T>(promise: Promise<T>, milliseconds: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = window.setTimeout(() => {
+      reject(new DOMException("等待通行密钥窗口超时", "NotAllowedError"));
+    }, milliseconds);
+    promise.then(
+      (value) => {
+        window.clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        window.clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
 
 function loginError(error: unknown): string {
   if (error instanceof DOMException) {
@@ -30,6 +48,35 @@ export function AuthPage({ onLogin }: Props) {
   const [invite, setInvite] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [platformAuthenticator, setPlatformAuthenticator] = useState<boolean | null>(
+    passkeySupported ? null : false,
+  );
+
+  useEffect(() => {
+    if (!passkeySupported) return;
+    if (typeof window.isSecureContext === "boolean" && !window.isSecureContext) {
+      setPlatformAuthenticator(false);
+      return;
+    }
+    const check = window.PublicKeyCredential
+      ?.isUserVerifyingPlatformAuthenticatorAvailable;
+    if (typeof check !== "function") {
+      setPlatformAuthenticator(true);
+      return;
+    }
+    let cancelled = false;
+    check
+      .call(window.PublicKeyCredential)
+      .then((available) => {
+        if (!cancelled) setPlatformAuthenticator(available);
+      })
+      .catch(() => {
+        if (!cancelled) setPlatformAuthenticator(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [passkeySupported]);
 
   async function handleLogin(event: React.FormEvent) {
     event.preventDefault();
@@ -42,10 +89,14 @@ export function AuthPage({ onLogin }: Props) {
         const started = await api.loginStart(username);
         // webauthn-rs 返回 { publicKey: {...} }，SimpleWebAuthn 需要里面的 publicKey 对象
         const options = started.options.publicKey ?? started.options;
-        const credential = await startAuthentication({ optionsJSON: options });
+        const credential = await withTimeout(
+          startAuthentication({ optionsJSON: options }),
+          60_000,
+        );
         onLogin(await api.loginFinish(started.flow_id, credential));
       }
     } catch (e) {
+      console.error("登录失败", e);
       setError(loginError(e));
     } finally {
       setBusy(false);
@@ -108,8 +159,15 @@ export function AuthPage({ onLogin }: Props) {
               当前浏览器不支持 WebAuthn 通行密钥（例如部分外置磁盘/便携版 Chrome），请使用动态验证码。
             </p>
           )}
+          {method === "passkey" && platformAuthenticator === false && (
+            <p className="hint">
+              当前浏览器没有可用的平台认证器（Touch ID / Windows Hello）。通行密钥可能不会弹窗；
+              请改用动态验证码，或换成正常安装的 Chrome/Safari/Edge 后再试。
+            </p>
+          )}
           <p className="hint">
-            通行密钥需要先填写用户名再点登录；没有绑定过通行密钥，请先用动态验证码登录后在「用户设置」绑定。
+            先填写用户名，再点下方「{method === "passkey" ? "使用通行密钥登录" : "使用动态验证码登录"}」。
+            没有绑定过通行密钥，请先用动态验证码登录后在「用户设置」绑定。
           </p>
           {method === "totp" && (
             <label>
@@ -124,8 +182,19 @@ export function AuthPage({ onLogin }: Props) {
             </label>
           )}
           <button type="submit" disabled={busy}>
-            {busy ? "处理中…" : "登录"}
+            {busy
+              ? method === "passkey"
+                ? "等待通行密钥窗口…"
+                : "处理中…"
+              : method === "passkey"
+                ? "使用通行密钥登录"
+                : "使用动态验证码登录"}
           </button>
+          {busy && method === "passkey" && (
+            <p className="hint">
+              正在等待浏览器弹出通行密钥窗口；如果 60 秒内没有弹窗，可以改用动态验证码。
+            </p>
+          )}
         </form>
       ) : (
         <form onSubmit={handleRegister}>
