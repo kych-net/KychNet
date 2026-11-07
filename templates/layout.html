@@ -4,6 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>{% block title %}{{ site.site_name }}{% endblock %}</title>
+    <link rel="stylesheet" href="/fonts/lxgw-wenkai-screen/lxgwwenkaiscreen.css" />
     {% for href in styles %}
     <link rel="stylesheet" href="{{ href }}" />
     {% endfor %}
@@ -111,7 +112,12 @@
         cursor: pointer;
         text-decoration: none;
       }
-      main { max-width: 46rem; margin: 0 auto; padding: 2.5rem 1.5rem 4rem; }
+      main {
+        max-width: 46rem;
+        margin: 0 auto;
+        padding: 2.5rem 1.5rem 4rem;
+        font-family: "LXGW WenKai Screen", "LXGW WenKai", "Kaiti SC", "STKaiti", serif;
+      }
       .page-title { font-size: 1.6rem; margin: 0 0 1.5rem; }
       .post-list { list-style: none; padding: 0; margin: 0; }
       .post-list li {
