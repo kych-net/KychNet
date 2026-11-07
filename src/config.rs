@@ -10,6 +10,9 @@ pub struct Config {
     pub rp_id: String,
     pub rp_origin: String,
     pub content_root: PathBuf,
+    /// 站点产物输出目录，`build` 子命令与管理端触发的重建共用这个路径。
+    /// serve 进程需要知道它，才能把重建请求落在对的地方。
+    pub build_out_dir: PathBuf,
     /// 是否信任 `X-Forwarded-For`。只有当服务确实只经由可信 CDN/反代进来时才开。
     pub trust_proxy_headers: bool,
 }
@@ -38,6 +41,7 @@ impl Config {
             rp_id: env_or("WEBAUTHN_RP_ID", "kych.net"),
             rp_origin: env_or("WEBAUTHN_ORIGIN", "https://admin.kych.net"),
             content_root: PathBuf::from(env_or("CONTENT_ROOT", "content")),
+            build_out_dir: PathBuf::from(env_or("BUILD_OUT_DIR", "dist")),
             trust_proxy_headers: env_flag("TRUST_PROXY_HEADERS"),
         })
     }
