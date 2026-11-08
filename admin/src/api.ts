@@ -237,7 +237,9 @@ export function avatarUrl(id: string, version?: number): string {
 
 /** 公开的 Git 仓库地址；项目名按 URL 段编码。 */
 export function gitUrl(slug: string): string {
-  return `${API_BASE}/git/${encodeURIComponent(slug)}.git`;
+  // Git 用 URL 最后一段作为默认克隆目录名；这里保留原始 UTF-8 项目名，
+  // 否则中文项目会被克隆成 %E5%... 目录。服务端本来就会解码路径。
+  return `${API_BASE}/git/${slug}.git`;
 }
 
 export class ApiError extends Error {
