@@ -131,7 +131,8 @@ export function ProjectsView() {
   const [newSlug, setNewSlug] = useState("");
   const [newDescription, setNewDescription] = useState("");
 
-  const [tab, setTab] = useState<"files" | "prs" | "discussions" | "history">("files");
+  const [middleTab, setMiddleTab] = useState<"files" | "discussions">("files");
+  const [rightTab, setRightTab] = useState<"history" | "prs">("history");
 
   const [commits, setCommits] = useState<CommitSummary[]>([]);
   const [commitDetail, setCommitDetail] = useState<CommitDetail | null>(null);
@@ -177,7 +178,8 @@ export function ProjectsView() {
     setCommitMessage("");
     setError("");
     setNotice("");
-    setTab("files");
+    setMiddleTab("files");
+    setRightTab("history");
     setCommits([]);
     setCommitDetail(null);
     setSelectedCommit(null);
@@ -194,23 +196,30 @@ export function ProjectsView() {
       const detail = await api.project(project.id);
       setBranches(detail.branches.length > 0 ? detail.branches : [project.default_branch]);
       await loadTree(project, project.default_branch, "");
+      void loadCommits(project, project.default_branch).catch((e) =>
+        setError((e as Error).message),
+      );
     } catch (e) {
       setError((e as Error).message);
     }
   }
 
-  function switchTab(next: "files" | "prs" | "discussions" | "history") {
-    setTab(next);
+  function switchMiddleTab(next: "files" | "discussions") {
+    setMiddleTab(next);
+    setError("");
+    setNotice("");
+    if (!selected || next !== "discussions") return;
+    void loadDiscussions(selected).catch((e) => setError((e as Error).message));
+  }
+
+  function switchRightTab(next: "history" | "prs") {
+    setRightTab(next);
     setError("");
     setNotice("");
     if (!selected) return;
     if (next === "prs") {
       void loadPrs(selected).catch((e) => setError((e as Error).message));
-    }
-    if (next === "discussions") {
-      void loadDiscussions(selected).catch((e) => setError((e as Error).message));
-    }
-    if (next === "history") {
+    } else {
       void loadCommits(selected, branch).catch((e) => setError((e as Error).message));
     }
   }
@@ -772,50 +781,24 @@ export function ProjectsView() {
                   <code>{gitUrl(selected.slug)}</code>
                 </div>
               </div>
-            </div>
-            <div className="project-git">
-              <div className="project-git-head">
-                <div>
-                  <span className="project-git-kicker">Git</span>
-                  <strong>工作区</strong>
-                </div>
-                <span className="project-git-meta">
-                  {selected.slug} · {branch}
-                </span>
-              </div>
-              <div className="project-tabs">
+              <div className="project-tabs project-middle-tabs">
                 <button
                   type="button"
-                  className={tab === "files" ? "active" : ""}
-                  onClick={() => switchTab("files")}
+                  className={middleTab === "files" ? "active" : ""}
+                  onClick={() => switchMiddleTab("files")}
                 >
                   文件
                 </button>
                 <button
                   type="button"
-                  className={tab === "history" ? "active" : ""}
-                  onClick={() => switchTab("history")}
-                >
-                  提交历史
-                </button>
-                <button
-                  type="button"
-                  className={tab === "prs" ? "active" : ""}
-                  onClick={() => switchTab("prs")}
-                >
-                  Pull Requests
-                </button>
-                <button
-                  type="button"
-                  className={tab === "discussions" ? "active" : ""}
-                  onClick={() => switchTab("discussions")}
+                  className={middleTab === "discussions" ? "active" : ""}
+                  onClick={() => switchMiddleTab("discussions")}
                 >
                   讨论
                 </button>
               </div>
-
-              {tab === "files" && (
-                <>
+              {middleTab === "files" && (
+                <div className="project-files-panel">
               <div className="row align file-toolbar">
                 <label>
                   分支
@@ -942,10 +925,160 @@ export function ProjectsView() {
                   )}
                 </div>
               </div>
-                </>
+                </div>
               )}
+              {middleTab === "discussions" && (
+                <div className="project-discussion-panel">
+                <div className="collab-layout">
+                  <div className="collab-list">
+                    <form className="collab-create" onSubmit={createDiscussion}>
+                      <h4>新建讨论</h4>
+                      <label>
+                        标题
+                        <input
+                          value={discussionTitle}
+                          onChange={(e) => setDiscussionTitle(e.target.value)}
+                          required
+                        />
+                      </label>
+                      <label>
+                        正文
+                        <textarea
+                          value={discussionBody}
+                          onChange={(e) => setDiscussionBody(e.target.value)}
+                          rows={4}
+                        />
+                      </label>
+                      <button
+                        type="submit"
+                        disabled={busy || !discussionTitle.trim() || !discussionBody.trim()}
+                      >
+                        创建
+                      </button>
+                    </form>
 
-              {tab === "history" && (
+                    <ul className="collab-items">
+                      {discussions.map((item) => (
+                        <li key={item.id}>
+                          <button
+                            type="button"
+                            className={selectedDiscussion === item.id ? "active" : ""}
+                            onClick={() => void openDiscussion(item.id)}
+                          >
+                            <span>{item.title}</span>
+                            <small>
+                              {item.author_name} · {formatTime(item.created_at)} · {item.comment_count} 条评论
+                              {item.closed_at ? " · 已关闭" : ""}
+                            </small>
+                          </button>
+                        </li>
+                      ))}
+                      {discussions.length === 0 && <li className="hint">暂无讨论。</li>}
+                    </ul>
+                  </div>
+
+                  <div className="collab-detail">
+                    {!discussionDetail ? (
+                      <p className="hint">选择一个讨论查看详情。</p>
+                    ) : (
+                      <>
+                        <div className="collab-detail-head">
+                          <h4>{discussionDetail.title}</h4>
+                          <span className={`pill ${discussionDetail.closed_at ? "status-closed" : "status-open"}`}>
+                            {discussionDetail.closed_at ? "已关闭" : "进行中"}
+                          </span>
+                        </div>
+                        <p className="hint">
+                          {discussionDetail.author_name} ·{" "}
+                          {formatTime(discussionDetail.created_at)}
+                          {discussionDetail.closed_at
+                            ? ` · 关闭于 ${formatTime(discussionDetail.closed_at)}`
+                            : ""}
+                        </p>
+                        <p className="collab-body">{discussionDetail.body}</p>
+
+                        <div className="row align">
+                          <button
+                            type="button"
+                            onClick={() => void closeDiscussion()}
+                            disabled={busy || discussionDetail.closed_at !== null}
+                          >
+                            关闭讨论
+                          </button>
+                        </div>
+
+                        <h5>评论</h5>
+                        <ul className="comment-list">
+                          {discussionDetail.comments.map((comment) => (
+                            <li key={comment.id}>
+                              <div className="comment-meta">
+                                {comment.author_name} · {formatTime(comment.created_at)}
+                              </div>
+                              <p className="collab-body">{comment.body}</p>
+                            </li>
+                          ))}
+                          {discussionDetail.comments.length === 0 && (
+                            <li className="hint">还没有评论。</li>
+                          )}
+                        </ul>
+                        <form onSubmit={commentDiscussion} className="comment-form">
+                          <textarea
+                            value={discussionComment}
+                            onChange={(e) => setDiscussionComment(e.target.value)}
+                            rows={3}
+                            placeholder={
+                              discussionDetail.closed_at ? "讨论已关闭" : "发表评论"
+                            }
+                            disabled={discussionDetail.closed_at !== null}
+                          />
+                          <button
+                            type="submit"
+                            disabled={
+                              busy ||
+                              discussionDetail.closed_at !== null ||
+                              !discussionComment.trim()
+                            }
+                          >
+                            发表评论
+                          </button>
+                        </form>
+                      </>
+                    )}
+                  </div>
+                </div>
+                </div>
+              )}
+            </div>
+            <div className="project-git">
+              <div className="project-git-head">
+                <div>
+                  <span className="project-git-kicker">Git</span>
+                  <strong>工作区</strong>
+                </div>
+                <span className="project-git-meta">
+                  {selected.slug} · {branch}
+                </span>
+              </div>
+              <div className="project-tabs">
+                <button
+                  type="button"
+                  className={rightTab === "history" ? "active" : ""}
+                  onClick={() => switchRightTab("history")}
+                >
+                  提交历史
+                </button>
+                <button
+                  type="button"
+                  className={rightTab === "prs" ? "active" : ""}
+                  onClick={() => switchRightTab("prs")}
+                >
+                  Pull Requests
+                </button>
+              </div>
+
+
+
+              {rightTab === "history" && (
                 <div className="collab-layout">
                   <div className="collab-list">
                     <div className="collab-create">
@@ -1048,7 +1181,7 @@ export function ProjectsView() {
                 </div>
               )}
 
-              {tab === "prs" && (
+              {rightTab === "prs" && (
                 <div className="collab-layout">
                   <div className="collab-list">
                     <form className="collab-create" onSubmit={createPr}>
@@ -1213,125 +1346,7 @@ export function ProjectsView() {
                 </div>
               )}
 
-              {tab === "discussions" && (
-                <div className="collab-layout">
-                  <div className="collab-list">
-                    <form className="collab-create" onSubmit={createDiscussion}>
-                      <h4>新建讨论</h4>
-                      <label>
-                        标题
-                        <input
-                          value={discussionTitle}
-                          onChange={(e) => setDiscussionTitle(e.target.value)}
-                          required
-                        />
-                      </label>
-                      <label>
-                        正文
-                        <textarea
-                          value={discussionBody}
-                          onChange={(e) => setDiscussionBody(e.target.value)}
-                          rows={4}
-                        />
-                      </label>
-                      <button
-                        type="submit"
-                        disabled={busy || !discussionTitle.trim() || !discussionBody.trim()}
-                      >
-                        创建
-                      </button>
-                    </form>
 
-                    <ul className="collab-items">
-                      {discussions.map((item) => (
-                        <li key={item.id}>
-                          <button
-                            type="button"
-                            className={selectedDiscussion === item.id ? "active" : ""}
-                            onClick={() => void openDiscussion(item.id)}
-                          >
-                            <span>{item.title}</span>
-                            <small>
-                              {item.author_name} · {formatTime(item.created_at)} · {item.comment_count} 条评论
-                              {item.closed_at ? " · 已关闭" : ""}
-                            </small>
-                          </button>
-                        </li>
-                      ))}
-                      {discussions.length === 0 && <li className="hint">暂无讨论。</li>}
-                    </ul>
-                  </div>
-
-                  <div className="collab-detail">
-                    {!discussionDetail ? (
-                      <p className="hint">选择一个讨论查看详情。</p>
-                    ) : (
-                      <>
-                        <div className="collab-detail-head">
-                          <h4>{discussionDetail.title}</h4>
-                          <span className={`pill ${discussionDetail.closed_at ? "status-closed" : "status-open"}`}>
-                            {discussionDetail.closed_at ? "已关闭" : "进行中"}
-                          </span>
-                        </div>
-                        <p className="hint">
-                          {discussionDetail.author_name} ·{" "}
-                          {formatTime(discussionDetail.created_at)}
-                          {discussionDetail.closed_at
-                            ? ` · 关闭于 ${formatTime(discussionDetail.closed_at)}`
-                            : ""}
-                        </p>
-                        <p className="collab-body">{discussionDetail.body}</p>
-
-                        <div className="row align">
-                          <button
-                            type="button"
-                            onClick={() => void closeDiscussion()}
-                            disabled={busy || discussionDetail.closed_at !== null}
-                          >
-                            关闭讨论
-                          </button>
-                        </div>
-
-                        <h5>评论</h5>
-                        <ul className="comment-list">
-                          {discussionDetail.comments.map((comment) => (
-                            <li key={comment.id}>
-                              <div className="comment-meta">
-                                {comment.author_name} · {formatTime(comment.created_at)}
-                              </div>
-                              <p className="collab-body">{comment.body}</p>
-                            </li>
-                          ))}
-                          {discussionDetail.comments.length === 0 && (
-                            <li className="hint">还没有评论。</li>
-                          )}
-                        </ul>
-                        <form onSubmit={commentDiscussion} className="comment-form">
-                          <textarea
-                            value={discussionComment}
-                            onChange={(e) => setDiscussionComment(e.target.value)}
-                            rows={3}
-                            placeholder={
-                              discussionDetail.closed_at ? "讨论已关闭" : "发表评论"
-                            }
-                            disabled={discussionDetail.closed_at !== null}
-                          />
-                          <button
-                            type="submit"
-                            disabled={
-                              busy ||
-                              discussionDetail.closed_at !== null ||
-                              !discussionComment.trim()
-                            }
-                          >
-                            发表评论
-                          </button>
-                        </form>
-                      </>
-                    )}
-                  </div>
-                </div>
-              )}
             </div>
           </>
         )}

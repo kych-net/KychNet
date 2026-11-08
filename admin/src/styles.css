@@ -2577,3 +2577,79 @@ code,
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+
+/* ---------- middle files/discussions, right history/PR ---------- */
+.projects-layout {
+  grid-template-columns: minmax(220px, 260px) minmax(0, 1fr) minmax(300px, 380px);
+}
+
+.project-overview {
+  position: static;
+}
+
+.project-middle-tabs {
+  margin: 0;
+  padding: 0.55rem 1.15rem;
+  background: var(--panel-soft);
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
+.project-middle-tabs button {
+  min-height: 2rem;
+  padding: 0.3rem 0.75rem;
+}
+
+.project-files-panel,
+.project-discussion-panel {
+  min-width: 0;
+}
+
+.project-overview .file-toolbar {
+  margin: 0;
+  padding: 0.85rem 1.15rem;
+  background: var(--panel-soft);
+  border-bottom: 1px solid var(--border);
+}
+
+.project-overview .project-browser {
+  min-height: 32rem;
+}
+
+.project-overview .project-editor {
+  min-height: 32rem;
+}
+
+.project-git .collab-layout {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.project-git .collab-list {
+  border-right: 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.project-git .collab-detail {
+  padding: 1rem 1.15rem;
+}
+
+.project-git .project-tabs {
+  padding: 0.55rem 0.9rem;
+}
+
+@media (max-width: 980px) {
+  .projects-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .project-overview,
+  .project-git,
+  .project-empty-shell {
+    grid-column: auto;
+  }
+
+  .project-overview {
+    position: static;
+  }
+}
