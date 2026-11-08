@@ -327,7 +327,7 @@ impl KychMcp {
         Ok(text_result(json!({ "deleted": slug }).to_string()))
     }
 
-    #[tool(description = "列出所有项目（slug、项目标题、默认分支、更新时间）。")]
+    #[tool(description = "列出所有项目（项目名 slug、描述、默认分支、更新时间）。")]
     async fn list_projects(
         &self,
         Extension(parts): Extension<Parts>,

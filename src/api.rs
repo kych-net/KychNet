@@ -1507,14 +1507,12 @@ pub async fn serve(cfg: Config) -> Result<()> {
 #[derive(Deserialize)]
 struct ProjectCreateBody {
     slug: String,
-    title: String,
     #[serde(default)]
     description: String,
 }
 
 #[derive(Deserialize)]
 struct ProjectUpdateBody {
-    title: Option<String>,
     description: Option<String>,
     archived: Option<bool>,
 }
@@ -1577,7 +1575,6 @@ async fn project_create(
         &state.pool,
         &user,
         &body.slug,
-        &body.title,
         &body.description,
     )
     .await?;
@@ -1619,7 +1616,6 @@ async fn project_update(
     let project = crate::project::update_project(
         &state.pool,
         id,
-        body.title.as_deref().unwrap_or(&existing.title),
         body.description
             .as_deref()
             .unwrap_or(&existing.description),

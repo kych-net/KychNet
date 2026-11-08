@@ -596,7 +596,7 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
         }
         if let Some(home) = project_home_slug(&snapshot.project.slug, &snapshot.files) {
             project_links.push(PostLink {
-                title: snapshot.project.title.clone(),
+                title: snapshot.project.slug.clone(),
                 href: content_url(&home),
                 date: snapshot.committed_at.format("%Y-%m-%d").to_string(),
             });

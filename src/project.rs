@@ -22,7 +22,6 @@ pub const PROJECT_NAMESPACE: &str = "项目";
 pub struct Project {
     pub id: Uuid,
     pub slug: String,
-    pub title: String,
     pub description: String,
     pub default_branch: String,
     #[serde(default)]
@@ -221,15 +220,10 @@ pub async fn create_project(
     pool: &PgPool,
     user: &User,
     slug: &str,
-    title: &str,
     description: &str,
 ) -> Result<Project> {
     if !valid_project_slug(slug) {
         bail!("项目名只能包含非特殊 UTF-8 字符，不能含 / \\ ? # % 或空白");
-    }
-    let title = title.trim();
-    if title.is_empty() || title.chars().count() > 200 {
-        bail!("项目标题需为 1-200 个字符");
     }
 
     let mut tx = pool.begin().await?;
@@ -244,13 +238,12 @@ pub async fn create_project(
     }
 
     let project = sqlx::query_as::<_, Project>(
-        "INSERT INTO projects (id, slug, title, description, created_by)
-         VALUES ($1, $2, $3, $4, $5)
+        "INSERT INTO projects (id, slug, description, created_by)
+         VALUES ($1, $2, $3, $4)
          RETURNING *",
     )
     .bind(Uuid::new_v4())
     .bind(slug)
-    .bind(title)
     .bind(description.trim())
     .bind(user.id)
     .fetch_one(&mut *tx)
@@ -263,10 +256,7 @@ pub async fn create_project(
     })?;
 
     let mut files = BTreeMap::new();
-    let index = format!(
-        "---\ntitle: {title}\n---\n\n{}\n",
-        description.trim()
-    );
+    let index = format!("# {slug}\n\n{}\n", description.trim());
     files.insert("index.md".to_string(), index.into_bytes());
     let tree_oid = tree::build_from_files(&mut tx, project.id, &files).await?;
     commit_files(
@@ -315,22 +305,12 @@ pub async fn find_project_by_slug(pool: &PgPool, slug: &str) -> Result<Option<Pr
     )
 }
 
-pub async fn update_project(
-    pool: &PgPool,
-    id: Uuid,
-    title: &str,
-    description: &str,
-) -> Result<Project> {
-    let title = title.trim();
-    if title.is_empty() || title.chars().count() > 200 {
-        bail!("项目标题需为 1-200 个字符");
-    }
+pub async fn update_project(pool: &PgPool, id: Uuid, description: &str) -> Result<Project> {
     sqlx::query_as::<_, Project>(
-        "UPDATE projects SET title = $2, description = $3, updated_at = now()
+        "UPDATE projects SET description = $2, updated_at = now()
          WHERE id = $1 RETURNING *",
     )
     .bind(id)
-    .bind(title)
     .bind(description.trim())
     .fetch_optional(pool)
     .await?
