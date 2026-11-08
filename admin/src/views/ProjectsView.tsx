@@ -129,7 +129,6 @@ export function ProjectsView() {
 
   const [creating, setCreating] = useState(false);
   const [newSlug, setNewSlug] = useState("");
-  const [newTitle, setNewTitle] = useState("");
   const [newDescription, setNewDescription] = useState("");
 
   const [tab, setTab] = useState<"files" | "prs" | "discussions" | "history">("files");
@@ -598,14 +597,12 @@ export function ProjectsView() {
     try {
       const result = await api.createProject({
         slug: newSlug,
-        title: newTitle,
         description: newDescription,
       });
       setCreating(false);
       setNewSlug("");
-      setNewTitle("");
       setNewDescription("");
-      setNotice(`项目「${result.item.title}」已创建`);
+      setNotice(`项目「${result.item.slug}」已创建`);
       await refreshProjects();
       await selectProject(result.item);
     } catch (e) {
@@ -617,11 +614,10 @@ export function ProjectsView() {
 
   async function editProject() {
     if (!selected) return;
-    const title = window.prompt("项目标题", selected.title);
-    if (title === null) return;
-    const description = window.prompt("项目描述", selected.description) ?? "";
+    const description = window.prompt("项目描述", selected.description);
+    if (description === null) return;
     try {
-      const result = await api.updateProject(selected.id, { title, description });
+      const result = await api.updateProject(selected.id, { description });
       setSelected(result.item);
       setNotice("项目信息已更新");
       await refreshProjects();
@@ -632,7 +628,7 @@ export function ProjectsView() {
 
   async function archiveProject() {
     if (!selected) return;
-    if (!window.confirm(`归档项目「${selected.title}」？归档后不再出现在列表和站点中。`)) return;
+    if (!window.confirm(`归档项目「${selected.slug}」？归档后不再出现在列表和站点中。`)) return;
     try {
       await api.updateProject(selected.id, { archived: true });
       setSelected(null);
@@ -668,10 +664,6 @@ export function ProjectsView() {
                 />
               </label>
               <label>
-                标题
-                <input value={newTitle} onChange={(e) => setNewTitle(e.target.value)} required />
-              </label>
-              <label>
                 描述
                 <textarea
                   value={newDescription}
@@ -697,8 +689,7 @@ export function ProjectsView() {
                   className={selected?.id === project.id ? "active" : ""}
                   onClick={() => void selectProject(project)}
                 >
-                  <span>{project.title}</span>
-                  <small>/{project.slug}</small>
+                  <span>{project.slug}</span>
                 </button>
               </li>
             ))}
@@ -712,7 +703,7 @@ export function ProjectsView() {
             <>
               <div className="project-head">
                 <div>
-                  <h3>{selected.title}</h3>
+                  <h3>{selected.slug}</h3>
                   <p className="hint">
                     内容路径 <code>/项目/{selected.slug}/</code> · 仓库{" "}
                     <code>{gitUrl(selected.slug)}</code>

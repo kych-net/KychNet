@@ -95,7 +95,6 @@ export type BuildStatus = {
 export type Project = {
   id: string;
   slug: string;
-  title: string;
   description: string;
   default_branch: string;
   created_by: string | null;
@@ -391,14 +390,14 @@ export const api = {
   rebuild: () => request<BuildStatus>("/admin/rebuild", { method: "POST" }),
 
   projects: () => request<{ items: Project[] }>("/projects"),
-  createProject: (payload: { slug: string; title: string; description: string }) =>
+  createProject: (payload: { slug: string; description: string }) =>
     request<{ item: Project }>("/projects", {
       method: "POST",
       body: JSON.stringify(payload),
     }),
   project: (id: string) =>
     request<{ item: Project; branches: string[] }>(`/projects/${id}`),
-  updateProject: (id: string, payload: { title?: string; description?: string; archived?: boolean }) =>
+  updateProject: (id: string, payload: { description?: string; archived?: boolean }) =>
     request<{ item: Project }>(`/projects/${id}`, {
       method: "PATCH",
       body: JSON.stringify(payload),
