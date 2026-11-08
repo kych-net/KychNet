@@ -353,6 +353,8 @@ async fn claim_one(state: &WorkflowState, executor_id: Uuid) -> Result<Option<Va
     .await
     .map_err(internal)?;
 
+    let workflow_dir =
+        super::resolve_workflow_dir(&state.pool, &project.3).await.map_err(internal)?;
     let payload: Value = match row.event_id {
         Some(id) => sqlx::query_scalar("SELECT payload FROM workflow_events WHERE id = $1")
             .bind(id)
@@ -379,7 +381,7 @@ async fn claim_one(state: &WorkflowState, executor_id: Uuid) -> Result<Option<Va
             "id": project.0,
             "slug": project.1,
             "default_branch": project.2,
-            "workflow_dir": project.3
+            "workflow_dir": workflow_dir
         },
         "commit_oid": hex::encode(row.commit_oid.unwrap_or_default()),
         "def_commit_oid": hex::encode(row.def_commit_oid.unwrap_or_default()),

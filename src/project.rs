@@ -25,6 +25,8 @@ pub struct Project {
     pub title: String,
     pub description: String,
     pub default_branch: String,
+    #[serde(default)]
+    pub workflow_dir: String,
     pub created_by: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

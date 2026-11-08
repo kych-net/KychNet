@@ -10,6 +10,7 @@
 
 pub mod dispatch;
 pub mod event;
+pub mod management;
 pub mod queue;
 pub mod runner_api;
 pub mod snapshot;
@@ -26,6 +27,46 @@ pub use runner_api::{router, WorkflowConfig, WorkflowState};
 /// 属**不兼容升级**，升级时需同步重启 KychRunner。
 pub const PROTOCOL_VERSION: i32 = 2;
 
+
+/// 旧版本硬编码/占位目录；现在都映射到 `.<site_name>/工作流`。
+fn is_legacy_dir(value: &str) -> bool {
+    matches!(
+        value.trim().trim_end_matches('/'),
+        "" | ".github/workflows" | ".网站名称/工作流"
+    )
+}
+
+fn sanitize_site_dir(site_name: &str) -> String {
+    let mut out = String::new();
+    for ch in site_name.trim().chars() {
+        if ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.') {
+            out.push(ch);
+        } else if ch.is_whitespace() {
+            out.push('-');
+        }
+    }
+    if out.is_empty() {
+        "kych-net".to_string()
+    } else {
+        out
+    }
+}
+
+/// 未显式配置时使用设置里的真实站点名称：`.<site_name>/工作流`。
+pub async fn resolve_workflow_dir(pool: &PgPool, configured: &str) -> anyhow::Result<String> {
+    let configured = configured.trim().trim_end_matches('/');
+    if !is_legacy_dir(configured) {
+        return Ok(configured.to_string());
+    }
+    let site_name = match crate::service::get_settings(pool).await {
+        Ok(settings) => settings.site_name,
+        Err(error) => {
+            tracing::warn!(%error, "读取站点名称失败，工作流目录回退 kych-net");
+            "kych-net".to_string()
+        }
+    };
+    Ok(format!(".{}/工作流", sanitize_site_dir(&site_name)))
+}
 /// 在 `api::router()` 里构造一次，传给 `workflow::router()` 与 `spawn_pruner()`。
 pub fn build_state(
     pool: PgPool,

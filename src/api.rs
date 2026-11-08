@@ -1390,6 +1390,15 @@ pub async fn serve(cfg: Config) -> Result<()> {
         .route("/api/projects/{id}/move", post(project_move_file))
         .route("/api/projects/{id}/commits", get(project_commits))
         .route(
+            "/api/projects/{id}/workflows",
+            get(project_workflows).put(project_workflows_update),
+        )
+        .route(
+            "/api/projects/{id}/workflows/dispatch",
+            post(project_workflow_dispatch),
+        )
+        .route("/api/projects/{id}/runs", get(project_runs))
+        .route(
             "/api/projects/{id}/commits/{oid}",
             get(project_commit_detail),
         )
@@ -1431,6 +1440,8 @@ pub async fn serve(cfg: Config) -> Result<()> {
             get(git_token_list).post(git_token_create),
         )
         .route("/api/git-tokens/{id}", delete(git_token_revoke))
+        .route("/api/runners", get(runner_list).post(runner_create))
+        .route("/api/runners/{id}", patch(runner_update))
         // /git/ 下有两类通道：<slug>.git/... 是 Git smart HTTP（匿名 clone，
         // 写入需 Git 令牌或登录会话）；<slug>/... 是站内文件树接口（公开只读，
         // 登录用户可写）。推送的 pack 可能远大于普通 API 请求，放宽上限。
@@ -1762,6 +1773,126 @@ struct BranchCreateBody {
     name: String,
     #[serde(default)]
     from: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WorkflowToggleBody {
+    path: String,
+    enabled: bool,
+}
+
+#[derive(Deserialize)]
+struct WorkflowDispatchBody {
+    #[serde(default)]
+    inputs: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct RunnerCreateBody {
+    name: String,
+    #[serde(default)]
+    labels: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct RunnerUpdateBody {
+    enabled: bool,
+}
+
+async fn project_workflows(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current_admin(&state, &session).await?;
+    let (workflow_dir, default_branch, items) =
+        crate::workflow::management::list_for_project(&state.pool, id).await?;
+    Ok(Json(json!({
+        "workflow_dir": workflow_dir,
+        "default_branch": default_branch,
+        "items": items,
+    })))
+}
+
+async fn project_workflows_update(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+    Json(body): Json<WorkflowToggleBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let admin = current_admin(&state, &session).await?;
+    crate::workflow::management::set_enabled(
+        &state.pool,
+        id,
+        &body.path,
+        body.enabled,
+        admin.id,
+    )
+    .await?;
+    Ok(Json(json!({ "path": body.path, "enabled": body.enabled })))
+}
+
+async fn project_workflow_dispatch(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+    Json(body): Json<WorkflowDispatchBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let admin = current_admin(&state, &session).await?;
+    crate::workflow::management::dispatch(
+        &state.pool,
+        id,
+        admin.id,
+        &admin.username,
+        body.inputs.unwrap_or_else(|| json!({})),
+    )
+    .await?;
+    Ok(Json(json!({ "queued": true })))
+}
+
+async fn project_runs(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current_admin(&state, &session).await?;
+    let items = crate::workflow::management::runs(&state.pool, id).await?;
+    Ok(Json(json!({ "items": items })))
+}
+
+async fn runner_list(
+    State(state): State<AppState>,
+    session: Session,
+) -> ApiResult<Json<serde_json::Value>> {
+    current_admin(&state, &session).await?;
+    let items = crate::workflow::management::runners(&state.pool).await?;
+    Ok(Json(json!({ "items": items })))
+}
+
+async fn runner_create(
+    State(state): State<AppState>,
+    session: Session,
+    Json(body): Json<RunnerCreateBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current_admin(&state, &session).await?;
+    let (id, code) = crate::workflow::management::create_registration_code(
+        &state.pool,
+        &body.name,
+        body.labels,
+    )
+    .await?;
+    Ok(Json(json!({ "runner_id": id, "registration_code": code })))
+}
+
+async fn runner_update(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+    Json(body): Json<RunnerUpdateBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current_admin(&state, &session).await?;
+    crate::workflow::management::set_runner_enabled(&state.pool, id, body.enabled).await?;
+    Ok(Json(json!({ "id": id, "enabled": body.enabled })))
 }
 
 async fn project_commits(
