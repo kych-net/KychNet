@@ -3,6 +3,7 @@ import { marked } from "marked";
 import { api, Content, ContentFormat, editorPath } from "../api";
 import { CodeEditor } from "../components/CodeEditor";
 import { DirTree } from "../components/DirTree";
+import { RevisionPanel } from "../components/RevisionPanel";
 
 function formatLabel(format: ContentFormat): string {
   switch (format) {
@@ -73,6 +74,7 @@ export function ContentsView() {
   const [format, setFormat] = useState<ContentFormat>("markdown");
   const [body, setBody] = useState("");
   const [published, setPublished] = useState(false);
+  const [message, setMessage] = useState("");
   const [previewOn, setPreviewOn] = useState(true);
   const [previewHtml, setPreviewHtml] = useState("");
   const [previewError, setPreviewError] = useState("");
@@ -167,10 +169,12 @@ export function ContentsView() {
         format,
         body,
         published,
+        message: message.trim() || undefined,
       });
       // 服务端会把 /xef/index、/eoe/index.md 归一化成输出路径，这里回显源文件路径。
       setContentId(result.item.id);
       setSlug(editorPath(result.item));
+      setMessage("");
       setNotice(published ? "内容已保存，并已自动编译当前页" : "内容已保存（草稿，暂不生成页面）");
       await refresh();
     } catch (e) {
@@ -193,6 +197,7 @@ export function ContentsView() {
     setFormat(item.format);
     setBody(item.body);
     setPublished(item.published);
+    setMessage("");
   }
 
   function changeFormat(next: ContentFormat) {
@@ -211,6 +216,7 @@ export function ContentsView() {
     setFormat("markdown");
     setBody("");
     setPublished(false);
+    setMessage("");
     setError("");
     setNotice("");
   }
@@ -329,6 +335,14 @@ export function ContentsView() {
             />
             发布
           </label>
+          <label>
+            版本说明
+            <input
+              value={message}
+              onChange={(e) => setMessage(e.target.value)}
+              placeholder="可选，记入版本历史"
+            />
+          </label>
           <button type="submit">保存</button>
           <button type="button" onClick={newContent}>
             新建内容
@@ -366,7 +380,21 @@ export function ContentsView() {
       </table>
       </div>
         </div>
-        <aside className="contents-aux" aria-hidden="true" />
+        <aside className="contents-aux">
+          <RevisionPanel
+            contentId={contentId}
+            onReverted={(item) => {
+              // 回滚是移动指针：编辑器同步显示回滚后的正文与格式。
+              setContentId(item.id);
+              setSlug(editorPath(item));
+              setFormat(item.format);
+              setBody(item.body);
+              setPublished(item.published);
+              setNotice(`已回滚到版本 ${item.rev_seq}`);
+              void refresh();
+            }}
+          />
+        </aside>
       </div>
     </section>
   );

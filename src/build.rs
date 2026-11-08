@@ -586,6 +586,7 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
                         published: true,
                         created_at: snapshot.committed_at,
                         updated_at: snapshot.committed_at,
+                        rev_seq: 0,
                     });
                     if format == ContentFormat::Typst {
                         project_typst.insert(slug, (files_map.clone(), path.clone()));
@@ -1081,6 +1082,7 @@ mod tests {
             published: true,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            rev_seq: 0,
         };
         tree.insert("index.html", &content("index.html", "主页"));
         tree.insert("xef/index.html", &content("xef/index.html", "xef"));

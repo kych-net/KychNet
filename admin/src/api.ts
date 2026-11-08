@@ -65,6 +65,26 @@ export type Content = {
   published: boolean;
   created_at: string;
   updated_at: string;
+  /** 当前版本指针：指向 content_revisions 里正在展示的版本。 */
+  rev_seq: number;
+};
+
+export type ContentRevision = {
+  id: string;
+  content_id: string;
+  seq: number;
+  parent_seq: number | null;
+  kind: "full" | "delta";
+  slug: string;
+  format: string;
+  added: number;
+  removed: number;
+  author_id: string | null;
+  author_name: string | null;
+  message: string;
+  byte_size: number;
+  created_at: string;
+  is_current: boolean;
 };
 
 /** 输出路径对应的源文件路径，用于编辑器展示。 */
@@ -361,12 +381,23 @@ export const api = {
     format: ContentFormat;
     body: string;
     published: boolean;
+    message?: string;
   }) =>
     request<{ item: Content }>("/contents", {
       method: "POST",
       body: JSON.stringify(payload),
     }),
   deleteContent: (id: string) => request<void>(`/contents/${id}`, { method: "DELETE" }),
+  revisions: (id: string) =>
+    request<{ items: ContentRevision[]; current_seq: number }>(`/contents/${id}/revisions`),
+  revisionBody: (id: string, seq: number) =>
+    request<{ seq: number; format: string; body: string }>(`/contents/${id}/revisions/${seq}`),
+  revisionDiff: (id: string, seq: number, against?: number) =>
+    request<{ diff: string }>(
+      `/contents/${id}/revisions/${seq}/diff${against ? `?against=${against}` : ""}`,
+    ),
+  revertRevision: (id: string, seq: number) =>
+    request<{ item: Content }>(`/contents/${id}/revisions/${seq}/revert`, { method: "POST" }),
   previewContent: (format: ContentFormat, body: string) =>
     request<{ html: string }>("/preview", {
       method: "POST",

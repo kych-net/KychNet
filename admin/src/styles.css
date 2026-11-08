@@ -2361,6 +2361,130 @@ code,
   border-radius: 13px;
 }
 
+/* 精简版历史面板（右栏 contents-aux） */
+.revision-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  padding: 0.75rem;
+  max-height: calc(100vh - 6.5rem);
+  overflow: auto;
+}
+
+.revision-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.revision-head strong {
+  font-size: 0.86rem;
+}
+
+.revision-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.revision-list li {
+  padding: 0.5rem 0.55rem;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+}
+
+.revision-list li.is-current {
+  border-color: var(--accent, #2f7d5c);
+}
+
+.revision-line {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.revision-line.revision-sub {
+  margin-top: 0.15rem;
+}
+
+.revision-badge {
+  padding: 0.05rem 0.4rem;
+  color: #fff;
+  background: var(--accent, #2f7d5c);
+  border-radius: 999px;
+  font-size: 0.62rem;
+  font-weight: 700;
+}
+
+.revision-meta {
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.revision-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  margin-top: 0.35rem;
+}
+
+.revision-actions button {
+  padding: 0.2rem 0.5rem;
+  font-size: 0.72rem;
+}
+
+.revision-diff {
+  margin: 0;
+  padding: 0.55rem;
+  overflow-x: auto;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.72rem;
+  line-height: 1.5;
+  white-space: pre;
+}
+
+.diff-add { color: #1a7f37; background: rgba(26, 127, 55, 0.12); }
+.diff-del { color: #cf222e; background: rgba(207, 34, 46, 0.12); }
+.diff-hunk { color: #1f6feb; }
+.diff-head { color: var(--muted); }
+
+.revision-body {
+  margin: 0;
+  padding: 0.55rem;
+  max-height: 30rem;
+  overflow: auto;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.74rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.link-button {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent, #1f6feb);
+  cursor: pointer;
+  font-size: 0.74rem;
+}
+
+.link-button:disabled {
+  color: var(--muted);
+  cursor: default;
+}
+
 .contents-main > .table-wrap {
   margin-top: 1.1rem;
 }
