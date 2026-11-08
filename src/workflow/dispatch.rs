@@ -60,8 +60,9 @@ async fn tick(state: &WorkflowState, build_queue: &BuildQueue) -> Result<bool> {
     .bind(event.project_id)
     .fetch_one(&mut *tx)
     .await
-    .unwrap_or_else(|_| ("main".to_string(), ".网站名称/工作流".to_string(), false));
+    .unwrap_or_else(|_| ("main".to_string(), String::new(), false));
     let (default_branch, workflow_dir, require_checks) = project_meta;
+    let workflow_dir = super::resolve_workflow_dir(&state.pool, &workflow_dir).await?;
     let on_default = event.ref_name == format!("refs/heads/{default_branch}");
     let wants_publish = matches!(event.kind.as_str(), "push" | "pr_merged" | "manual") && on_default;
     if wants_publish {

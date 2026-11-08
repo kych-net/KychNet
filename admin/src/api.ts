@@ -8,6 +8,36 @@ export type User = {
 
 export type NavLink = { label: string; href: string };
 
+export type WorkflowItem = {
+  path: string;
+  enabled: boolean;
+  approved_at: string | null;
+};
+
+export type WorkflowRun = {
+  id: string;
+  workflow_path: string;
+  event_kind: string;
+  ref_name: string;
+  status: string;
+  conclusion: string | null;
+  skipped_reason: string | null;
+  attempt: number;
+  workflow_dir: string;
+  created_at: string;
+  finished_at: string | null;
+};
+
+export type WorkflowRunner = {
+  id: string;
+  name: string;
+  enabled: boolean;
+  protocol_version: number;
+  labels: string[];
+  last_seen_at: string | null;
+};
+
+
 export type SiteSettings = {
   site_name: string;
   description: string;
@@ -484,4 +514,31 @@ export const api = {
     }),
   revokeGitToken: (id: string) =>
     request<void>(`/git-tokens/${id}`, { method: "DELETE" }),
+  projectWorkflows: (id: string) =>
+    request<{ workflow_dir: string; default_branch: string; items: WorkflowItem[] }>(
+      `/projects/${id}/workflows`,
+    ),
+  setProjectWorkflow: (id: string, path: string, enabled: boolean) =>
+    request<{ path: string; enabled: boolean }>(`/projects/${id}/workflows`, {
+      method: "PUT",
+      body: JSON.stringify({ path, enabled }),
+    }),
+  dispatchProjectWorkflow: (id: string) =>
+    request<{ queued: boolean }>(`/projects/${id}/workflows/dispatch`, {
+      method: "POST",
+      body: JSON.stringify({ inputs: {} }),
+    }),
+  projectRuns: (id: string) => request<{ items: WorkflowRun[] }>(`/projects/${id}/runs`),
+  runners: () => request<{ items: WorkflowRunner[] }>("/runners"),
+  createRunner: (name: string, labels: string[]) =>
+    request<{ runner_id: string; registration_code: string }>("/runners", {
+      method: "POST",
+      body: JSON.stringify({ name, labels }),
+    }),
+  setRunnerEnabled: (id: string, enabled: boolean) =>
+    request<{ id: string; enabled: boolean }>(`/runners/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ enabled }),
+    }),
+
 };

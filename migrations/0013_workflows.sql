@@ -14,12 +14,12 @@
 ALTER TABLE projects
     ADD COLUMN IF NOT EXISTS require_workflow_checks BOOLEAN NOT NULL DEFAULT false,
     ADD COLUMN IF NOT EXISTS require_executor_for_merge BOOLEAN NOT NULL DEFAULT false,
-    ADD COLUMN IF NOT EXISTS workflow_dir TEXT NOT NULL DEFAULT '.网站名称/工作流',
+    ADD COLUMN IF NOT EXISTS workflow_dir TEXT NOT NULL DEFAULT '',
     ADD COLUMN IF NOT EXISTS workflow_executor_enabled BOOLEAN NOT NULL DEFAULT true,
     ADD COLUMN IF NOT EXISTS publish_on_check_success BOOLEAN NOT NULL DEFAULT false;
-ALTER TABLE projects ALTER COLUMN workflow_dir SET DEFAULT '.网站名称/工作流';
-UPDATE projects SET workflow_dir = '.网站名称/工作流'
- WHERE workflow_dir = '.github/workflows';
+ALTER TABLE projects ALTER COLUMN workflow_dir SET DEFAULT '';
+UPDATE projects SET workflow_dir = ''
+ WHERE workflow_dir IN ('.github/workflows', '.网站名称/工作流', '.网站名称/工作流/');
 
 -- 可选执行器注册表。token 明文只在注册时回显一次，服务端只存 SHA-256 hash。
 -- enabled=false 即「临时禁用」；撤销 token 后所有请求（含快照接口）立即 403。
@@ -47,7 +47,7 @@ CREATE INDEX IF NOT EXISTS workflow_runners_online_idx
 CREATE TABLE IF NOT EXISTS project_workflows (
     id UUID PRIMARY KEY,
     project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    path TEXT NOT NULL,                       -- 例如 .网站名称/工作流/site.yml
+    path TEXT NOT NULL,                       -- 例如 .KychNet/工作流/site.yml
     enabled BOOLEAN NOT NULL DEFAULT false,
     approved_by UUID REFERENCES users(id) ON DELETE SET NULL,
     approved_at TIMESTAMPTZ,
