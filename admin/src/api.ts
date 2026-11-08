@@ -55,7 +55,7 @@ export type Invite = {
   created_at: string;
 };
 
-export type ContentFormat = "markdown" | "html" | "typst" | "wikidot" | "css";
+export type ContentFormat = "markdown" | "html" | "typst" | "wikidot" | "css" | "svg";
 
 export type Content = {
   id: string;
@@ -71,8 +71,16 @@ export type Content = {
 export function sourcePath(item: { slug: string; format: ContentFormat }): string {
   if (item.format === "css") return item.slug;
   const ext =
-    item.format === "markdown" ? ".md" : item.format === "typst" ? ".typ" : item.format === "wikidot" ? ".wj" : ".html";
-  return item.slug.replace(/\.html$/, ext);
+    item.format === "markdown"
+      ? ".md"
+      : item.format === "typst"
+        ? ".typ"
+        : item.format === "wikidot"
+          ? ".wj"
+          : item.format === "svg"
+            ? ".svg"
+            : ".html";
+  return item.slug.replace(/\.(html|svg)$/, ext);
 }
 
 /** 编辑器里显示的绝对路径，例如 /eoe/index.md。 */

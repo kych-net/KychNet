@@ -20,11 +20,13 @@ function formatLabel(format: ContentFormat): string {
       return "Wikidot";
     case "css":
       return "CSS";
+    case "svg":
+      return "SVG";
   }
 }
 
 function extensionFor(format: ContentFormat): string {
-  return format === "markdown" ? ".md" : format === "typst" ? ".typ" : format === "wikidot" ? ".wj" : format === "css" ? ".css" : ".html";
+  return format === "markdown" ? ".md" : format === "typst" ? ".typ" : format === "wikidot" ? ".wj" : format === "css" ? ".css" : format === "svg" ? ".svg" : ".html";
 }
 
 function stripPreviewHeader(body: string): string {
@@ -84,7 +86,7 @@ export function ContentsView({ editContentId, onEditHandled }: Props) {
     void refresh();
   }, []);
   const previewSupported =
-    format === "markdown" || format === "html" || format === "wikidot";
+    format === "markdown" || format === "html" || format === "wikidot" || format === "svg";
 
   useEffect(() => {
     if (!previewOn || !previewSupported) {
@@ -93,7 +95,13 @@ export function ContentsView({ editContentId, onEditHandled }: Props) {
       setPreviewLoading(false);
       return;
     }
-    // Markdown 和 HTML 用浏览器端渲染，不走 API。
+    // SVG 直接交给 iframe；Markdown 和 HTML 用浏览器端渲染，不走 API。
+    if (format === "svg") {
+      setPreviewHtml(body);
+      setPreviewError("");
+      setPreviewLoading(false);
+      return;
+    }
     if (format === "html" || format === "markdown") {
       try {
         const source = stripPreviewHeader(body);
@@ -203,7 +211,7 @@ export function ContentsView({ editContentId, onEditHandled }: Props) {
 
   function changeFormat(next: ContentFormat) {
     setFormat(next);
-    setSlug((current) => current.replace(/\.(html|md|typ)$/i, extensionFor(next)));
+    setSlug((current) => current.replace(/\.(html|md|typ|wj|svg)$/i, extensionFor(next)));
   }
 
   function newContent() {
@@ -241,6 +249,7 @@ export function ContentsView({ editContentId, onEditHandled }: Props) {
               <option value="typst">Typst</option>
               <option value="wikidot">Wikidot</option>
               <option value="css">CSS</option>
+              <option value="svg">SVG</option>
             </select>
           </label>
         </div>
@@ -248,6 +257,7 @@ export function ContentsView({ editContentId, onEditHandled }: Props) {
           目录主页必须写 <code>/eoe/index</code>，不再接受 <code>/eoe/</code>；普通页面用 <code>/reff/93df/l.html</code>。
           <code>.html/.md/.typ/.wj</code> 最终都输出同一个 <code>.html</code>，同一路径只保留一条内容。
           <code>/api</code> 是保留路径；<code>/index.html</code> 是主页，只能编辑不能删除。
+          SVG 文件使用 <code>/media/xxx.svg</code> 路径和 SVG 格式，原样输出，不套页面模板。
           CSS 文件必须使用 <code>/css/xxx</code> 路径和 CSS 格式；页面正文最前面写
           <code>---</code>、<code>css: /css/xxx.css</code>、<code>---</code> 才会加载它。
         </p>

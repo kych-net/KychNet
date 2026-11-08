@@ -388,6 +388,9 @@ fn write_sitemap(out: &Path, cfg: &Config, pages: &[BuiltPage]) -> Result<()> {
     );
     let mut seen = std::collections::HashSet::new();
     for page in pages {
+        if page.slug.ends_with(".svg") {
+            continue;
+        }
         let loc = format!("{base}{}", content_url(&page.slug));
         if !seen.insert(loc.clone()) {
             continue;
@@ -511,7 +514,9 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
             } else {
                 tracing::warn!("跳过非法 CSS slug: {:?}", content.slug);
             }
-        } else if service::valid_content_slug(&content.slug) {
+        } else if service::valid_content_slug(&content.slug)
+            || service::valid_svg_slug(&content.slug)
+        {
             contents.push(content);
         } else {
             // 历史脏数据不该让整站构建永久失败。新增数据已在 save_content 拦住，
@@ -622,6 +627,16 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
     // 先把所有页面渲染到内存。任何一篇 Typst 编译失败都不会触碰磁盘。
     let mut pages = Vec::new();
     for content in &contents {
+        if content.format() == ContentFormat::Svg {
+            pages.push(BuiltPage {
+                slug: content.slug.clone(),
+                title: source_filename(&content.slug, content.format()),
+                date: content.updated_at.format("%Y-%m-%d").to_string(),
+                html: content.body.clone(),
+                pdf: None,
+            });
+            continue;
+        }
         let page = content
             .slug
             .strip_suffix(".html")
@@ -724,6 +739,7 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
     } else {
         let mut links: Vec<PostLink> = pages
             .iter()
+            .filter(|page| !page.slug.ends_with(".svg"))
             .map(|page| PostLink {
                 title: page.title.clone(),
                 href: content_url(&page.slug),
@@ -802,11 +818,18 @@ pub async fn run_one(
     only: &str,
     remove: Option<&str>,
 ) -> Result<()> {
-    if !service::valid_content_slug(only) && !service::valid_style_slug(only) {
+    if !service::valid_content_slug(only)
+        && !service::valid_style_slug(only)
+        && !service::valid_svg_slug(only)
+    {
         bail!("非法内容路径: {only}");
     }
     if let Some(old) = remove {
-        if old != only && (service::valid_content_slug(old) || service::valid_style_slug(old)) {
+        if old != only
+            && (service::valid_content_slug(old)
+                || service::valid_style_slug(old)
+                || service::valid_svg_slug(old))
+        {
             remove_output(out, old)?;
         }
     }
@@ -820,7 +843,9 @@ pub async fn run_one(
             if service::valid_style_slug(&content.slug) {
                 styles.push(content);
             }
-        } else if service::valid_content_slug(&content.slug) {
+        } else if service::valid_content_slug(&content.slug)
+            || service::valid_svg_slug(&content.slug)
+        {
             contents.push(content);
         }
     }
@@ -855,6 +880,10 @@ pub async fn run_one(
         return Ok(());
     };
 
+    if content.format() == ContentFormat::Svg {
+        write_raw(out, &content.slug, content.body.as_bytes())?;
+        return Ok(());
+    }
     let (styles, body) = parse_page_styles(&content.body)?;
     let page = content
         .slug

@@ -86,6 +86,11 @@ pub fn render_doc_with_project(
         }),
         ContentFormat::Typst => render_typst(body, root, files, main_path),
         ContentFormat::Wikidot => render_wikidot(body, ctx),
+        // SVG 是原样输出的静态资源，不套 HTML 模板。
+        ContentFormat::Svg => Ok(Rendered {
+            html: body.to_string(),
+            pdf: None,
+        }),
         ContentFormat::Css => bail!("CSS 文件不是页面，不能走页面渲染"),
     }
 }
