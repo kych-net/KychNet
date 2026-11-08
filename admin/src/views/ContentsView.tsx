@@ -2,11 +2,7 @@ import { useEffect, useState } from "react";
 import { marked } from "marked";
 import { api, Content, ContentFormat, editorPath } from "../api";
 import { CodeEditor } from "../components/CodeEditor";
-
-type Props = {
-  editContentId?: string | null;
-  onEditHandled?: () => void;
-};
+import { DirTree } from "../components/DirTree";
 
 function formatLabel(format: ContentFormat): string {
   switch (format) {
@@ -67,7 +63,7 @@ function previewDocument(html: string): string {
 </html>`;
 }
 
-export function ContentsView({ editContentId, onEditHandled }: Props) {
+export function ContentsView() {
   const [items, setItems] = useState<Content[]>([]);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -81,6 +77,7 @@ export function ContentsView({ editContentId, onEditHandled }: Props) {
   const [previewHtml, setPreviewHtml] = useState("");
   const [previewError, setPreviewError] = useState("");
   const [previewLoading, setPreviewLoading] = useState(false);
+  const [mobileTreeOpen, setMobileTreeOpen] = useState(false);
 
   useEffect(() => {
     void refresh();
@@ -152,17 +149,6 @@ export function ContentsView({ editContentId, onEditHandled }: Props) {
   }, [body, format, previewOn, previewSupported]);
 
 
-  useEffect(() => {
-    if (!editContentId) {
-      return;
-    }
-    const item = items.find((entry) => entry.id === editContentId);
-    if (item) {
-      edit(item);
-      onEditHandled?.();
-    }
-  }, [editContentId, items, onEditHandled]);
-
   async function refresh() {
     try {
       setItems((await api.contents()).items);
@@ -214,6 +200,11 @@ export function ContentsView({ editContentId, onEditHandled }: Props) {
     setSlug((current) => current.replace(/\.(html|md|typ|wj|svg)$/i, extensionFor(next)));
   }
 
+  function editFromTree(item: Content) {
+    edit(item);
+    setMobileTreeOpen(false);
+  }
+
   function newContent() {
     setContentId(null);
     setSlug("");
@@ -230,6 +221,29 @@ export function ContentsView({ editContentId, onEditHandled }: Props) {
       {error && <p className="error">{error}</p>}
       {notice && <p className="notice">{notice}</p>}
 
+      <div className="contents-mobile-toggle-row">
+        <button
+          className="contents-mobile-toggle"
+          type="button"
+          onClick={() => setMobileTreeOpen((value) => !value)}
+        >
+          {mobileTreeOpen ? "编辑器" : "目录"}
+        </button>
+      </div>
+
+      <div className={`contents-layout ${mobileTreeOpen ? "show-tree" : ""}`}>
+        <aside className="contents-tree">
+          <div className="contents-tree-head">
+            <div>
+              <span className="contents-tree-kicker">URL</span>
+              <strong>内容树</strong>
+            </div>
+            <span className="contents-tree-count">{items.length}</span>
+          </div>
+          <DirTree items={items} onEdit={editFromTree} />
+        </aside>
+
+        <div className="contents-main">
       <form onSubmit={save}>
         <div className="row">
           <label>
@@ -350,6 +364,8 @@ export function ContentsView({ editContentId, onEditHandled }: Props) {
           ))}
         </tbody>
       </table>
+      </div>
+        </div>
       </div>
     </section>
   );
