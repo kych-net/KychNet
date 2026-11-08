@@ -1,196 +1,93 @@
-# 挂接清单：把 `src/workflow/` 接入现有代码
+# 工作流模块挂接记录
 
-本 PR 只新增文件，**不改动任何现有代码**，因此合入后不会破坏当前构建。
-下面给出让模块真正生效的最小改动，建议在同一个 feature 分支上追加一个 commit 完成。
+PR #19 的第一个 commit 只新增文件；**第二个 commit 已完成挂接**，把 `src/workflow/`
+真正接入主服务。下面是实际落地情况，以及相对初版清单的修正。
 
-> 所有片段按现有 `anyhow` + `sqlx 0.8` + `axum 0.8` 风格写就；
-> 挂接后请以 `cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test` 为准微调。
+## 1. 逐文件改动
 
-## 1. 注册模块（`src/main.rs`，约第 1 行）
+| 文件 | 改动 |
+| --- | --- |
+| `src/main.rs` | 注册 `mod workflow;` |
+| `src/api.rs` | `with_state` 之前克隆 `pool` / `build_ctl`；在管理端 layer 链之后构造 `WorkflowState`、启动 `spawn_pruner` + `spawn_dispatcher`、`nest("/api/runner", workflow::router(...))`；删除 `git_receive` 与 `pr_merge` 里的同步 `build_all()` |
+| `src/git/http.rs` | 去掉 `default_branch_updated: bool` 与同步构建触发；`checked` 元组带上 `old` / `new`；成功落库的每条 ref（含 tag、delete）在 `receive_pack` 内部收集为 `RefUpdate`（局部变量），并在 `tx.commit()` **之前** `enqueue()` push/tag 事件，对来源分支的开放 PR 追加 `pr_sync`。`ReceiveOutcome` 只回传 Git 协议响应，事件不再经上层二次触发 |
+| `src/collab.rs` | `create_pr` / `merge_pr` / `close_pr` 在各自事务提交前发 `pr_opened` / `pr_merged` / `pr_closed`；`merge_pr` 增加工作流检查门禁 |
+| `src/git/gc.rs` | `mark_reachable` 接收 `pending_commits()` 返回的 OID 作为额外可达种子，避免删除排队/执行中 run 还没读取的 Git 对象 |
+| `src/workflow/runner_api.rs` | 路由参数 `:id` → `{id}`（axum 0.8，初版会在注册路由时 panic）；`BuildCtl` 改从 `crate::api` 引入；修正日志字节数比较 |
+| `src/workflow/mod.rs` / `queue.rs` / `dispatch.rs` / `snapshot.rs` | `BuildCtl` 统一改从 `crate::api` 引入（实际定义在 `api.rs` 且需 `pub(crate)`）；`dispatch` 去掉 `tx.acquire()` 改用事务本身、补类型标注；`snapshot` 删除冗余 `RunRef.id`、修 USTAR 校验和单测；`mod.rs` 删除未使用的 `SNAPSHOT_SOURCE` |
 
-```rust
-mod api;
-// ... 现有模块 ...
-mod workflow;   // 新增
-```
+## 2. 相对初版清单的三处修正
 
-## 2. 构造状态并挂载路由（`src/api.rs`）
+1. **GC 不在 `src/build.rs`**，实际实现在 `src/git/gc.rs::mark_reachable()`。
+   把 `pending_commits()` 的结果并入初始 `stack`，这样被保护的不只是 commit 本身，
+   还包括它的整棵树与父提交——只把 OID 塞进 `reachable` 集合是不够的。
+2. **runner 路由挂在管理端 layer 链之后**（与 MCP 路由并列），不套
+   `DefaultBodyLimit::max(2 MiB)` 与 `guard_origin`：runner 用 token 认证、不带浏览器
+   Origin，日志分片上限是 8 MiB。
+3. **门禁按来源分支头校验**：`pr_checks.commit_oid` 绑定的是 PR 来源分支 head，
+   所以合并门禁用 `source`（而非目标分支 ref）比对，才能防止「检查通过后改代码再合并」。
 
-现有 `router()` 里 `let app = Router::new()...with_state(state)`（约 1329 / 1436 行）。
-`workflow::router()` 返回 `Router<()>`，所以要在 **`with_state` 之后** nest：
+## 3. 关键行为变化
 
-```rust
-// 在 with_state 之前先把资源克隆出来（state 会被 move）
-let wf_pool = state.pool.clone();
-let wf_build_ctl = state.build_ctl.clone();
+- push 响应**不再等待构建**：事件在 refs 事务内入队，发布由 `BuildQueue` 的 300ms
+  去重窗口串行执行。这修掉了「构建期间连续 push 静默丢内容更新」。
+- PR 合并接口**不再因构建失败返回 500**：门禁与事件入队都在 `collab::merge_pr`
+  事务里，失败整体回滚，前端不会误判「已合并但报错」。
+- 门禁查询在项目未开启 `require_workflow_checks` 或执行器缺席（没有 required 检查）时
+  返回通过，因此「没装 KychRunner 就永远不能合并 PR」不会发生。
 
-let app = Router::new()
-    // ... 现有全部 route ...
-    .with_state(state);                       // 现在 app: Router<()>
+## 4. 配置项
 
-let wf_state = workflow::build_state(wf_pool, wf_build_ctl);
+`WorkflowConfig::from_env()` 独立读环境变量，不需要改 `src/config.rs`：
 
-// 后台任务：事件分发 + 租约/过期扫描
-workflow::spawn_pruner(wf_state.clone());
-workflow::dispatch::spawn_dispatcher(
-    wf_state.clone(),
-    wf_state.build_queue.clone(),
-);
-
-let app = app
-    .nest("/api/runner", workflow::router(wf_state))
-    // 管理端（P1）：/api/projects/{id}/runs|workflows|dispatch|checks
-    .layer(middleware::from_fn_with_state(/* ... 现有 layer ... */));
-```
-
-`workflow::router()` 内部路径是 `/jobs/claim`、`/register` 等，nest 后即为
-`/api/runner/jobs/claim`。管理端 API 仍走 session 认证，与 runner token 互不影响。
-
-## 3. 配置项（无需改 `src/config.rs`）
-
-`WorkflowConfig::from_env()` 独立读环境变量：
-
-| 变量 | 默认 | 说明 |
-| --- | --- | --- |
-| `WORKFLOW_QUEUE_MAX` | `500` | queued run 上限 |
-| `RUN_LEASE_SECS` | `300` | 租约时长 |
-| `WORKFLOW_LOG_ROOT` | `logs/workflows` | 运行日志目录（DB 只存路径） |
-| `WORKFLOW_SNAPSHOT_CACHE` | `cache/workflow-snapshots` | tar.gz 内容寻址缓存 |
-| `MAX_SNAPSHOT_BYTES` | `209715200` | 快照原始字节上限 |
-| `MAX_LOG_BYTES` | `8388608` | 单 run 日志上限 |
-| `LFS_ROOT` | `lfs` | 与现有配置一致，用于还原 LFS pointer |
+| 变量 | 默认 |
+| --- | --- |
+| `WORKFLOW_QUEUE_MAX` | `500` |
+| `RUN_LEASE_SECS` | `300` |
+| `WORKFLOW_LOG_ROOT` | `logs/workflows` |
+| `WORKFLOW_SNAPSHOT_CACHE` | `cache/workflow-snapshots` |
+| `MAX_SNAPSHOT_BYTES` | `209715200` |
+| `MAX_LOG_BYTES` | `8388608` |
+| `LFS_ROOT` | `lfs` |
 
 **不需要** `ACT_BIN`、Docker 配置、`pg_dsn`——主服务不碰这些。
 
-## 4. `src/git/http.rs`：`ReceiveOutcome` 改成完整 ref 变更列表
+## 5. 验证
 
-现状（约 22 / 901 / 963 行）只有一个 `default_branch_updated: bool`：
+在含两个 commit 的完整源码树上实际执行：
 
-```rust
-pub struct ReceiveOutcome {
-    pub default_branch_updated: bool,
-    // ...
-}
+```bash
+cargo clippy --ignore-rust-version --all-targets   # 0 error
+cargo test   --ignore-rust-version                 # 92 passed / 0 failed
 ```
 
-改为：
+- 沙箱 rustc 为 1.93，而 `Cargo.lock` 中 `enum-map@3.0.0` 要求 ≥ 1.95，
+  故带 `--ignore-rust-version` 绕过 MSRV 检查；CI 应在 ≥ 1.95 的工具链上跑 `cargo test --locked`。
+- clippy 剩余 18 条 warning 全部来自 main 分支既有代码（`auth.rs` / `cli_cn.rs` /
+  `oauth.rs` / `render.rs` 等），**新增的 `src/workflow/` 六个模块零 warning**；
+  清理它们会扩大无关 diff，故不在本 PR 处理。
+- 为保持 PR diff 聚焦，被修改的既有文件保留仓库原有排版，未跑全量 `cargo fmt --all`
+  （那会重排 12 个无关文件）；新增代码本身按 rustfmt 风格书写。
 
-```rust
-pub struct ReceiveOutcome {
-    pub updates: Vec<workflow::event::RefUpdate>,
-    // ... 其余字段保持不变
-}
+## 6. 注册一个执行器
+
+管理员在数据库里预置一次性注册码。**必须用 SHA-256**（服务端用
+`Sha256::digest(code.as_bytes())` 匹配），初版清单里的 `md5` 是错的——长度 16 字节，
+永远匹配不上 32 字节的哈希：
+
+```bash
+# 本地算出注册码的 sha256 十六进制（32 字节 = 64 个 hex 字符）
+printf '%s' '你的注册码' | sha256sum
 ```
-
-在 `receive_pack` 的循环里，把每次 ref 更新收集成
-`RefUpdate { name, before, after }`（含 `refs/tags/*`），并在
-**`tx.commit()` 之前**写 outbox：
-
-```rust
-// tx 仍在处理 refs 更新的同一个事务里
-for u in &updates {
-    let kind = if u.name.starts_with("refs/tags/") { "tag" } else { "push" };
-    workflow::event::enqueue(
-        &mut tx,
-        &workflow::event::WorkflowEvent {
-            project_id,
-            kind: kind.to_string(),
-            ref_name: u.name.clone(),
-            before_oid: u.before.clone(),
-            after_oid: u.after.clone(),
-            pr_number: None,
-            actor_id: Some(actor_id),
-            payload: serde_json::json!({
-                "ref": u.name,
-                "before": u.before.as_ref().map(hex::encode),
-                "after": u.after.as_ref().map(hex::encode),
-            }),
-            dedupe_key: Some(workflow::event::dedupe_key(project_id, kind, &u.name, None)),
-        },
-    ).await?;
-}
-tx.commit().await?;
-```
-
-> 来源分支的 push 还要额外发一条 `pr_sync`（按 `pull_requests` 查 source branch），
-> 见第 6 节。
-
-## 5. `src/api.rs::git_receive`（约 2322 行）：删同步构建
-
-现状：
-
-```rust
-if outcome.default_branch_updated {
-    if let Err(error) = state.build_ctl.build_all().await {
-        tracing::warn!("重建站点失败: {error:#}");
-    }
-}
-```
-
-删掉整段。事件已经在 `receive_pack` 的事务里入队，分发器会触发 `BuildQueue`。
-**push 响应不再等待构建**，构建失败也不影响已提交的 refs。
-
-## 6. `src/collab.rs`：PR 事件
-
-在各自事务提交前调用 `workflow::event::enqueue()`：
-
-| 位置 | kind | 备注 |
-| --- | --- | --- |
-| `create_pr` | `pr_opened` | payload 为 GitHub 兼容 `pull_request` 事件 |
-| 来源分支 push | `pr_sync` | `pr_number` 带上 |
-| `merge_pr` | `pr_merged` | 目标分支是默认分支才允许发布 |
-| `close_pr` | `pr_closed` | |
-
-`merge_pr` 里加门禁（执行器缺席时不写 required check，所以默认不阻塞合并）：
-
-```sql
-SELECT COALESCE(bool_and(c.conclusion = 'success'), true)
-  FROM projects p
-  LEFT JOIN pr_checks c
-    ON c.project_id = p.id AND c.pr_number = $2 AND c.required
-   AND c.commit_oid = (SELECT target FROM git_refs
-                       WHERE project_id = p.id AND name = 'refs/heads/' || $3)
- WHERE p.id = $1 AND p.require_workflow_checks;
-```
-
-## 7. `src/api.rs::pr_merge`（约 1923 行）
-
-删掉同步 `build_all()`（现在构建失败时 PR 已合并却返回 500，前端容易误判），
-改成入队 + 上面的门禁查询。
-
-## 8. `src/build.rs`：`gc` 协调
-
-清理不可达对象前，跳过仍被排队/执行中 run 引用的 commit：
-
-```rust
-let keep = workflow::dispatch::pending_commits(pool).await?;
-// 把 keep 里的 oid 加入 gc 的 reachable 集合
-```
-
-否则 run 排队期间跑了 gc，快照接口会读不到对象。
-`workflow_runs_pending_commit_idx` 索引已为这个查询准备。
-
-## 9. 管理端（P1）
-
-`admin/src/views/` 新增：
-
-- `WorkflowsView`：列表 / 启用新路径 / 手动触发 / 历史；明示「工作区无 `.git`」。
-- `WorkflowRunView`：步骤与日志（日志走 `log_path` 文件，不进 PG）。
-- `ExecutorsView`：在线状态、禁用、重放、快照来源（恒为 `api`）。
-- PR 页：检查条，区分 `skipped / no_runner` 与 `failure`。
-
-## 10. 注册一个执行器
-
-管理员在数据库里预置一次性注册码（`token_hash` 先填随机值占位）：
 
 ```sql
 INSERT INTO workflow_runners (id, name, token_hash, registration_code_hash)
-VALUES (gen_random_uuid(), 'runner-1', gen_random_bytes(32),
-        decode(md5('你的注册码'), 'hex'));
+VALUES (
+    gen_random_uuid(),
+    'runner-1',
+    gen_random_bytes(32),                       -- 未注册前的占位值，随机以免撞 UNIQUE
+    decode('<上面算出的 64 位 hex>', 'hex')      -- 32 字节 sha256
+);
 ```
-
-> 生产环境请用 SHA-256：`registration_code_hash = sha256('你的注册码')`（`bytea`）。
-> `kychrunner register` 会用 `sha256(code)` 匹配，成功后立刻把该列置 NULL 并写入真正的 `token_hash`。
 
 然后：
 
@@ -200,12 +97,20 @@ kychrunner register --url https://kych.net --code '你的注册码'
 systemctl enable --now kychrunner
 ```
 
-## 11. 联调验收
+注册成功后服务端把 `registration_code_hash` 置 NULL 并写入真正的 `token_hash`；
+`enabled=false` 即临时禁用，撤销 token 后所有请求（含快照接口）立即 403。
 
-1. **不装 KychRunner**：push 默认分支 → 静态站正常重建，run 记 `skipped / no_runner`，UI 明示。
+> 后续可补管理端 API（session + step-up）自动生成注册码，避免手工 SQL。
+> 注意当前 `register` 端点的 SELECT + UPDATE 未包在同一事务里，并发用同一个码
+> 存在竞态；建议后续改成单条 `UPDATE ... WHERE registration_code_hash = $1
+> AND token_hash IS NOT NULL RETURNING id`。
+
+## 7. 联调验收
+
+1. **不装 KychRunner**：push 默认分支 → 静态站正常重建，run 记 `skipped / no_runner`。
 2. **只给 token**：完整跑通 `site.yml`，执行器不配任何 DSN。
 3. 300ms 连推 3 次 → 只 1 次发布构建，产物是第 3 次内容。
 4. `kill -9 kychrunner` → 租约到期 job 回 `queued` 被重新领取。
 5. 撤销 token 后 `GET /api/runner/jobs/{id}/snapshot` → 403。
 6. runner 拿 A 的 run_id 请求 B 的快照 → 403。
-7. `cargo clippy --all-targets -- -D warnings` 与 `cargo test` 通过。
+7. `cargo clippy --ignore-rust-version --all-targets` 0 error、`cargo test --ignore-rust-version` 92 项全过（见第 5 节）。
