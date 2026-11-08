@@ -7,7 +7,7 @@
 >
 > 保留决策：不 clone、不 `git init`、工作区无 `.git`；执行器是独立二进制仓库
 > [`kych-net/KychRunner`](https://github.com/kych-net/KychRunner)（MIT）、可选安装 / 可临时禁用；
-> 工作流语法对齐 GitHub Actions（默认 `.github/workflows/`）。
+> 工作流语法对齐 GitHub Actions（默认 `.网站名称/工作流/`）。
 
 ## 0. 决策摘要
 
@@ -18,7 +18,7 @@
 | 执行器凭据 | **仅 runner token**，零 DB 凭据；PG 完全不暴露，撤销 token 即禁用 |
 | 内置动作 | `site.build` / `build_page` 不经执行器，主服务自己排队。**没装 KychRunner 时网站照常重建** |
 | 状态通道 | HTTP `/api/runner/*`（runner token）+ 租约；执行器不写生产库 |
-| 工作流目录 | 默认 `.github/workflows/`；项目级 `workflow_dir` 可覆盖 |
+| 工作流目录 | 默认 `.网站名称/工作流/`；项目级 `workflow_dir` 可覆盖 |
 | 语法执行 | KychRunner 内调 `nektos/act`；主服务不解析 YAML、不装 Docker、不依赖 act |
 | 执行器缺席 | 内置动作照跑；YAML 工作流记 `skipped / no_runner`，UI 明示，TTL 内可重放 |
 | 许可隔离 | KychRunner(MIT) 不拷贝 KychNet(AGPL-3.0) 源码；两仓只通过 HTTP 契约交互 |
@@ -126,7 +126,7 @@ definitions/<文件名>       默认分支 workflow_dir 下的 *.yml|*.yaml，�
 
 | GitHub 概念 | 站内实现 |
 | --- | --- |
-| `.github/workflows/*.yml` | 默认目录；项目级 `workflow_dir` 可覆盖 |
+| `.网站名称/工作流/*.yml` | 默认目录；项目级 `workflow_dir` 可覆盖 |
 | `on: push / pull_request / workflow_dispatch / schedule` | 主服务发事件 |
 | `jobs / steps / needs / if / env / matrix` | act 解析执行，主服务不碰 YAML |
 | `github.*` / `GITHUB_*` | act 原生提供；`event.json` 另注入 `kychnet` 私有节点 |

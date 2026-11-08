@@ -1,4 +1,4 @@
-# 放到站内项目仓库的 .github/workflows/site.yml
+# 放到站内项目仓库的 .网站名称/工作流/site.yml
 # 同一份文件在 GitHub Actions 与 KychNet 站内都能跑：
 #   - GitHub 上 actions/checkout@v4 是真 checkout，工作区有 .git
 #   - 站内由 --local-repository 映射为 no-op，代码已由主服务快照铺好，无 .git

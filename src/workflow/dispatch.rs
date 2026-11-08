@@ -11,7 +11,7 @@ use std::time::Duration;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use super::runner_api::{WorkflowConfig, WorkflowState};
+use super::runner_api::WorkflowState;
 use crate::git::object::Oid;
 use crate::git::store;
 use crate::git::tree;
@@ -53,13 +53,15 @@ async fn tick(state: &WorkflowState, build_queue: &BuildQueue) -> Result<bool> {
     };
 
     // ---- 支路 1：内置发布动作，恒执行，与执行器是否存在无关 ----
-    let default_branch: String = sqlx::query_scalar(
-        "SELECT default_branch FROM projects WHERE id = $1",
+    let project_meta: (String, String, bool) = sqlx::query_as(
+        "SELECT default_branch, workflow_dir, require_workflow_checks
+           FROM projects WHERE id = $1",
     )
     .bind(event.project_id)
     .fetch_one(&mut *tx)
     .await
-    .unwrap_or_else(|_| "main".to_string());
+    .unwrap_or_else(|_| ("main".to_string(), ".网站名称/工作流".to_string(), false));
+    let (default_branch, workflow_dir, require_checks) = project_meta;
     let on_default = event.ref_name == format!("refs/heads/{default_branch}");
     let wants_publish = matches!(event.kind.as_str(), "push" | "pr_merged" | "manual") && on_default;
     if wants_publish {
@@ -70,7 +72,7 @@ async fn tick(state: &WorkflowState, build_queue: &BuildQueue) -> Result<bool> {
     let def_ref = format!("refs/heads/{default_branch}");
     let def_oid = store::get_ref(&mut tx, event.project_id, &def_ref).await?;
     let definitions = match def_oid {
-        Some(oid) => discover_definitions(&mut tx, event.project_id, oid, &state.cfg).await?,
+        Some(oid) => discover_definitions(&mut tx, event.project_id, oid, &workflow_dir).await?,
         None => Vec::new(),
     };
 
@@ -144,7 +146,8 @@ async fn tick(state: &WorkflowState, build_queue: &BuildQueue) -> Result<bool> {
                      (id, project_id, pr_number, run_id, name, conclusion, required, commit_oid)
                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
                    ON CONFLICT (run_id, name) DO UPDATE
-                     SET conclusion = EXCLUDED.conclusion"#,
+                     SET conclusion = EXCLUDED.conclusion,
+                         required = EXCLUDED.required"#,
             )
             .bind(Uuid::new_v4())
             .bind(event.project_id)
@@ -152,7 +155,7 @@ async fn tick(state: &WorkflowState, build_queue: &BuildQueue) -> Result<bool> {
             .bind(run_id)
             .bind(path)
             .bind(if status == "skipped" { "skipped" } else { "pending" })
-            .bind(false)
+            .bind(status == "queued" && require_checks)
             .bind(commit_oid.as_deref())
             .execute(&mut *tx)
             .await?;
@@ -193,15 +196,15 @@ async fn discover_definitions(
     conn: &mut sqlx::PgConnection,
     project_id: Uuid,
     commit: Oid,
-    _cfg: &WorkflowConfig,
+    workflow_dir: &str,
 ) -> Result<Vec<String>> {
+    let prefix = format!("{}/", workflow_dir.trim_end_matches('/'));
     let files = tree::read_files(conn, project_id, commit).await?;
     let mut out: Vec<String> = files
         .into_keys()
         .filter(|p| {
             let lower = p.to_ascii_lowercase();
-            (lower.starts_with(".github/workflows/") || p.contains("/workflows/"))
-                && (lower.ends_with(".yml") || lower.ends_with(".yaml"))
+            p.starts_with(&prefix) && (lower.ends_with(".yml") || lower.ends_with(".yaml"))
         })
         .collect();
     out.sort();
@@ -276,6 +279,17 @@ async fn prune(state: &WorkflowState) -> Result<()> {
     sqlx::query(
         "UPDATE workflow_runs SET status='expired'
           WHERE status='queued' AND expires_at < now()",
+    )
+    .execute(&state.pool)
+    .await?;
+
+    // 门禁不能永久停在 pending：run 被取消或过期时，把仍 pending 的 check
+    // 落成 failure，让合并入口得到明确结果。
+    sqlx::query(
+        r#"UPDATE pr_checks c SET conclusion='failure'
+             FROM workflow_runs r
+            WHERE c.run_id = r.id AND c.conclusion = 'pending'
+              AND r.status IN ('cancelled','expired')"#,
     )
     .execute(&state.pool)
     .await?;

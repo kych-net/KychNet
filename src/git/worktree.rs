@@ -17,6 +17,7 @@ use uuid::Uuid;
 use super::lfs;
 use super::object::Oid;
 use super::store;
+use super::object::TreeEntry;
 use super::tree::{self, DirItem};
 use crate::project::{valid_branch, valid_file_path};
 
@@ -119,6 +120,51 @@ pub async fn collect(
 /// 全量工作树的字节数，用于 archive 限额。
 pub fn total_bytes(files: &BTreeMap<String, Vec<u8>>) -> u64 {
     files.values().map(|data| data.len() as u64).sum()
+}
+
+/// 在真正把工作树读进内存前预检总字节数，避免匿名 archive 请求先吃满内存
+/// 再被 `MAX_WORKTREE_BYTES` 拒绝。逐 blob 读取对象大小，不保留文件内容。
+pub async fn ensure_within_limit(
+    pool: &PgPool,
+    project_id: Uuid,
+    commit: Oid,
+    max_bytes: u64,
+) -> Result<u64> {
+    let mut conn = pool.acquire().await?;
+    let root = tree::read_commit_tree(&mut conn, project_id, commit).await?;
+    let mut stack = vec![root];
+    let mut total: u64 = 0;
+    while let Some(tree_oid) = stack.pop() {
+        let tree = tree::read_tree(&mut conn, project_id, tree_oid).await?;
+        for (name, entry) in tree.entries {
+            if !super::object::valid_tree_entry_name(&name) {
+                bail!("工作树路径包含非法条目名：{name:?}");
+            }
+            match entry {
+                TreeEntry::Dir(oid) => stack.push(oid),
+                TreeEntry::Blob(oid) => {
+                    let object = store::require_object(&mut conn, project_id, oid).await?;
+                    let size = if lfs::is_pointer(&object.data) {
+                        lfs_size(&object.data).unwrap_or(object.data.len() as u64)
+                    } else {
+                        object.data.len() as u64
+                    };
+                    total = total.saturating_add(size);
+                    if total > max_bytes {
+                        bail!("工作树超过字节上限 {max_bytes}");
+                    }
+                }
+            }
+        }
+    }
+    Ok(total)
+}
+
+fn lfs_size(data: &[u8]) -> Option<u64> {
+    let text = std::str::from_utf8(data).ok()?;
+    text.lines()
+        .find_map(|line| line.strip_prefix("size "))
+        .and_then(|value| value.trim().parse().ok())
 }
 
 #[cfg(test)]

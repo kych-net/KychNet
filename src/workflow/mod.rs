@@ -27,11 +27,15 @@ pub use runner_api::{router, WorkflowConfig, WorkflowState};
 pub const PROTOCOL_VERSION: i32 = 2;
 
 /// 在 `api::router()` 里构造一次，传给 `workflow::router()` 与 `spawn_pruner()`。
-pub fn build_state(pool: PgPool, build_ctl: Arc<crate::api::BuildCtl>) -> WorkflowState {
+pub fn build_state(
+    pool: PgPool,
+    build_ctl: Arc<crate::api::BuildCtl>,
+    build_queue: queue::BuildQueue,
+) -> WorkflowState {
     WorkflowState {
         pool,
         cfg: Arc::new(WorkflowConfig::from_env()),
-        build_queue: queue::BuildQueue::start(build_ctl.clone()),
+        build_queue,
         build_ctl,
     }
 }

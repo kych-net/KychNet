@@ -45,10 +45,11 @@ pub struct RunRef {
 /// Git 对象不可变，缓存可长期复用。
 pub async fn build_snapshot(state: &WorkflowState, run: &RunRef) -> Result<Snapshot> {
     let key = format!(
-        "{}-{}-{}",
+        "{}-{}-{}-{}",
         run.project_id,
         hex::encode(&run.commit_oid),
-        hex::encode(&run.def_commit_oid)
+        hex::encode(&run.def_commit_oid),
+        run.workflow_dir.replace('/', "_")
     );
     let cache = state.cfg.snapshot_cache.join(format!("{key}.tar.gz"));
     let meta = state.cfg.snapshot_cache.join(format!("{key}.meta.json"));
