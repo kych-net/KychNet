@@ -1,4 +1,4 @@
-//! 工作树读取（`/git/<slug>.git/worktree/*` 的数据层）。
+//! 文件树读取（`/git/<项目>/{tree,file,archive}` 的数据层）。
 //!
 //! 站内没有磁盘工作树，也没有 `.git`：这里把 PG `git_objects` 里的
 //! commit / tree / blob 即时展开成「路径 → 字节」，和 `git-upload-pack`
