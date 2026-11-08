@@ -522,12 +522,9 @@ pub async fn create_pr(
     let mut tx = pool.begin().await?;
     lock_project(&mut tx, project_id).await?;
 
-    if store::resolve_branch(&mut tx, project_id, source_branch)
-        .await?
-        .is_none()
-    {
+    let Some(source_oid) = store::resolve_branch(&mut tx, project_id, source_branch).await? else {
         bail!("来源分支不存在: {source_branch}");
-    }
+    };
     if store::resolve_branch(&mut tx, project_id, target_branch)
         .await?
         .is_none()
@@ -571,6 +568,38 @@ pub async fn create_pr(
     .bind(target_branch)
     .bind(user.id)
     .execute(&mut *tx)
+    .await?;
+
+    crate::workflow::event::enqueue(
+        &mut tx,
+        &crate::workflow::event::WorkflowEvent {
+            project_id,
+            kind: "pr_opened".to_string(),
+            ref_name: format!("refs/heads/{source_branch}"),
+            before_oid: None,
+            after_oid: Some(source_oid.as_bytes().to_vec()),
+            pr_number: Some(number),
+            actor_id: Some(user.id),
+            payload: serde_json::json!({
+                "action": "opened",
+                "number": number,
+                "pull_request": {
+                    "number": number,
+                    "title": title,
+                    "body": body.trim(),
+                    "head": { "ref": source_branch, "sha": source_oid.to_hex() },
+                    "base": { "ref": target_branch },
+                },
+                "sender": { "login": user.username },
+            }),
+            dedupe_key: Some(crate::workflow::event::dedupe_key(
+                project_id,
+                "pr_opened",
+                &format!("refs/heads/{source_branch}"),
+                Some(number),
+            )),
+        },
+    )
     .await?;
 
     tx.commit().await?;
@@ -679,8 +708,27 @@ pub async fn merge_pr(
         .await?
         .context("目标分支不存在")?;
 
-    let fast_forward = target == source
-        || is_ancestor(&mut tx, project_id, target, source).await?;
+    // 工作流检查门禁：项目开启 require_workflow_checks 时，与当前来源分支头绑定的
+    // required 检查必须全部 success。执行器缺席不会写 required 检查，因此不阻塞合并。
+    let checks_pass: Option<bool> = sqlx::query_scalar(
+        r#"SELECT COALESCE(bool_and(c.conclusion = 'success'), true)
+             FROM projects p
+             LEFT JOIN pr_checks c
+               ON c.project_id = p.id AND c.pr_number = $2 AND c.required
+              AND c.commit_oid = $3
+            WHERE p.id = $1 AND p.require_workflow_checks
+            GROUP BY p.id"#,
+    )
+    .bind(project_id)
+    .bind(number)
+    .bind(&source.as_bytes()[..])
+    .fetch_optional(&mut *tx)
+    .await?;
+    if checks_pass == Some(false) {
+        bail!("工作流检查未通过，禁止合并");
+    }
+
+    let fast_forward = target == source || is_ancestor(&mut tx, project_id, target, source).await?;
     let merge_oid = if fast_forward {
         source
     } else {
@@ -735,6 +783,31 @@ pub async fn merge_pr(
     .execute(&mut *tx)
     .await?;
 
+    crate::workflow::event::enqueue(
+        &mut tx,
+        &crate::workflow::event::WorkflowEvent {
+            project_id,
+            kind: "pr_merged".to_string(),
+            ref_name: format!("refs/heads/{}", pr.target_branch),
+            before_oid: Some(target.as_bytes().to_vec()),
+            after_oid: Some(merge_oid.as_bytes().to_vec()),
+            pr_number: Some(number),
+            actor_id: Some(user.id),
+            payload: serde_json::json!({
+                "action": "closed",
+                "number": number,
+                "pull_request": {
+                    "merged": true,
+                    "head": { "ref": pr.source_branch },
+                    "base": { "ref": pr.target_branch },
+                },
+                "sender": { "login": user.username },
+            }),
+            dedupe_key: None,
+        },
+    )
+    .await?;
+
     tx.commit().await?;
     let mut conn = pool.acquire().await?;
     let pr = fetch_pr(&mut conn, project_id, number)
@@ -764,6 +837,26 @@ pub async fn close_pr(pool: &PgPool, project_id: Uuid, number: i32) -> Result<Pu
     .bind(project_id)
     .bind(number)
     .execute(&mut *tx)
+    .await?;
+
+    crate::workflow::event::enqueue(
+        &mut tx,
+        &crate::workflow::event::WorkflowEvent {
+            project_id,
+            kind: "pr_closed".to_string(),
+            ref_name: format!("refs/heads/{}", pr.source_branch),
+            before_oid: None,
+            after_oid: None,
+            pr_number: Some(number),
+            actor_id: None,
+            payload: serde_json::json!({
+                "action": "closed",
+                "number": number,
+                "pull_request": { "merged": false },
+            }),
+            dedupe_key: None,
+        },
+    )
     .await?;
 
     tx.commit().await?;

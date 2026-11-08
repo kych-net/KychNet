@@ -14,12 +14,11 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::collections::BTreeMap;
 use std::io::Write;
-use std::sync::Arc;
 use uuid::Uuid;
 
+use super::runner_api::WorkflowState;
 use crate::git::object::Oid;
 use crate::git::tree;
-use super::runner_api::{WorkflowConfig, WorkflowState};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotHeaders {
@@ -36,7 +35,6 @@ pub struct Snapshot {
 
 #[derive(Debug, Clone)]
 pub struct RunRef {
-    pub id: Uuid,
     pub project_id: Uuid,
     pub commit_oid: Vec<u8>,
     pub def_commit_oid: Vec<u8>,
@@ -230,7 +228,7 @@ fn tar_header(path: &str, size: u64) -> Result<[u8; 512]> {
             .char_indices()
             .filter(|(i, c)| *c == '/' && path.len() - i - 1 <= 100)
             .map(|(i, _)| i)
-            .last()
+            .next_back()
             .context("tar 路径过长且无法切分 prefix")?;
         let prefix = &path[..cut];
         let name = &path[cut + 1..];
@@ -278,7 +276,6 @@ pub async fn load_run(pool: &PgPool, run_id: Uuid) -> Result<RunRef> {
     .await
     .context("run 不存在")?;
     Ok(RunRef {
-        id: run_id,
         project_id: row.0,
         commit_oid: row.1,
         def_commit_oid: row.2,
@@ -295,7 +292,9 @@ mod tests {
         let h = tar_header("code/README.md", 5).unwrap();
         assert_eq!(&h[257..263], b"ustar\0");
         assert_eq!(h[156], b'0');
-        let stored = std::str::from_utf8(&h[148..155]).unwrap().trim();
+        // USTAR checksum = 6 位八进制数字 + NUL + 空格；只解析前 6 字节。
+        assert_eq!(&h[154..156], b"\0 ");
+        let stored = std::str::from_utf8(&h[148..154]).unwrap();
         let expected = u64::from_str_radix(stored, 8).unwrap();
         let mut copy = h;
         for b in &mut copy[148..156] {

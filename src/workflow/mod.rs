@@ -5,7 +5,7 @@
 //! - KychRunner 是可选执行器，只有 runner token，零数据库凭据。
 //! - 内置动作 `site.build` 由主服务独立排队，与执行器是否存在无关。
 //!
-//! 本模块全部为新增文件，未改动现有代码；挂接步骤见 `docs/workflow-integration.md`。
+//! 本模块源码为新增文件；与现有代码的挂接点见 `docs/workflow-integration.md`。
 
 pub mod dispatch;
 pub mod event;
@@ -20,10 +20,9 @@ pub use runner_api::{router, WorkflowConfig, WorkflowState};
 
 /// 与 KychRunner 协商的契约版本，必须与其 `PROTOCOL_VERSION` 一致。
 pub const PROTOCOL_VERSION: i32 = 1;
-pub const SNAPSHOT_SOURCE: &str = "api";
 
 /// 在 `api::router()` 里构造一次，传给 `workflow::router()` 与 `spawn_pruner()`。
-pub fn build_state(pool: PgPool, build_ctl: Arc<crate::build::BuildCtl>) -> WorkflowState {
+pub fn build_state(pool: PgPool, build_ctl: Arc<crate::api::BuildCtl>) -> WorkflowState {
     WorkflowState {
         pool,
         cfg: Arc::new(WorkflowConfig::from_env()),

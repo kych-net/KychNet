@@ -100,7 +100,7 @@ struct BuildStatus {
 /// 独立进程：Typst 及其内嵌字体是重依赖，进程隔离让渲染崩溃、内存尖峰只损失
 /// 一次构建，不会波及常驻的 API 服务。可执行文件取 `current_exe()`，
 /// 与 serve 是同一个二进制，不存在路径配置问题。
-struct BuildCtl {
+pub(crate) struct BuildCtl {
     /// 同一时刻只允许一个构建。用原子量而不是锁，避免排队语义——
     /// 并发触发直接 409，让前端提示「已在构建」。
     running: AtomicBool,
@@ -185,7 +185,7 @@ impl BuildCtl {
     }
 
     /// 项目文件可能影响多个页面（目录树、项目索引），保存后直接整站重建。
-    async fn build_all(&self) -> Result<()> {
+    pub(crate) async fn build_all(&self) -> Result<()> {
         if self.running.swap(true, Ordering::SeqCst) {
             bail!("已有构建在进行，请稍后重试或执行整站重建");
         }
@@ -1185,9 +1185,6 @@ async fn put_settings(
     if site.site_name.trim().is_empty() || site.site_name.chars().count() > 64 {
         api_bail!("站点名称需为 1-64 个字符");
     }
-    if site.description.chars().count() > 300 {
-        api_bail!("站点描述最多 300 个字符");
-    }
     if site.nav.len() > 12 {
         api_bail!("导航链接最多 12 条");
     }
@@ -1258,9 +1255,6 @@ pub async fn serve(cfg: Config) -> Result<()> {
     let pool = crate::db::connect(&cfg.database_url).await?;
     crate::db::migrate(&pool).await?;
     spawn_flow_pruner(pool.clone());
-    if let Err(error) = oauth::gc(&pool).await {
-        tracing::warn!(%error, "OAuth 过期数据清理失败");
-    }
 
     let auth = Arc::new(Auth::new(&cfg.rp_id, &cfg.rp_origin)?);
     let state = AppState {
@@ -1331,6 +1325,9 @@ pub async fn serve(cfg: Config) -> Result<()> {
     // 而挂载判断要等 layer 链拼完之后才能做。
     let state_pool_for_mcp = state.pool.clone();
     let state_limits_for_mcp = state.limits.clone();
+    // 工作流模块同样要在 state 被 move 之前取出所需资源。
+    let wf_pool = state.pool.clone();
+    let wf_build_ctl = state.build_ctl.clone();
 
     let app = Router::new()
         .route("/api/health", get(|| async { Json(json!({"ok": true})) }))
@@ -1451,6 +1448,13 @@ pub async fn serve(cfg: Config) -> Result<()> {
             guard_origin,
         ))
         .layer(TraceLayer::new_for_http());
+
+    // 工作流 runner API 与管理端中间件分开挂：runner 用 token 认证、不带浏览器
+    // Origin，且日志分片可能超过管理端的 2 MiB 请求体上限。
+    let wf_state = crate::workflow::build_state(wf_pool, wf_build_ctl);
+    crate::workflow::spawn_pruner(wf_state.clone());
+    crate::workflow::dispatch::spawn_dispatcher(wf_state.clone(), wf_state.build_queue.clone());
+    let app = app.nest("/api/runner", crate::workflow::router(wf_state));
 
     // MCP Streamable HTTP：鉴权由 MCP 自己按 OAuth access token 校验。
     let mcp_state = crate::mcp::KychMcp::new(
@@ -1932,17 +1936,10 @@ async fn pr_merge(
     Path((id, number)): Path<(Uuid, i32)>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let user = current_user(&state, &session).await?;
-    let project = require_project(&state, id).await?;
+    require_project(&state, id).await?;
+    // 工作流检查门禁与事件入队都在 collab::merge_pr 的事务里完成；
+    // 发布由后台队列执行，合并接口不再同步等待构建（避免 PR 已合并却返回 500）。
     let outcome = crate::collab::merge_pr(&state.pool, &user, id, number).await?;
-    // 只有合并进默认分支才会改变线上内容，此时才触发整站编译。
-    if outcome.pr.target_branch == project.default_branch {
-        if let Err(error) = state.build_ctl.build_all().await {
-            return Err(ApiError::with_status(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("PR 已合并，但自动编译失败：{error}"),
-            ));
-        }
-    }
     Ok(Json(json!({
         "item": outcome.pr,
         "overwrote_target": outcome.overwrote_target
@@ -2340,12 +2337,8 @@ async fn git_receive(
         Ok(outcome) => outcome,
         Err(error) => return git_plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
-    // 默认分支变了就重新发布静态站；失败不影响推送结果，只记录日志。
-    if outcome.default_branch_updated {
-        if let Err(error) = state.build_ctl.build_all().await {
-            tracing::warn!("Git 推送后自动编译失败: {error:#}");
-        }
-    }
+    // 事件已在 receive_pack 的事务里入队，分发器负责触发内置 site.build；
+    // push 响应不等构建，构建失败也不影响已提交的 refs（修掉原来的静默丢更新）。
     git_binary("application/x-git-receive-pack-result", outcome.response)
 }
 

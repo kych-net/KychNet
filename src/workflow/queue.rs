@@ -15,7 +15,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::warn;
 
-use crate::build::BuildCtl;
+use crate::api::BuildCtl;
 
 /// 发布动作不写进 YAML、不进执行器容器：`kych-net build` 以数据库为唯一事实源，
 /// 不能把 `DATABASE_URL` 交给能 push 分支的人。

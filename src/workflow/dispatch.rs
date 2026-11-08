@@ -11,12 +11,11 @@ use std::time::Duration;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use super::runner_api::{WorkflowConfig, WorkflowState};
 use crate::git::object::Oid;
 use crate::git::store;
 use crate::git::tree;
 use crate::workflow::queue::BuildQueue;
-use super::runner_api::{WorkflowConfig, WorkflowState};
-use super::PROTOCOL_VERSION;
 
 /// 事件提交后由后台轮询处理，push 响应不等待任何构建或执行器。
 pub fn spawn_dispatcher(state: WorkflowState, build_queue: BuildQueue) -> tokio::task::JoinHandle<()> {
@@ -68,11 +67,10 @@ async fn tick(state: &WorkflowState, build_queue: &BuildQueue) -> Result<bool> {
     }
 
     // ---- 支路 2：YAML 工作流，定义只从默认分支 head 读 ----
-    let mut conn = tx.acquire().await?;
     let def_ref = format!("refs/heads/{default_branch}");
-    let def_oid = store::get_ref(&mut conn, event.project_id, &def_ref).await?;
+    let def_oid = store::get_ref(&mut tx, event.project_id, &def_ref).await?;
     let definitions = match def_oid {
-        Some(oid) => discover_definitions(&mut conn, event.project_id, oid, &state.cfg).await?,
+        Some(oid) => discover_definitions(&mut tx, event.project_id, oid, &state.cfg).await?,
         None => Vec::new(),
     };
 
@@ -85,22 +83,21 @@ async fn tick(state: &WorkflowState, build_queue: &BuildQueue) -> Result<bool> {
         .bind(Uuid::new_v4())
         .bind(event.project_id)
         .bind(path)
-        .execute(&mut *conn)
+        .execute(&mut *tx)
         .await?;
     }
-    let enabled: Vec<String> = sqlx::query_scalar(
-        "SELECT path FROM project_workflows WHERE project_id = $1 AND enabled",
-    )
-    .bind(event.project_id)
-    .fetch_all(&mut *conn)
-    .await?;
+    let enabled: Vec<String> =
+        sqlx::query_scalar("SELECT path FROM project_workflows WHERE project_id = $1 AND enabled")
+            .bind(event.project_id)
+            .fetch_all(&mut *tx)
+            .await?;
 
     let available = executor_available(&state.pool, state.cfg.protocol_version).await?;
-    let project_enabled: bool = sqlx::query_scalar(
+    let project_enabled: bool = sqlx::query_scalar::<_, bool>(
         "SELECT workflow_executor_enabled FROM projects WHERE id = $1",
     )
     .bind(event.project_id)
-    .fetch_one(&mut *conn)
+    .fetch_one(&mut *tx)
     .await
     .unwrap_or(false);
 
@@ -137,7 +134,7 @@ async fn tick(state: &WorkflowState, build_queue: &BuildQueue) -> Result<bool> {
         .bind(trust)
         .bind(status)
         .bind(skipped_reason)
-        .execute(&mut *conn)
+        .execute(&mut *tx)
         .await?;
 
         // 执行器缺席时不写 required check，避免「没装执行器就永远不能合并 PR」。
@@ -157,17 +154,15 @@ async fn tick(state: &WorkflowState, build_queue: &BuildQueue) -> Result<bool> {
             .bind(if status == "skipped" { "skipped" } else { "pending" })
             .bind(false)
             .bind(commit_oid.as_deref())
-            .execute(&mut *conn)
+            .execute(&mut *tx)
             .await?;
         }
     }
 
-    sqlx::query(
-        "UPDATE workflow_events SET status='done', consumed_at=now() WHERE id=$1",
-    )
-    .bind(event.id)
-    .execute(&mut *conn)
-    .await?;
+    sqlx::query("UPDATE workflow_events SET status='done', consumed_at=now() WHERE id=$1")
+        .bind(event.id)
+        .execute(&mut *tx)
+        .await?;
 
     tx.commit().await.context("提交分发事务失败")?;
     info!(
@@ -289,7 +284,8 @@ async fn prune(state: &WorkflowState) -> Result<()> {
 
 /// 供 `gc` 调用：排队/执行中的 run 引用的 commit 不能被清理。
 pub async fn pending_commits(pool: &PgPool) -> Result<Vec<Vec<u8>>> {
-    let rows: Vec<(Option<Vec<u8>>, Option<Vec<u8>>)> = sqlx::query_as(
+    type PendingRow = (Option<Vec<u8>>, Option<Vec<u8>>);
+    let rows: Vec<PendingRow> = sqlx::query_as(
         r#"SELECT commit_oid, def_commit_oid FROM workflow_runs
             WHERE status IN ('queued','in_progress') AND expires_at > now()"#,
     )
@@ -301,7 +297,11 @@ pub async fn pending_commits(pool: &PgPool) -> Result<Vec<Vec<u8>>> {
         .collect())
 }
 
-/// 手动触发 / 定时触发的事件构造 helper（供管理端 API 使用）。
+/// 手动触发 / 定时触发的事件构造 helper。
+///
+/// P1：管理端 `workflow_dispatch` 端点尚未接入，本 helper 供该端点直接调用；
+/// 事件类型 `manual` 在 `event::trust_level` / 本文件分发逻辑中已完整支持。
+#[allow(dead_code)]
 pub fn manual_payload(actor: &str, inputs: serde_json::Value) -> serde_json::Value {
     json!({
         "inputs": inputs,

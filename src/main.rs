@@ -14,6 +14,7 @@ mod rate;
 mod render;
 mod service;
 mod svg;
+mod workflow;
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};

@@ -20,10 +20,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::build::BuildCtl;
-use crate::workflow::queue::BuildQueue;
 use super::snapshot;
 use super::PROTOCOL_VERSION;
+use crate::api::BuildCtl;
+use crate::workflow::queue::BuildQueue;
 
 #[derive(Clone)]
 pub struct WorkflowState {
@@ -83,11 +83,11 @@ pub fn router(state: WorkflowState) -> Router {
     Router::new()
         .route("/register", post(register))
         .route("/jobs/claim", get(claim))
-        .route("/jobs/:id/snapshot", get(snapshot_handler))
-        .route("/jobs/:id/start", post(start))
-        .route("/jobs/:id/logs", post(logs))
-        .route("/jobs/:id/steps", post(steps))
-        .route("/jobs/:id/complete", post(complete))
+        .route("/jobs/{id}/snapshot", get(snapshot_handler))
+        .route("/jobs/{id}/start", post(start))
+        .route("/jobs/{id}/logs", post(logs))
+        .route("/jobs/{id}/steps", post(steps))
+        .route("/jobs/{id}/complete", post(complete))
         .route("/heartbeat", post(heartbeat))
         .with_state(state)
 }
@@ -442,7 +442,7 @@ async fn logs(
         .await
         .map_err(internal)?;
     if let Ok(meta) = file.metadata().await {
-        if meta.len() as u64 >= state.cfg.max_log_bytes {
+        if meta.len() >= state.cfg.max_log_bytes {
             return Ok(StatusCode::OK); // 截断，不再追加
         }
     }

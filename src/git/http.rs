@@ -17,9 +17,10 @@ use crate::project::Project;
 const MAX_COMMIT_WALK: usize = 5000;
 const MAX_OBJECT_WALK: usize = 200_000;
 
+/// `receive_pack` 的返回体。ref 变更已在**同一事务**内写入事件 outbox，
+/// 因此这里只回传 Git 协议响应，不再把 updates 交给上层重复触发。
 pub struct ReceiveOutcome {
     pub response: Vec<u8>,
-    pub default_branch_updated: bool,
 }
 
 fn upload_caps(project: &Project) -> String {
@@ -848,7 +849,8 @@ pub async fn receive_pack(
     }
 
     // 第一轮只做校验，收集每条命令的校验结果；atomic 推送据此决定是否整体放弃。
-    let mut checked: Vec<(String, Result<CommandAction, String>)> = Vec::new();
+    // 同时保留 old/new，供 ref 变更后构造 RefUpdate（tag 与 delete 也需要）。
+    let mut checked: Vec<(String, Oid, Oid, Result<CommandAction, String>)> = Vec::new();
     for (old, new, name) in &request.commands {
         let name = name.clone();
         let result = match &unpack_error {
@@ -893,16 +895,16 @@ pub async fn receive_pack(
                 }
             },
         };
-        checked.push((name, result));
+        checked.push((name, *old, *new, result));
     }
 
-    let has_failure = checked.iter().any(|(_, result)| result.is_err());
+    let has_failure = checked.iter().any(|(_, _, _, result)| result.is_err());
     let mut statuses: Vec<(String, bool, String)> = Vec::new();
-    let mut default_branch_updated = false;
+    let mut updates: Vec<crate::workflow::event::RefUpdate> = Vec::new();
 
     if atomic && has_failure {
         // 原子推送：任何一条失败都不落库，其余命令报告回滚。
-        for (name, result) in checked {
+        for (name, _, _, result) in checked {
             match result {
                 Err(reason) => statuses.push((name, false, reason)),
                 Ok(_) => statuses.push((
@@ -913,26 +915,31 @@ pub async fn receive_pack(
             }
         }
     } else {
-        for (name, result) in checked {
+        for (name, old, _new, result) in checked {
             match result {
                 Err(reason) => statuses.push((name, false, reason)),
                 Ok(CommandAction::Delete(name)) => {
                     store::delete_ref(&mut tx, project.id, &name).await?;
+                    updates.push(crate::workflow::event::RefUpdate {
+                        name: name.clone(),
+                        before: Some(old.as_bytes().to_vec()),
+                        after: None,
+                    });
                     statuses.push((name, true, String::new()));
                 }
-                Ok(CommandAction::Set {
-                    name,
-                    target,
-                    is_head,
-                }) => {
+                Ok(CommandAction::Set { name, target, .. }) => {
                     store::set_ref(&mut tx, project.id, &name, target).await?;
                     let peeled = peel_tag_once(&mut tx, project.id, target).await?;
                     index_commits(&mut tx, project.id, peeled, user).await?;
-                    if is_head
-                        && name == format!("refs/heads/{}", project.default_branch)
-                    {
-                        default_branch_updated = true;
-                    }
+                    updates.push(crate::workflow::event::RefUpdate {
+                        name: name.clone(),
+                        before: if old == Oid::zero() {
+                            None
+                        } else {
+                            Some(old.as_bytes().to_vec())
+                        },
+                        after: Some(target.as_bytes().to_vec()),
+                    });
                     statuses.push((name, true, String::new()));
                 }
             }
@@ -943,6 +950,83 @@ pub async fn receive_pack(
         .bind(project.id)
         .execute(&mut *tx)
         .await?;
+
+    // 事件与 refs 更新同事务：提交失败不会触发构建，构建也不会读到旧 refs。
+    for u in &updates {
+        let kind = if u.name.starts_with("refs/tags/") {
+            "tag"
+        } else {
+            "push"
+        };
+        let payload = serde_json::json!({
+            "ref": u.name,
+            "before": u.before.as_ref().map(hex::encode),
+            "after": u.after.as_ref().map(hex::encode),
+            "kychnet": { "trigger": kind, "snapshot_source": "api" },
+        });
+        crate::workflow::event::enqueue(
+            &mut tx,
+            &crate::workflow::event::WorkflowEvent {
+                project_id: project.id,
+                kind: kind.to_string(),
+                ref_name: u.name.clone(),
+                before_oid: u.before.clone(),
+                after_oid: u.after.clone(),
+                pr_number: None,
+                actor_id: Some(user.id),
+                payload,
+                dedupe_key: Some(crate::workflow::event::dedupe_key(
+                    project.id, kind, &u.name, None,
+                )),
+            },
+        )
+        .await?;
+    }
+
+    // 来源分支有新提交时，通知该分支上的开放 PR（对齐 pull_request.synchronize）。
+    for u in &updates {
+        let Some(after) = u.after.as_ref() else {
+            continue;
+        };
+        let Some(branch) = u.name.strip_prefix("refs/heads/") else {
+            continue;
+        };
+        let prs: Vec<(i32,)> = sqlx::query_as(
+            "SELECT number FROM pull_requests
+              WHERE project_id = $1 AND source_branch = $2 AND status = 'open'",
+        )
+        .bind(project.id)
+        .bind(branch)
+        .fetch_all(&mut *tx)
+        .await?;
+        for (number,) in prs {
+            crate::workflow::event::enqueue(
+                &mut tx,
+                &crate::workflow::event::WorkflowEvent {
+                    project_id: project.id,
+                    kind: "pr_sync".to_string(),
+                    ref_name: u.name.clone(),
+                    before_oid: u.before.clone(),
+                    after_oid: u.after.clone(),
+                    pr_number: Some(number),
+                    actor_id: Some(user.id),
+                    payload: serde_json::json!({
+                        "action": "synchronize",
+                        "number": number,
+                        "after": hex::encode(after),
+                        "pull_request": { "head": { "ref": branch } },
+                    }),
+                    dedupe_key: Some(crate::workflow::event::dedupe_key(
+                        project.id,
+                        "pr_sync",
+                        &u.name,
+                        Some(number),
+                    )),
+                },
+            )
+            .await?;
+        }
+    }
     tx.commit().await?;
 
     let mut out = Vec::new();
@@ -958,10 +1042,7 @@ pub async fn receive_pack(
         }
     }
     out.extend(proto::flush());
-    Ok(ReceiveOutcome {
-        response: out,
-        default_branch_updated,
-    })
+    Ok(ReceiveOutcome { response: out })
 }
 
 /// 从 `/git/<项目>.git/...` 的剩余路径里解析仓库名与动作。
