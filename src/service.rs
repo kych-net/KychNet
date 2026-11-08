@@ -586,15 +586,15 @@ pub async fn update_content(
     let mut tx = pool.begin().await?;
     // 与回滚共用一把行锁：锁住后再读旧正文、算增量、落版本，
     // 并发保存与回滚在行级串行，版本链不会交叉。
-    let old: Option<(String,)> =
-        sqlx::query_as("SELECT body FROM contents WHERE id = $1 FOR UPDATE")
+    let old: Option<(String, String)> =
+        sqlx::query_as("SELECT body, format FROM contents WHERE id = $1 FOR UPDATE")
             .bind(id)
             .fetch_optional(&mut *tx)
             .await?;
-    let Some((old_body,)) = old else {
+    let Some((old_body, old_format)) = old else {
         bail!("内容不存在");
     };
-    let content_changed = old_body != body;
+    let content_changed = old_body != body || old_format != format;
     let new_rev_seq = if content_changed {
         Some(
             crate::history::record_revision(
@@ -661,13 +661,13 @@ pub async fn upsert_content(
     message: &str,
 ) -> Result<Content> {
     let mut tx = pool.begin().await?;
-    let existing: Option<(Uuid, String)> =
-        sqlx::query_as("SELECT id, body FROM contents WHERE slug = $1 FOR UPDATE")
+    let existing: Option<(Uuid, String, String)> =
+        sqlx::query_as("SELECT id, body, format FROM contents WHERE slug = $1 FOR UPDATE")
             .bind(slug)
             .fetch_optional(&mut *tx)
             .await?;
-    let content = if let Some((id, old_body)) = existing {
-        let content_changed = old_body != body;
+    let content = if let Some((id, old_body, old_format)) = existing {
+        let content_changed = old_body != body || old_format != format;
         let new_rev_seq = if content_changed {
             Some(
                 crate::history::record_revision(
