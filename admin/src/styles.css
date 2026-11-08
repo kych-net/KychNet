@@ -2653,3 +2653,262 @@ code,
     position: static;
   }
 }
+
+/* ---------- project topbar + commit workspace ---------- */
+.project-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1.2rem;
+  margin: 0 0 1.1rem;
+  padding: 0.9rem 1.2rem;
+  background:
+    linear-gradient(110deg, color-mix(in srgb, var(--accent) 8%, transparent), transparent 46%),
+    var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: var(--shadow-soft);
+}
+
+.project-topbar-main {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.project-topbar-title {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+  min-width: 0;
+}
+
+.project-topbar-title h3 {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-size: clamp(1.25rem, 2.2vw, 1.65rem);
+  font-weight: 760;
+  letter-spacing: -0.04em;
+  line-height: 1.15;
+}
+
+.project-topbar-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.project-topbar-meta code {
+  overflow: hidden;
+  max-width: min(44rem, 100%);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-topbar .project-head-actions {
+  flex: 0 0 auto;
+}
+
+.projects-layout {
+  grid-template-columns: minmax(220px, 260px) minmax(0, 1fr) minmax(300px, 380px);
+}
+
+.project-workbench {
+  min-width: 0;
+  overflow: hidden;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  box-shadow: var(--shadow);
+}
+
+.project-workbench .project-middle-tabs {
+  margin: 0;
+  padding: 0.55rem 1.15rem;
+  background: var(--panel-soft);
+  border-bottom: 1px solid var(--border);
+}
+
+.project-workbench .file-toolbar {
+  margin: 0;
+  padding: 0.85rem 1.15rem;
+  background: var(--panel-soft);
+  border-bottom: 1px solid var(--border);
+}
+
+.project-workbench .project-browser {
+  min-height: 32rem;
+}
+
+.project-workbench .project-editor {
+  min-height: 32rem;
+}
+
+.project-commit-panel {
+  padding: 1rem;
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--accent) 7%, transparent), transparent 70%),
+    var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+
+.project-commit-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.65rem;
+}
+
+.project-commit-head > div {
+  display: flex;
+  align-items: baseline;
+  gap: 0.45rem;
+}
+
+.project-commit-kicker {
+  color: var(--accent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.6rem;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.project-commit-head strong {
+  font-size: 0.9rem;
+}
+
+.project-commit-count {
+  min-width: 1.4rem;
+  padding: 0.12rem 0.38rem;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 1px solid color-mix(in srgb, var(--accent) 20%, transparent);
+  border-radius: 999px;
+  font-size: 0.68rem;
+  font-weight: 800;
+  text-align: center;
+}
+
+.project-commit-panel textarea {
+  width: 100%;
+  min-height: 4.6rem;
+  margin: 0;
+  resize: vertical;
+  font-size: 0.8rem;
+}
+
+.project-pending-list {
+  max-height: 10rem;
+  margin: 0.55rem 0;
+  padding: 0;
+  overflow: auto;
+  list-style: none;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--panel-soft);
+}
+
+.project-pending-list li {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-width: 0;
+  padding: 0.38rem 0.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.project-pending-list li:last-child {
+  border-bottom: 0;
+}
+
+.project-pending-list li.hint {
+  display: block;
+  padding: 0.65rem;
+  border: 0;
+  font-size: 0.74rem;
+}
+
+.project-pending-list code {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 0.7rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pending-badge {
+  flex: 0 0 auto;
+  padding: 0.08rem 0.28rem;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-radius: 4px;
+  font-size: 0.62rem;
+  font-weight: 700;
+}
+
+.pending-delete {
+  color: var(--error-text);
+  background: var(--error-bg);
+}
+
+.project-commit-button {
+  width: 100%;
+  min-height: 2.5rem;
+  color: var(--accent-text);
+  background: var(--accent);
+  border-color: var(--accent);
+  font-weight: 750;
+}
+
+.project-commit-button:hover:not(:disabled) {
+  color: var(--accent-text);
+  background: color-mix(in srgb, var(--accent) 88%, #000);
+}
+
+.staged-badge {
+  margin-right: 0.4rem;
+  padding: 0.08rem 0.32rem;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-radius: 4px;
+  font-size: 0.65rem;
+  font-weight: 700;
+}
+
+.editor-actions .hint {
+  margin-left: auto;
+  font-size: 0.72rem;
+}
+
+@media (max-width: 980px) {
+  .project-topbar {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .project-topbar .project-head-actions {
+    width: 100%;
+  }
+
+  .projects-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .project-workbench,
+  .project-git,
+  .project-empty-shell {
+    grid-column: auto;
+  }
+
+  .editor-actions .hint {
+    margin-left: 0;
+  }
+}

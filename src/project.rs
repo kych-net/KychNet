@@ -46,6 +46,19 @@ pub struct WriteResult {
     pub oid: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct FileChange {
+    pub path: String,
+    pub content: Option<String>,
+    pub delete: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchWriteResult {
+    pub commit: String,
+    pub paths: Vec<String>,
+}
+
 /// 项目名允许任意非特殊 UTF-8：只排除路径分隔符、URL 保留字符和控制字符。
 pub fn valid_project_slug(slug: &str) -> bool {
     let trimmed = slug.trim();
@@ -532,6 +545,139 @@ pub async fn write_file_bytes(
         commit: commit.to_hex(),
         path: path.to_string(),
         oid: blob.to_hex(),
+    })
+}
+
+/// 把多个文件变更合成一个项目级 commit。
+pub async fn commit_changes(
+    pool: &PgPool,
+    user: &User,
+    project_id: Uuid,
+    branch: &str,
+    message: Option<&str>,
+    changes: &[FileChange],
+) -> Result<BatchWriteResult> {
+    if !valid_branch(branch) {
+        bail!("非法分支名");
+    }
+    if changes.is_empty() || changes.len() > 200 {
+        bail!("一次提交需要 1-200 个文件变更");
+    }
+    let mut seen = std::collections::HashSet::new();
+    for change in changes {
+        if !valid_file_path(&change.path) {
+            bail!("非法文件路径: {}", change.path);
+        }
+        if !seen.insert(change.path.as_str()) {
+            bail!("重复的文件路径: {}", change.path);
+        }
+        if change.delete {
+            if is_root_index(&change.path) {
+                bail!("项目主页 index 不能删除，只能编辑");
+            }
+        } else {
+            let content = change
+                .content
+                .as_deref()
+                .context("非删除变更缺少 content")?;
+            ensure_text(content.as_bytes())?;
+        }
+    }
+    get_project(pool, project_id).await?.context("项目不存在")?;
+
+    let mut tx = pool.begin().await?;
+    lock_project(&mut tx, project_id).await?;
+    let parent = store::resolve_branch(&mut tx, project_id, branch).await?;
+    let mut files = match parent {
+        Some(commit) => tree::read_files(&mut tx, project_id, commit).await?,
+        None => BTreeMap::new(),
+    };
+    let mut root = match parent {
+        Some(commit) => Some(tree::read_commit_tree(&mut tx, project_id, commit).await?),
+        None => None,
+    };
+    let mut metadata: Vec<(String, String, Option<Oid>, Option<Oid>)> = Vec::new();
+
+    // 先删除，再写入；这样同批里的删除不会和新增输出路径撞车。
+    let ordered: Vec<&FileChange> = changes
+        .iter()
+        .filter(|change| change.delete)
+        .chain(changes.iter().filter(|change| !change.delete))
+        .collect();
+    for change in ordered {
+        if change.delete {
+            let Some((old_oid, _)) = tree::find_file(
+                &mut tx,
+                project_id,
+                parent.context("分支不存在")?,
+                &change.path,
+            )
+            .await?
+            else {
+                bail!("文件不存在: {}", change.path);
+            };
+            root = Some(tree::update_path(&mut tx, project_id, root, &change.path, None).await?);
+            files.remove(&change.path);
+            metadata.push((change.path.clone(), "delete".to_string(), None, Some(old_oid)));
+        } else {
+            ensure_no_output_conflict(&change.path, &files)?;
+            let content = change.content.as_deref().unwrap_or_default();
+            let blob = tree::write_blob(&mut tx, project_id, content.as_bytes()).await?;
+            let existed = files.contains_key(&change.path);
+            root = Some(
+                tree::update_path(&mut tx, project_id, root, &change.path, Some(blob)).await?,
+            );
+            files.insert(change.path.clone(), content.as_bytes().to_vec());
+            metadata.push((
+                change.path.clone(),
+                if existed { "modify" } else { "add" }.to_string(),
+                Some(blob),
+                None,
+            ));
+        }
+    }
+
+    let tree_oid = root.context("分支不存在")?;
+    let default_message = if metadata.len() == 1 {
+        format!(
+            "{} {}",
+            match metadata[0].1.as_str() {
+                "delete" => "删除",
+                "add" => "新增",
+                _ => "更新",
+            },
+            metadata[0].0
+        )
+    } else {
+        format!("更新 {} 个文件", metadata.len())
+    };
+    let message = message_or(&default_message, message);
+    let commit = commit_snapshot(
+        &mut tx,
+        project_id,
+        user,
+        branch,
+        parent,
+        tree_oid,
+        &message,
+    )
+    .await?;
+    for (path, change, blob, old_blob) in &metadata {
+        store::insert_commit_path(
+            &mut tx,
+            project_id,
+            commit,
+            path,
+            change,
+            None,
+            blob.or(*old_blob),
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(BatchWriteResult {
+        commit: commit.to_hex(),
+        paths: metadata.into_iter().map(|(path, ..)| path).collect(),
     })
 }
 
