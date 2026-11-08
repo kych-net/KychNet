@@ -626,6 +626,16 @@ export function ProjectsView() {
     }
   }
 
+  async function copyGitUrl() {
+    if (!selected) return;
+    try {
+      await navigator.clipboard.writeText(gitUrl(selected.slug));
+      setNotice("仓库地址已复制");
+    } catch {
+      setError("无法访问剪贴板，请手动复制仓库地址");
+    }
+  }
+
   async function archiveProject() {
     if (!selected) return;
     if (!window.confirm(`归档项目「${selected.slug}」？归档后不再出现在列表和站点中。`)) return;
@@ -649,8 +659,19 @@ export function ProjectsView() {
 
       <div className="projects-layout">
         <aside className="project-sidebar">
-          <button type="button" onClick={() => setCreating((value) => !value)}>
-            {creating ? "取消新建" : "新建项目"}
+          <div className="project-sidebar-head">
+            <div>
+              <span className="project-sidebar-kicker">Workspace</span>
+              <strong>项目仓库</strong>
+            </div>
+            <span className="project-count">{projects.length}</span>
+          </div>
+          <button
+            type="button"
+            className="project-new-button"
+            onClick={() => setCreating((value) => !value)}
+          >
+            {creating ? "取消新建" : "+ 新建项目"}
           </button>
           {creating && (
             <form className="project-create" onSubmit={createProject}>
@@ -689,7 +710,12 @@ export function ProjectsView() {
                   className={selected?.id === project.id ? "active" : ""}
                   onClick={() => void selectProject(project)}
                 >
-                  <span>{project.slug}</span>
+                  <span className="project-avatar">{project.slug.slice(0, 1).toUpperCase()}</span>
+                  <span className="project-list-copy">
+                    <strong>{project.slug}</strong>
+                    {project.description && <small>{project.description}</small>}
+                  </span>
+                  <span className="project-chevron" aria-hidden="true">›</span>
                 </button>
               </li>
             ))}
@@ -698,22 +724,34 @@ export function ProjectsView() {
 
         <div className="project-main">
           {!selected ? (
-            <p className="hint">选择或新建一个项目。</p>
+            <div className="project-empty">
+              <span className="project-empty-mark">⌘</span>
+              <h3>选择一个项目</h3>
+              <p>左侧选择已有仓库，或新建一个项目开始。</p>
+              <button type="button" onClick={() => setCreating(true)}>
+                新建项目
+              </button>
+            </div>
           ) : (
             <>
               <div className="project-head">
-                <div>
+                <div className="project-head-main">
+                  <span className="project-head-kicker">Repository</span>
                   <h3>{selected.slug}</h3>
-                  <p className="hint">
-                    内容路径 <code>/项目/{selected.slug}/</code> · 仓库{" "}
-                    <code>{gitUrl(selected.slug)}</code>
-                  </p>
+                  {selected.description && <p className="project-description">{selected.description}</p>}
+                  <div className="project-meta-row">
+                    <span className="pill pill-branch">{selected.default_branch}</span>
+                    <code className="project-url">{gitUrl(selected.slug)}</code>
+                  </div>
                 </div>
                 <div className="project-head-actions">
+                  <button type="button" onClick={copyGitUrl}>
+                    复制地址
+                  </button>
                   <button type="button" onClick={() => void editProject()}>
                     编辑信息
                   </button>
-                  <button type="button" onClick={() => void archiveProject()}>
+                  <button type="button" className="danger-text" onClick={() => void archiveProject()}>
                     归档
                   </button>
                 </div>
@@ -752,7 +790,7 @@ export function ProjectsView() {
 
               {tab === "files" && (
                 <>
-              <div className="row align">
+              <div className="row align file-toolbar">
                 <label>
                   分支
                   <select
@@ -805,8 +843,11 @@ export function ProjectsView() {
                             item.is_dir ? void openDir(item.path) : void openFile(item.path)
                           }
                         >
-                          <span>
-                            {item.is_dir ? "[目录]" : "[文件]"} {item.name}
+                          <span className={`project-file-name ${item.is_dir ? "is-dir" : "is-file"}`}>
+                            <span className="file-glyph" aria-hidden="true">
+                              {item.is_dir ? "▸" : "·"}
+                            </span>
+                            {item.name}
                           </span>
                           {!item.is_dir && <small>{item.size} B</small>}
                         </button>
@@ -867,7 +908,11 @@ export function ProjectsView() {
                       </div>
                     </form>
                   ) : (
-                    <p className="hint">选择文件查看或编辑。</p>
+                    <div className="editor-empty">
+                      <span className="editor-empty-mark">⌁</span>
+                      <h4>选择一个文件</h4>
+                      <p>从左侧文件树打开文件，或新建一个文件开始编辑。</p>
+                    </div>
                   )}
                 </div>
               </div>
