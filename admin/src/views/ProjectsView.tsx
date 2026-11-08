@@ -774,6 +774,15 @@ export function ProjectsView() {
               </div>
             </div>
             <div className="project-git">
+              <div className="project-git-head">
+                <div>
+                  <span className="project-git-kicker">Git</span>
+                  <strong>工作区</strong>
+                </div>
+                <span className="project-git-meta">
+                  {selected.slug} · {branch}
+                </span>
+              </div>
               <div className="project-tabs">
                 <button
                   type="button"
