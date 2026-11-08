@@ -26,6 +26,16 @@ type Props = {
 
 const adminViews: View[] = ["workflows", "invites", "users", "settings"];
 
+const viewMeta: Record<View, { title: string; subtitle: string }> = {
+  contents: { title: "内容", subtitle: "维护页面、样式与发布状态" },
+  projects: { title: "项目", subtitle: "站内 Git 仓库、分支与协作" },
+  workflows: { title: "工作流", subtitle: "定义、运行记录与执行器" },
+  invites: { title: "邀请码", subtitle: "控制注册入口与有效期" },
+  users: { title: "用户", subtitle: "账号状态与权限" },
+  settings: { title: "站点设置", subtitle: "站点信息、导航与发布" },
+  profile: { title: "个人资料", subtitle: "头像、Git 令牌与安全设置" },
+};
+
 export function Shell({
   user,
   site,
@@ -99,6 +109,7 @@ export function Shell({
           ) : (
             <span className="brand-mark">{site.site_name.slice(0, 1)}</span>
           )}
+          <span className="brand-name">{site.site_name}</span>
         </a>
 
         <button className="dir-tree-toggle" type="button" onClick={toggleTree}>
@@ -176,6 +187,14 @@ export function Shell({
       </header>
 
       <main className="appmain">
+        <div className="page-head">
+          <div>
+            <span className="page-eyebrow">KychNet Admin</span>
+            <h1>{viewMeta[view].title}</h1>
+            <p>{viewMeta[view].subtitle}</p>
+          </div>
+          <span className="page-badge">{user.is_admin ? "管理员" : "编辑者"}</span>
+        </div>
         <Suspense fallback={<p className="hint">加载视图…</p>}>
         {view === "contents" && (
           <ContentsView
