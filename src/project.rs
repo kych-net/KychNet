@@ -173,6 +173,9 @@ async fn commit_snapshot(
     let commit =
         store::put_object(conn, project_id, &crate::git::object::Object::commit(data)).await?;
     store::set_ref(conn, project_id, &format!("refs/heads/{branch}"), commit).await?;
+    // `Uuid::nil()` 是「系统身份」（KychRunner）约定：runner 不是站内用户，
+    // 作者名仍记 username（`kychrunner`），但 author_id 写 NULL，避免违反
+    // git_commits.author_id → users(id) 的外键。
     store::insert_commit_index(
         conn,
         project_id,
@@ -180,7 +183,7 @@ async fn commit_snapshot(
         parent,
         None,
         tree_oid,
-        Some(user.id),
+        (!user.id.is_nil()).then_some(user.id),
         &user.username,
         message,
         now,
