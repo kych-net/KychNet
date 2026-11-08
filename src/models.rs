@@ -129,6 +129,30 @@ pub struct Content {
     pub published: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// 当前版本指针：指向 `content_revisions` 里正在展示的版本。
+    /// 回滚直接移动这个指针，不产生新版本；0 表示尚未落任何版本。
+    pub rev_seq: i32,
+}
+
+/// 单篇内容的单线历史版本。`kind = full` 时 `data` 是整段正文，
+/// `kind = delta` 时 `data` 是相对 `parent_seq` 版本的行级增量（JSON 操作序列）。
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct ContentRevision {
+    pub id: Uuid,
+    pub content_id: Uuid,
+    pub seq: i32,
+    pub parent_seq: Option<i32>,
+    pub kind: String,
+    pub slug: String,
+    pub format: String,
+    pub data: String,
+    pub added: i32,
+    pub removed: i32,
+    pub author_id: Option<Uuid>,
+    pub author_name: Option<String>,
+    pub message: String,
+    pub byte_size: i32,
+    pub created_at: DateTime<Utc>,
 }
 
 impl Content {

@@ -957,6 +957,9 @@ struct ContentRequest {
     body: String,
     #[serde(default)]
     published: bool,
+    /// 可选的版本说明，落入精简版历史；缺省为空。
+    #[serde(default)]
+    message: String,
 }
 
 async fn preview_content(
@@ -1009,7 +1012,7 @@ async fn save_content(
     session: Session,
     Json(req): Json<ContentRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    current_user(&state, &session).await?;
+    let user = current_user(&state, &session).await?;
     let Some(format) = crate::models::ContentFormat::parse(&req.format) else {
         api_bail!("format 只能是 markdown、html、typst、wikidot、css 或 svg");
     };
@@ -1043,6 +1046,8 @@ async fn save_content(
             format.as_str(),
             &req.body,
             req.published,
+            user.id,
+            req.message.trim(),
         )
         .await?
     } else {
@@ -1052,6 +1057,8 @@ async fn save_content(
             format.as_str(),
             &req.body,
             req.published,
+            user.id,
+            req.message.trim(),
         )
         .await?
     };
@@ -1093,6 +1100,85 @@ async fn delete_content(
         }
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// 精简版历史：版本列表。data 不下发，避免把大正文拖出来。
+async fn content_revisions(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current_user(&state, &session).await?;
+    let rev_seq: i32 = sqlx::query_scalar("SELECT rev_seq FROM contents WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or_else(|| ApiError::with_status(StatusCode::NOT_FOUND, "内容不存在"))?;
+    let items: Vec<serde_json::Value> = crate::history::list_revisions(&state.pool, id)
+        .await?
+        .into_iter()
+        .map(|revision| {
+            let mut value = json!(revision);
+            if let Some(object) = value.as_object_mut() {
+                object.insert("is_current".to_string(), json!(revision.seq == rev_seq));
+            }
+            value
+        })
+        .collect();
+    Ok(Json(json!({ "items": items, "current_seq": rev_seq })))
+}
+
+/// 单个版本的完整正文（重建增量后返回），用于版本预览与回滚确认。
+async fn content_revision_body(
+    State(state): State<AppState>,
+    session: Session,
+    Path((id, seq)): Path<(Uuid, i32)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current_user(&state, &session).await?;
+    let (format, body) = crate::history::read_revision(&state.pool, id, seq)
+        .await
+        .map_err(|error| ApiError::with_status(StatusCode::NOT_FOUND, format!("{error}")))?;
+    Ok(Json(json!({ "seq": seq, "format": format, "body": body })))
+}
+
+#[derive(Deserialize)]
+struct RevisionDiffQuery {
+    /// 缺省与当前指针版本比较。
+    #[serde(default)]
+    against: Option<i32>,
+}
+
+/// 两个版本间的 unified diff（源文本行级比较）。
+async fn content_revision_diff(
+    State(state): State<AppState>,
+    session: Session,
+    Path((id, seq)): Path<(Uuid, i32)>,
+    Query(query): Query<RevisionDiffQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current_user(&state, &session).await?;
+    let diff = crate::history::diff_revisions(&state.pool, id, seq, query.against)
+        .await
+        .map_err(|error| ApiError::with_status(StatusCode::NOT_FOUND, format!("{error}")))?;
+    Ok(Json(json!({ "diff": diff })))
+}
+
+/// 回滚：直接移动指针到目标版本（不产生新版本），并重建该页静态产物。
+async fn content_revision_revert(
+    State(state): State<AppState>,
+    session: Session,
+    Path((id, seq)): Path<(Uuid, i32)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current_user(&state, &session).await?;
+    let content = crate::history::revert(&state.pool, id, seq)
+        .await
+        .map_err(|error| ApiError::with_status(StatusCode::NOT_FOUND, format!("{error}")))?;
+    if let Err(error) = state.build_ctl.build_page(&content.slug, None).await {
+        return Err(ApiError::with_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("已回滚，但自动编译失败：{error}"),
+        ));
+    }
+    Ok(Json(json!({ "item": content })))
 }
 
 async fn invites(
@@ -1381,6 +1467,16 @@ pub async fn serve(cfg: Config) -> Result<()> {
         .route("/api/contents", get(contents).post(save_content))
         .route("/api/preview", post(preview_content))
         .route("/api/contents/{id}", delete(delete_content))
+        .route("/api/contents/{id}/revisions", get(content_revisions))
+        .route("/api/contents/{id}/revisions/{seq}", get(content_revision_body))
+        .route(
+            "/api/contents/{id}/revisions/{seq}/diff",
+            get(content_revision_diff),
+        )
+        .route(
+            "/api/contents/{id}/revisions/{seq}/revert",
+            post(content_revision_revert),
+        )
         .route("/api/projects", get(project_list).post(project_create))
         .route(
             "/api/projects/{id}",

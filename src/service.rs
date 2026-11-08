@@ -569,6 +569,10 @@ pub async fn find_content_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Conten
 }
 
 /// 按 id 更新内容，允许修改路径。路径唯一冲突时返回可读错误。
+///
+/// 正文或格式实际变化时在同一事务里落一条版本行（精简版历史），
+/// 只改路径 / 发布状态不产生新版本。
+#[allow(clippy::too_many_arguments)]
 pub async fn update_content(
     pool: &PgPool,
     id: Uuid,
@@ -576,20 +580,63 @@ pub async fn update_content(
     format: &str,
     body: &str,
     published: bool,
+    author_id: Uuid,
+    message: &str,
 ) -> Result<Content> {
-    let result = sqlx::query_as::<_, Content>(
-        "UPDATE contents
-         SET slug = $2, format = $3, body = $4, published = $5, updated_at = now()
-         WHERE id = $1
-         RETURNING *",
-    )
-    .bind(id)
-    .bind(slug)
-    .bind(format)
-    .bind(body)
-    .bind(published)
-    .fetch_one(pool)
-    .await;
+    let mut tx = pool.begin().await?;
+    // 与回滚共用一把行锁：锁住后再读旧正文、算增量、落版本，
+    // 并发保存与回滚在行级串行，版本链不会交叉。
+    let old: Option<(String,)> =
+        sqlx::query_as("SELECT body FROM contents WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((old_body,)) = old else {
+        bail!("内容不存在");
+    };
+    let content_changed = old_body != body;
+    let new_rev_seq = if content_changed {
+        Some(
+            crate::history::record_revision(
+                &mut tx, id, slug, format, &old_body, body, author_id, message,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let result = if let Some(rev_seq) = new_rev_seq {
+        sqlx::query_as::<_, Content>(
+            "UPDATE contents
+             SET slug = $2, format = $3, body = $4, published = $5,
+                 rev_seq = $6, updated_at = now()
+             WHERE id = $1
+             RETURNING *",
+        )
+        .bind(id)
+        .bind(slug)
+        .bind(format)
+        .bind(body)
+        .bind(published)
+        .bind(rev_seq)
+        .fetch_one(&mut *tx)
+        .await
+    } else {
+        sqlx::query_as::<_, Content>(
+            "UPDATE contents
+             SET slug = $2, format = $3, body = $4, published = $5, updated_at = now()
+             WHERE id = $1
+             RETURNING *",
+        )
+        .bind(id)
+        .bind(slug)
+        .bind(format)
+        .bind(body)
+        .bind(published)
+        .fetch_one(&mut *tx)
+        .await
+    };
+    tx.commit().await?;
 
     match result {
         Ok(content) => Ok(content),
@@ -601,28 +648,91 @@ pub async fn update_content(
     }
 }
 
+/// 按 slug 新建或更新内容。已存在同名记录时行为同 `update_content`
+/// （含落版本），否则插入并落第一条全文基线版本。
+#[allow(clippy::too_many_arguments)]
 pub async fn upsert_content(
     pool: &PgPool,
     slug: &str,
     format: &str,
     body: &str,
     published: bool,
+    author_id: Uuid,
+    message: &str,
 ) -> Result<Content> {
-    let content = sqlx::query_as::<_, Content>(
-        "INSERT INTO contents (id, slug, format, body, published)
-         VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (slug) DO UPDATE
-         SET format = EXCLUDED.format, body = EXCLUDED.body,
-             published = EXCLUDED.published, updated_at = now()
-         RETURNING *",
-    )
-    .bind(Uuid::new_v4())
-    .bind(slug)
-    .bind(format)
-    .bind(body)
-    .bind(published)
-    .fetch_one(pool)
-    .await?;
+    let mut tx = pool.begin().await?;
+    let existing: Option<(Uuid, String)> =
+        sqlx::query_as("SELECT id, body FROM contents WHERE slug = $1 FOR UPDATE")
+            .bind(slug)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let content = if let Some((id, old_body)) = existing {
+        let content_changed = old_body != body;
+        let new_rev_seq = if content_changed {
+            Some(
+                crate::history::record_revision(
+                    &mut tx, id, slug, format, &old_body, body, author_id, message,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        if let Some(rev_seq) = new_rev_seq {
+            sqlx::query_as::<_, Content>(
+                "UPDATE contents
+                 SET format = $2, body = $3, published = $4, rev_seq = $5, updated_at = now()
+                 WHERE id = $1
+                 RETURNING *",
+            )
+            .bind(id)
+            .bind(format)
+            .bind(body)
+            .bind(published)
+            .bind(rev_seq)
+            .fetch_one(&mut *tx)
+            .await?
+        } else {
+            sqlx::query_as::<_, Content>(
+                "UPDATE contents
+                 SET format = $2, body = $3, published = $4, updated_at = now()
+                 WHERE id = $1
+                 RETURNING *",
+            )
+            .bind(id)
+            .bind(format)
+            .bind(body)
+            .bind(published)
+            .fetch_one(&mut *tx)
+            .await?
+        }
+    } else {
+        let content = sqlx::query_as::<_, Content>(
+            "INSERT INTO contents (id, slug, format, body, published, rev_seq)
+             VALUES ($1, $2, $3, $4, $5, 1)
+             RETURNING *",
+        )
+        .bind(Uuid::new_v4())
+        .bind(slug)
+        .bind(format)
+        .bind(body)
+        .bind(published)
+        .fetch_one(&mut *tx)
+        .await?;
+        // 新内容的第一版就是全文基线。
+        crate::history::record_full_baseline(
+            &mut tx,
+            content.id,
+            slug,
+            format,
+            body,
+            author_id,
+            message,
+        )
+        .await?;
+        content
+    };
+    tx.commit().await?;
     Ok(content)
 }
 

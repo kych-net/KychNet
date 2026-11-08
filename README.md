@@ -52,6 +52,16 @@
 - 管理端 Markdown/HTML 预览在浏览器端渲染,Wikidot 预览走服务端 ftml,统一放进无脚本 sandbox iframe.
 - 用户头像为上传的 SVG 文件,由服务端校验确为纯矢量:必须是合法 XML 且根元素为 `svg`,至少包含一个矢量图形,禁止内嵌/外链位图、`<script>`、`<foreignObject>`、事件属性、DTD 与实体声明、`<animate>`/`<set>` 等属性动画元素,`href` 只允许指向文档内图元(`#xxx`);内容上限 256 KB,传输上限 257 KB.
 
+## 精简版版本历史
+
+普通文章(不含项目 Git)有单文件、单线历史的精简版版本管理,历史存在 PostgreSQL 的 `content_revisions` 表:
+
+- 每次保存,正文或格式实际变化才落一条版本;只改路径/发布状态不产生新版本;
+- 历史以行级增量存储(`content_revisions.data` 为 copy/insert/delete/replace 操作序列),不存全文快照;每 20 个增量或增量超过新正文 40% 时自动落一次全文检查点,任意版本的重建最多回放 20 个增量;
+- 回滚是移动指针:直接把 `contents.rev_seq` 指向目标版本并把正文写回,不产生新版本;之后的版本仍保留在历史中,下一次保存基于移动后的指针继续延伸;
+- 管理端内容页右栏是「版本历史」面板:版本列表、任意两版本的 unified diff(源文本行级比较)、版本预览、一键回滚;保存表单可附非必填的版本说明;
+- API:`GET/POST /api/contents/{id}/revisions[/{seq}[/diff|/revert]]`,权限与内容写接口一致。
+
 
 ## 技术栈
 

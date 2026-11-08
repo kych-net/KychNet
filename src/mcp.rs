@@ -280,6 +280,11 @@ impl KychMcp {
         Parameters(params): Parameters<SaveContentParams>,
     ) -> Result<CallToolResult, McpError> {
         require_scope(&parts, "content:write")?;
+        let author_id = parts
+            .extensions
+            .get::<McpUser>()
+            .map(|context| context.user.id)
+            .ok_or_else(|| McpError::invalid_params("缺少认证上下文", None))?;
         let requested = ContentFormat::parse(params.format.trim().to_ascii_lowercase().as_str())
             .ok_or_else(|| McpError::invalid_params(format!("未知格式: {}", params.format), None))?;
         let (slug, format) = service::normalize_content_path(&params.slug, requested)
@@ -290,6 +295,8 @@ impl KychMcp {
             format.as_str(),
             &params.body,
             params.published,
+            author_id,
+            "",
         )
         .await
         .map_err(internal_error)?;
