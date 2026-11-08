@@ -351,10 +351,12 @@ impl TypstWorld {
             for entry in archive.entries()? {
                 let mut entry = entry?;
                 let path = entry.path()?.into_owned();
-                if path
-                    .components()
-                    .any(|part| !matches!(part, std::path::Component::Normal(_)))
-                {
+                if path.components().any(|part| {
+                    !matches!(
+                        part,
+                        std::path::Component::Normal(_) | std::path::Component::CurDir
+                    )
+                }) {
                     anyhow::bail!("Typst 包包含非法路径: {}", path.display());
                 }
                 if entry.header().entry_type().is_symlink()
