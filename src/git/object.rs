@@ -147,17 +147,18 @@ pub fn hash_object(kind: ObjectKind, data: &[u8]) -> Oid {
     Oid(hasher.finalize().into())
 }
 
-/// 项目仓库暂时禁止二进制：未实现 LFS 之前只接受 UTF-8 文本。
+/// 判断内容能否作为 UTF-8 文本直接进 blob。
 ///
-/// Git 自己的二进制判定主要看 NUL；这里再要求整体是合法 UTF-8，
-/// 让“能放进编辑器 / 能参与构建”与“能进仓库”保持一致。
+/// Git 自己的二进制判定主要看 NUL；这里再要求整体是合法 UTF-8。
+/// 非文本内容走站内已实现的 LFS（`git/lfs.rs`），由 `project::write_file_bytes`
+/// 分流；`ensure_text` 只用于管理端文本编辑器这个入口。
 pub fn is_text(data: &[u8]) -> bool {
     !data.contains(&0) && std::str::from_utf8(data).is_ok()
 }
 
 pub fn ensure_text(data: &[u8]) -> Result<()> {
     if !is_text(data) {
-        bail!("项目仓库暂不支持二进制文件；二进制将在 LFS 实现后启用");
+        bail!("管理端编辑器只支持 UTF-8 文本；二进制请用 /git/<项目>/file 写入（LFS）");
     }
     Ok(())
 }

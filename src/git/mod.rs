@@ -6,3 +6,4 @@ pub mod proto;
 pub mod store;
 pub mod token;
 pub mod tree;
+pub mod worktree;

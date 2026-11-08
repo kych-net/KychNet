@@ -7,9 +7,10 @@ const InvitesView = lazy(() => import("../views/InvitesView").then((module) => (
 const ProfileView = lazy(() => import("../views/ProfileView").then((module) => ({ default: module.ProfileView })));
 const ProjectsView = lazy(() => import("../views/ProjectsView").then((module) => ({ default: module.ProjectsView })));
 const SettingsView = lazy(() => import("../views/SettingsView").then((module) => ({ default: module.SettingsView })));
+const WorkflowsView = lazy(() => import("../views/WorkflowsView").then((module) => ({ default: module.WorkflowsView })));
 const UsersView = lazy(() => import("../views/UsersView").then((module) => ({ default: module.UsersView })));
 
-type View = "contents" | "projects" | "invites" | "users" | "settings" | "profile";
+type View = "contents" | "projects" | "workflows" | "invites" | "users" | "settings" | "profile";
 
 type Props = {
   user: User;
@@ -23,7 +24,7 @@ type Props = {
   onLogout: () => void;
 };
 
-const adminViews: View[] = ["invites", "users", "settings"];
+const adminViews: View[] = ["workflows", "invites", "users", "settings"];
 
 export function Shell({
   user,
@@ -118,7 +119,7 @@ export function Shell({
                 className={view === item ? "active" : ""}
                 onClick={() => go(item)}
               >
-                {item === "invites" ? "邀请码" : item === "users" ? "用户" : "站点设置"}
+                {item === "workflows" ? "工作流" : item === "invites" ? "邀请码" : item === "users" ? "用户" : "站点设置"}
               </button>
             ))}
         </nav>
@@ -183,6 +184,7 @@ export function Shell({
           />
         )}
         {view === "projects" && <ProjectsView />}
+        {view === "workflows" && user.is_admin && <WorkflowsView />}
         {view === "invites" && user.is_admin && <InvitesView />}
         {view === "users" && user.is_admin && <UsersView />}
         {view === "settings" && user.is_admin && <SettingsView />}

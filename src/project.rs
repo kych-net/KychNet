@@ -1,12 +1,15 @@
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use sqlx::{PgConnection, PgPool};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::path::Path;
 use uuid::Uuid;
 
+use crate::git::lfs;
 use crate::git::object::{
-    commit_parents, encode_commit, ensure_text, identity_name, Oid,
+    commit_parents, encode_commit, ensure_text, identity_name, is_text, Oid,
 };
 use crate::git::store;
 use crate::git::tree;
@@ -22,6 +25,8 @@ pub struct Project {
     pub title: String,
     pub description: String,
     pub default_branch: String,
+    #[serde(default)]
+    pub workflow_dir: String,
     pub created_by: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -170,6 +175,9 @@ async fn commit_snapshot(
     let commit =
         store::put_object(conn, project_id, &crate::git::object::Object::commit(data)).await?;
     store::set_ref(conn, project_id, &format!("refs/heads/{branch}"), commit).await?;
+    // `Uuid::nil()` 是「系统身份」（KychRunner）约定：runner 不是站内用户，
+    // 作者名仍记 username（`kychrunner`），但 author_id 写 NULL，避免违反
+    // git_commits.author_id → users(id) 的外键。
     store::insert_commit_index(
         conn,
         project_id,
@@ -177,7 +185,7 @@ async fn commit_snapshot(
         parent,
         None,
         tree_oid,
-        Some(user.id),
+        (!user.id.is_nil()).then_some(user.id),
         &user.username,
         message,
         now,
@@ -366,7 +374,7 @@ pub async fn read_file(
         return Ok(None);
     };
     if !crate::git::object::is_text(&data) {
-        bail!("该文件不是 UTF-8 文本；二进制需等 LFS 实现后才能管理");
+        bail!("该文件不是 UTF-8 文本；二进制请用 GET /git/<项目>/file 读取（LFS 已支持）");
     }
     Ok(Some(FileContent {
         path: path.to_string(),
@@ -428,6 +436,91 @@ pub async fn write_file(
     ensure_no_output_conflict(path, &files)?;
 
     let blob = tree::write_blob(&mut tx, project_id, content.as_bytes()).await?;
+    let root = match parent {
+        Some(commit) => Some(tree::read_commit_tree(&mut tx, project_id, commit).await?),
+        None => None,
+    };
+    let tree_oid = tree::update_path(&mut tx, project_id, root, path, Some(blob)).await?;
+    let change = if existing_oid.is_some() { "modify" } else { "add" };
+    let default_message = format!(
+        "{} {path}",
+        if existing_oid.is_some() { "更新" } else { "新增" }
+    );
+    let message = message_or(&default_message, message);
+    let commit = commit_files(
+        &mut tx,
+        project_id,
+        user,
+        branch,
+        parent,
+        tree_oid,
+        &message,
+        path,
+        change,
+        None,
+        Some(blob),
+    )
+    .await?;
+
+    tx.commit().await?;
+    Ok(WriteResult {
+        commit: commit.to_hex(),
+        path: path.to_string(),
+        oid: blob.to_hex(),
+    })
+}
+
+/// 写文件树（原始字节）：UTF-8 文本直接进 blob，二进制走站内已实现的
+/// LFS——对象落盘并登记，仓库里只存 pointer。与管理端 `write_file` 共用
+/// 同一套项目锁、乐观锁、输出冲突校验与 commit 记录。
+#[allow(clippy::too_many_arguments)]
+pub async fn write_file_bytes(
+    pool: &PgPool,
+    user: &User,
+    project_id: Uuid,
+    branch: &str,
+    path: &str,
+    data: &[u8],
+    message: Option<&str>,
+    base_oid: Option<&str>,
+    lfs_root: &Path,
+) -> Result<WriteResult> {
+    if !valid_branch(branch) {
+        bail!("非法分支名");
+    }
+    if !valid_file_path(path) {
+        bail!("非法文件路径");
+    }
+    get_project(pool, project_id).await?.context("项目不存在")?;
+
+    // LFS 落盘在事务外完成：它自己要用 pool 取连接，避免和 lock_project
+    // 持有的事务互相等连接。万一事务回滚，留下的孤儿对象由 gc 清理。
+    let blob_bytes = if is_text(data) {
+        data.to_vec()
+    } else {
+        let oid = hex::encode(Sha256::digest(data));
+        lfs::store(pool, lfs_root, project_id, &oid, data).await?;
+        format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{oid}\nsize {}\n",
+            data.len()
+        )
+        .into_bytes()
+    };
+
+    let mut tx = pool.begin().await?;
+    lock_project(&mut tx, project_id).await?;
+    let parent = store::resolve_branch(&mut tx, project_id, branch).await?;
+    let files = match parent {
+        Some(commit) => tree::read_files(&mut tx, project_id, commit).await?,
+        None => BTreeMap::new(),
+    };
+    let existing_oid = files.get(path).map(|old| {
+        crate::git::object::hash_object(crate::git::object::ObjectKind::Blob, old)
+    });
+    store::check_old_oid(existing_oid, base_oid)?;
+    ensure_no_output_conflict(path, &files)?;
+
+    let blob = tree::write_blob(&mut tx, project_id, &blob_bytes).await?;
     let root = match parent {
         Some(commit) => Some(tree::read_commit_tree(&mut tx, project_id, commit).await?),
         None => None,
