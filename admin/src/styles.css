@@ -1431,3 +1431,125 @@ code,
     overflow-x: auto;
   }
 }
+
+/* ---------- page shell & hierarchy ---------- */
+.shell .appmain {
+  width: min(1320px, 100%);
+  max-width: 1320px;
+  margin: 0 auto;
+  padding: clamp(1.1rem, 2.4vw, 2rem) clamp(1rem, 3vw, 2.25rem) 4rem;
+}
+
+.brand-name {
+  margin-left: 0.55rem;
+  color: var(--text);
+  font-size: 0.95rem;
+  font-weight: 700;
+  letter-spacing: -0.015em;
+}
+
+.page-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  margin: 0.15rem 0 1.15rem;
+}
+
+.page-eyebrow {
+  display: block;
+  margin-bottom: 0.2rem;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.page-head h1 {
+  margin: 0;
+  color: var(--text);
+  font-size: clamp(1.55rem, 3vw, 2.15rem);
+  font-weight: 760;
+  letter-spacing: -0.045em;
+  line-height: 1.1;
+}
+
+.page-head p {
+  margin: 0.35rem 0 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.page-badge {
+  flex: 0 0 auto;
+  margin-top: 0.2rem;
+  padding: 0.3rem 0.6rem;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, transparent);
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 700;
+}
+
+.appmain > section {
+  padding: clamp(1.1rem, 2.4vw, 1.6rem);
+  border-color: color-mix(in srgb, var(--border) 84%, transparent);
+  box-shadow: var(--shadow);
+}
+
+/* 视图已有 h2 时，用页头做主标题，避免重复。 */
+.appmain > .page-head + section > h2 {
+  display: none;
+}
+
+.appmain > section > h3 {
+  margin-top: 1.9rem;
+  padding-top: 1.1rem;
+  border-top: 1px solid var(--border);
+}
+
+.appmain > section > h3:first-of-type {
+  margin-top: 1.25rem;
+}
+
+.table-wrap {
+  margin: 0.85rem 0 1.25rem;
+  overflow: auto;
+  border-radius: 12px;
+}
+
+.appmain table {
+  min-width: 36rem;
+}
+
+.appmain td,
+.appmain th {
+  vertical-align: middle;
+}
+
+.project-main,
+.editor-shell,
+.project-browser {
+  margin-top: 1rem;
+}
+
+@media (max-width: 760px) {
+  .brand-name {
+    display: none;
+  }
+
+  .page-head {
+    align-items: center;
+  }
+
+  .page-head h1 {
+    font-size: 1.45rem;
+  }
+
+  .appmain > section {
+    padding: 1rem;
+  }
+}
