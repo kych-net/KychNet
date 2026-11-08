@@ -1,8 +1,11 @@
-//! `/api/runner/*` HTTP 契约（模式 B）。
+//! `/api/runner/*` HTTP 契约（模式 B / protocol v2）。
 //!
 //! 只认 runner token（SHA-256 hash），与管理端 session 认证完全隔离。
 //! 快照端点在返回任何字节前，必须校验：token 有效 + executor_id 归属 +
 //! `status='in_progress'` + 租约未过期 + commit 属于该 run，任一不满足 403。
+//!
+//! v2 起执行器直接读写 `/git/<项目>/` 工作树；`runner_write_scope()` 把同一份
+//! token 复用到文件树写，但额外把写入目标限制在该 run 绑定的分支上。
 
 use axum::{
     extract::{Path as AxumPath, Query, State},
@@ -114,6 +117,62 @@ async fn authenticate(state: &WorkflowState, headers: &HeaderMap) -> Result<Uuid
     .await
     .map_err(internal)?;
     row.map(|(id,)| id).ok_or(StatusCode::FORBIDDEN)
+}
+
+/// `/git/<项目>/file` 写授权：runner token 只能写「自己正在执行的那个 run」。
+///
+/// 返回该 run 绑定的分支名（`refs/heads/` 已去掉）；命中条件全部满足才放行：
+/// token 有效且 executor 未禁用、run 处于 `in_progress`、租约未过期、
+/// run 属于当前项目。tag / 非 refs 事件返回 None（没有可写的分支）。
+///
+/// 这条校验是文件树写放开给 runner token 后的**唯一**约束来源，不能省略。
+pub(crate) async fn runner_write_scope(
+    pool: &PgPool,
+    headers: &HeaderMap,
+    project_id: Uuid,
+) -> anyhow::Result<Option<String>> {
+    let Some(token) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    else {
+        return Ok(None);
+    };
+    let hash = Sha256::digest(token.as_bytes()).to_vec();
+    let row: Option<(String,)> = sqlx::query_as(
+        r#"SELECT r.ref_name
+             FROM workflow_runners e
+             JOIN workflow_runs r ON r.executor_id = e.id
+            WHERE e.token_hash = $1 AND e.enabled
+              AND r.project_id = $2
+              AND r.status = 'in_progress' AND r.lease_until > now()
+            ORDER BY r.started_at DESC NULLS LAST
+            LIMIT 1"#,
+    )
+    .bind(&hash)
+    .bind(project_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|(name,)| {
+        name.strip_prefix("refs/heads/")
+            .filter(|b| !b.is_empty())
+            .map(str::to_string)
+    }))
+}
+
+/// 只编码 URL 路径段里必须编码的字节（与 `api::percent_encode_segment` 同规则）。
+fn encode_slug(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 /// 幂等 + 越权校验：只接受「本人正在执行、租约有效、attempt 匹配」的回报。
@@ -309,6 +368,15 @@ async fn claim_one(state: &WorkflowState, executor_id: Uuid) -> Result<Option<Va
         None => json!({}),
     };
 
+    // protocol v2：执行器直接读写 `/git/<项目>/` 工作树，不再默认走
+    // `/api/runner/jobs/{id}/snapshot`。写目标只给分支事件，tag 事件为 null。
+    let git_base = format!("/git/{}", encode_slug(&project.1));
+    let write_ref = row
+        .ref_name
+        .strip_prefix("refs/heads/")
+        .filter(|b| !b.is_empty())
+        .map(str::to_string);
+
     Ok(Some(json!({
         "run_id": row.id,
         "attempt": row.attempt,
@@ -321,6 +389,8 @@ async fn claim_one(state: &WorkflowState, executor_id: Uuid) -> Result<Option<Va
         "commit_oid": hex::encode(row.commit_oid.unwrap_or_default()),
         "def_commit_oid": hex::encode(row.def_commit_oid.unwrap_or_default()),
         "ref_name": row.ref_name,
+        "git_base": git_base,
+        "write_ref": write_ref,
         "workflow_path": row.workflow_path,
         "pr_number": row.pr_number,
         "trust_level": row.trust_level,

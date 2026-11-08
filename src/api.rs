@@ -2149,6 +2149,52 @@ fn git_need_user(
     }
 }
 
+/// 文件树写身份。Git 令牌 / 登录会话可写任意分支；runner token 只能写
+/// 自己正在执行的那个 run 绑定的分支（`allowed_ref`）。
+struct WorktreeWriteAuth {
+    user: User,
+    allowed_ref: Option<String>,
+}
+
+/// runner token 不是站内用户，用合成身份生成 commit。`id = Uuid::nil()` 是
+/// 「系统身份」约定：`project::commit_snapshot()` 据此把 `git_commits.author_id`
+/// 写成 NULL，避免指向不存在的 users 行；作者名记为 `kychrunner`。
+fn runner_identity() -> User {
+    User {
+        id: Uuid::nil(),
+        username: "kychrunner".to_string(),
+        disabled: false,
+        is_admin: false,
+        created_at: Utc::now(),
+    }
+}
+
+/// 文件树写认证：Git 令牌 → 登录会话 → runner token（带 run 绑定）。
+///
+/// smart HTTP 的 push / LFS 仍只走 `git_write_user()`，**不放给 runner token**：
+/// runner 只需要写工作树文件，不需要 push 任意 ref 或上传 LFS 对象。
+async fn worktree_write_auth(
+    state: &AppState,
+    headers: &HeaderMap,
+    session: &Session,
+    project_id: Uuid,
+) -> std::result::Result<Option<WorktreeWriteAuth>, String> {
+    if let Some(user) = git_write_user(state, headers, session).await? {
+        return Ok(Some(WorktreeWriteAuth {
+            user,
+            allowed_ref: None,
+        }));
+    }
+    match crate::workflow::runner_api::runner_write_scope(&state.pool, headers, project_id).await {
+        Ok(Some(branch)) => Ok(Some(WorktreeWriteAuth {
+            user: runner_identity(),
+            allowed_ref: Some(branch),
+        })),
+        Ok(None) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 /// 文件树写要更新分支 ref，所以只接受分支名，不接受 commit OID。
 #[allow(clippy::result_large_err)]
 fn worktree_write_ref(params: &HashMap<String, String>) -> std::result::Result<&str, Response> {
@@ -2248,7 +2294,8 @@ async fn git_http_get(
 ///
 /// 与 `git-upload-pack` 保持同等可见性：站内仓库内容本来就能匿名 fetch，
 /// 这里只是把 packfile 换成展开后的文件树，不额外放大暴露面。
-/// 写操作不在这里，走 `git_http_put` / `git_http_delete`，需登录会话。
+/// 写操作不在这里，走 `git_http_put` / `git_http_delete`：Git 令牌或登录会话
+/// 可写任意分支，runner token 只能写本次 run 绑定的分支。
 async fn worktree_get(
     state: &AppState,
     project: &crate::project::Project,
@@ -2565,10 +2612,11 @@ async fn git_http_delete(
     worktree_delete(&state, &project, &action, &params, &headers, &session).await
 }
 
-/// PUT `/git/<项目>/file`：登录用户写文件并生成一个新 commit。
+/// PUT `/git/<项目>/file`：写文件并生成一个新 commit。
 ///
 /// 请求体就是文件原始字节：UTF-8 文本直接进 blob，二进制走站内已实现的
 /// LFS（对象落盘 + 仓库里存 pointer）。可选 `message` 与 `base_oid`（乐观锁）。
+/// runner token 也能写，但只能写本次 run 绑定的分支，作者记为 `kychrunner`。
 #[allow(clippy::too_many_arguments)]
 async fn worktree_put(
     state: &AppState,
@@ -2582,14 +2630,23 @@ async fn worktree_put(
     if action != "file" {
         return git_plain(StatusCode::NOT_FOUND, "未知的文件树路径");
     }
-    let user = match git_need_user(git_write_user(state, headers, session).await) {
-        Ok(user) => user,
-        Err(response) => return response,
+    let auth = match worktree_write_auth(state, headers, session, project.id).await {
+        Ok(Some(auth)) => auth,
+        Ok(None) => return git_unauthorized(),
+        Err(error) => return git_plain(StatusCode::INTERNAL_SERVER_ERROR, &error),
     };
     let branch = match worktree_write_ref(params) {
         Ok(value) => value,
         Err(response) => return response,
     };
+    if let Some(allowed) = &auth.allowed_ref {
+        if branch != allowed {
+            return git_plain(
+                StatusCode::FORBIDDEN,
+                "runner 只能写本次 run 绑定的分支",
+            );
+        }
+    }
     let path = match worktree_write_path(params) {
         Ok(value) => value,
         Err(response) => return response,
@@ -2598,7 +2655,7 @@ async fn worktree_put(
     let base_oid = params.get("base_oid").map(String::as_str);
     let result = match crate::project::write_file_bytes(
         &state.pool,
-        &user,
+        &auth.user,
         project.id,
         branch,
         path,
@@ -2627,6 +2684,7 @@ async fn worktree_put(
 }
 
 /// 文件树删除：复用管理端 `project::delete_file`，语义完全一致。
+/// runner token 同样只能删本次 run 绑定分支上的文件。
 #[allow(clippy::too_many_arguments)]
 async fn worktree_delete(
     state: &AppState,
@@ -2639,21 +2697,37 @@ async fn worktree_delete(
     if action != "file" {
         return git_plain(StatusCode::NOT_FOUND, "未知的文件树路径");
     }
-    let user = match git_need_user(git_write_user(state, headers, session).await) {
-        Ok(user) => user,
-        Err(response) => return response,
+    let auth = match worktree_write_auth(state, headers, session, project.id).await {
+        Ok(Some(auth)) => auth,
+        Ok(None) => return git_unauthorized(),
+        Err(error) => return git_plain(StatusCode::INTERNAL_SERVER_ERROR, &error),
     };
     let branch = match worktree_write_ref(params) {
         Ok(value) => value,
         Err(response) => return response,
     };
+    if let Some(allowed) = &auth.allowed_ref {
+        if branch != allowed {
+            return git_plain(
+                StatusCode::FORBIDDEN,
+                "runner 只能写本次 run 绑定的分支",
+            );
+        }
+    }
     let path = match worktree_write_path(params) {
         Ok(value) => value,
         Err(response) => return response,
     };
     let message = params.get("message").map(String::as_str);
-    if let Err(error) =
-        crate::project::delete_file(&state.pool, &user, project.id, branch, path, message).await
+    if let Err(error) = crate::project::delete_file(
+        &state.pool,
+        &auth.user,
+        project.id,
+        branch,
+        path,
+        message,
+    )
+    .await
     {
         return git_plain(StatusCode::BAD_REQUEST, &error.to_string());
     }
