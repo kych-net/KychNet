@@ -722,8 +722,8 @@ export function ProjectsView() {
           </ul>
         </aside>
 
-        <div className="project-main">
-          {!selected ? (
+        {!selected ? (
+          <div className="project-empty-shell">
             <div className="project-empty">
               <span className="project-empty-mark">⌘</span>
               <h3>选择一个项目</h3>
@@ -732,8 +732,10 @@ export function ProjectsView() {
                 新建项目
               </button>
             </div>
-          ) : (
-            <>
+          </div>
+        ) : (
+          <>
+            <div className="project-overview">
               <div className="project-head">
                 <div className="project-head-main">
                   <span className="project-head-kicker">Repository</span>
@@ -756,7 +758,22 @@ export function ProjectsView() {
                   </button>
                 </div>
               </div>
-
+              <div className="project-overview-info">
+                <div className="project-fact">
+                  <span>默认分支</span>
+                  <strong>{selected.default_branch}</strong>
+                </div>
+                <div className="project-fact">
+                  <span>内容入口</span>
+                  <code>/项目/{selected.slug}/</code>
+                </div>
+                <div className="project-fact">
+                  <span>Git 仓库</span>
+                  <code>{gitUrl(selected.slug)}</code>
+                </div>
+              </div>
+            </div>
+            <div className="project-git">
               <div className="project-tabs">
                 <button
                   type="button"
@@ -1306,10 +1323,9 @@ export function ProjectsView() {
                   </div>
                 </div>
               )}
-            </>
-          )}
-        </div>
-        <aside className="project-aux" aria-hidden="true" />
+            </div>
+          </>
+        )}
       </div>
     </section>
   );
