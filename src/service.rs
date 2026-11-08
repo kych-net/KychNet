@@ -65,6 +65,21 @@ pub fn valid_content_slug(slug: &str) -> bool {
     !segments[0].eq_ignore_ascii_case("api") && !segments[0].eq_ignore_ascii_case("css")
 }
 
+/// 校验原始 SVG 路径（数据库里的输出路径，例如 `media/logo.svg`）。
+pub fn valid_svg_slug(slug: &str) -> bool {
+    let Some(stem) = slug.strip_suffix(".svg") else {
+        return false;
+    };
+    if slug.len() > MAX_PATH_BYTES {
+        return false;
+    }
+    let segments: Vec<&str> = stem.split('/').collect();
+    !segments.is_empty()
+        && segments.iter().all(|segment| valid_segment(segment))
+        && !segments[0].eq_ignore_ascii_case("api")
+        && !segments[0].eq_ignore_ascii_case("css")
+}
+
 /// 校验 `/css/...css` 路径（数据库里的输出路径，例如 `css/theme.css`）。
 pub fn valid_style_slug(slug: &str) -> bool {
     let Some(stem) = slug.strip_suffix(".css") else {
@@ -117,6 +132,31 @@ pub fn normalize_content_path(
         bail!("/项目/ 下的内容由项目仓库管理，请从「项目」入口编辑");
     }
 
+    if requested == ContentFormat::Svg {
+        let raw = trimmed.trim_start_matches('/');
+        let mut parts: Vec<String> = raw.split('/').map(str::to_string).collect();
+        if parts.iter().any(|s| s.is_empty() || s == "." || s == "..") {
+            bail!("路径不能包含空段、`.` 或 `..`");
+        }
+        let last = parts.last_mut().expect("parts 至少有一个元素");
+        let lower = last.to_ascii_lowercase();
+        let Some((stem, ext)) = lower.rsplit_once('.') else {
+            bail!("SVG 文件必须使用 .svg 扩展名");
+        };
+        if ext != "svg" {
+            bail!("SVG 文件必须使用 .svg 扩展名");
+        }
+        if stem.is_empty() {
+            bail!("路径缺少文件名");
+        }
+        *last = stem.to_string();
+        let slug = format!("{}.svg", parts.join("/"));
+        if !valid_svg_slug(&slug) {
+            bail!("SVG 路径只能包含 Unicode 字母/数字、-、_ 和 /，且不能使用保留路径");
+        }
+        return Ok((slug, ContentFormat::Svg));
+    }
+
     if requested == ContentFormat::Css {
         let raw = trimmed.trim_start_matches('/');
         let mut parts: Vec<String> = raw.split('/').map(str::to_string).collect();
@@ -158,6 +198,20 @@ pub fn normalize_content_path(
 
     if base.is_empty() {
         bail!("路径缺少文件名");
+    }
+    if inferred == Some(ContentFormat::Svg) {
+        if requested != ContentFormat::Svg {
+            bail!("扩展名与格式不一致：{} 应对应 svg", last);
+        }
+        let mut svg_parts = parts.clone();
+        if let Some(last) = svg_parts.last_mut() {
+            *last = base.clone();
+        }
+        let slug = format!("{}.svg", svg_parts.join("/"));
+        if !valid_svg_slug(&slug) {
+            bail!("SVG 路径只能包含 Unicode 字母/数字、-、_ 和 /，且不能使用保留路径");
+        }
+        return Ok((slug, ContentFormat::Svg));
     }
     let last_display = last.clone();
     *last = base;
@@ -730,4 +784,20 @@ mod tests {
         assert_eq!(source_path("wiki.html", ContentFormat::Wikidot), "wiki.wj");
         assert_eq!(source_path("css/theme.css", ContentFormat::Css), "css/theme.css");
     }
+    #[test]
+    fn normalizes_svg_raw_files() {
+        assert_eq!(
+            normalize_content_path("/media/logo.svg", ContentFormat::Svg).unwrap(),
+            ("media/logo.svg".to_string(), ContentFormat::Svg)
+        );
+        assert!(normalize_content_path("/media/logo", ContentFormat::Svg).is_err());
+        assert!(normalize_content_path("/media/logo.svg", ContentFormat::Markdown).is_err());
+        assert_eq!(
+            source_path("media/logo.svg", ContentFormat::Svg),
+            "media/logo.svg"
+        );
+        assert!(super::valid_svg_slug("media/logo.svg"));
+        assert!(!super::valid_svg_slug("api/logo.svg"));
+    }
+
 }

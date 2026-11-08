@@ -967,13 +967,16 @@ async fn preview_content(
     current_user(&state, &session).await?;
     let format = ContentFormat::parse(&req.format)
         .ok_or_else(|| ApiError::with_status(StatusCode::BAD_REQUEST, "未知内容格式"))?;
+    if format == ContentFormat::Svg {
+        return Ok(Json(json!({ "html": req.body })));
+    }
     if !matches!(
         format,
         ContentFormat::Markdown | ContentFormat::Html | ContentFormat::Wikidot
     ) {
         return Err(ApiError::with_status(
             StatusCode::BAD_REQUEST,
-            "实时预览目前只支持 Markdown、HTML 和 Wikidot",
+            "实时预览目前只支持 Markdown、HTML、Wikidot 和 SVG",
         ));
     }
 
@@ -1008,13 +1011,16 @@ async fn save_content(
 ) -> ApiResult<Json<serde_json::Value>> {
     current_user(&state, &session).await?;
     let Some(format) = crate::models::ContentFormat::parse(&req.format) else {
-        api_bail!("format 只能是 markdown、html、typst、wikidot 或 css");
+        api_bail!("format 只能是 markdown、html、typst、wikidot、css 或 svg");
     };
     // 路径在这里归一化成输出路径：
     //   /xef/ -> xef/index.html
     //   /eoe/index.md -> eoe/index.html
     // 同一路径只有一条记录，因此 .html/.md/.typ 天然互斥。
     let (slug, format) = service::normalize_content_path(&req.slug, format)?;
+    if format == crate::models::ContentFormat::Svg {
+        crate::svg::validate_svg(req.body.as_bytes())?;
+    }
     let existing = if let Some(id) = req.id {
         Some(
             service::find_content_by_id(&state.pool, id)

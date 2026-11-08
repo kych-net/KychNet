@@ -66,6 +66,7 @@ pub enum ContentFormat {
     Typst,
     Wikidot,
     Css,
+    Svg,
 }
 
 impl ContentFormat {
@@ -76,6 +77,7 @@ impl ContentFormat {
             "typst" => Some(Self::Typst),
             "wikidot" => Some(Self::Wikidot),
             "css" => Some(Self::Css),
+            "svg" => Some(Self::Svg),
             _ => None,
         }
     }
@@ -88,6 +90,7 @@ impl ContentFormat {
             Self::Typst => "typst",
             Self::Wikidot => "wikidot",
             Self::Css => "css",
+            Self::Svg => "svg",
         }
     }
 
@@ -99,6 +102,7 @@ impl ContentFormat {
             Self::Typst => ".typ",
             Self::Wikidot => ".wj",
             Self::Css => ".css",
+            Self::Svg => ".svg",
         }
     }
 
@@ -110,6 +114,7 @@ impl ContentFormat {
             "typ" => Some(Self::Typst),
             "wj" => Some(Self::Wikidot),
             "css" => Some(Self::Css),
+            "svg" => Some(Self::Svg),
             _ => None,
         }
     }

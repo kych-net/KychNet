@@ -104,6 +104,8 @@ function languageFor(format: ContentFormat) {
       return html();
     case "css":
       return css();
+    case "svg":
+      return html();
     case "wikidot":
       return StreamLanguage.define(wikidotParser);
     case "typst":
