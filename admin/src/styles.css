@@ -1564,7 +1564,7 @@ code,
 /* ---------- project workspace ---------- */
 .projects-layout {
   display: grid;
-  grid-template-columns: minmax(220px, 280px) minmax(0, 1fr) minmax(180px, 280px);
+  grid-template-columns: minmax(220px, 260px) minmax(240px, 300px) minmax(0, 1fr);
   gap: 1.2rem;
   align-items: start;
 }
@@ -2186,16 +2186,6 @@ code,
   line-height: 1.4;
 }
 
-@media (max-width: 1200px) {
-  .projects-layout {
-    grid-template-columns: minmax(220px, 280px) minmax(0, 1fr);
-  }
-
-  .project-aux {
-    display: none;
-  }
-}
-
 @media (max-width: 980px) {
   .projects-layout {
     grid-template-columns: 1fr;
@@ -2396,5 +2386,154 @@ code,
 
   .contents-layout.show-tree .contents-main {
     display: none;
+  }
+}
+
+
+/* ---------- project overview / git workspace ---------- */
+.project-overview,
+.project-git {
+  min-width: 0;
+  overflow: hidden;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  box-shadow: var(--shadow);
+}
+
+.project-overview {
+  position: sticky;
+  top: 5.35rem;
+}
+
+.project-overview .project-head {
+  flex-direction: column;
+  gap: 0.9rem;
+  padding: 1.15rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.project-overview .project-head-actions {
+  width: 100%;
+}
+
+.project-overview .project-head-actions button {
+  flex: 1 1 auto;
+}
+
+.project-overview .project-meta-row {
+  align-items: flex-start;
+  flex-direction: column;
+}
+
+.project-overview .project-url {
+  max-width: 100%;
+}
+
+.project-overview-info {
+  display: flex;
+  flex-direction: column;
+}
+
+.project-fact {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  min-width: 0;
+  padding: 0.85rem 1.15rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.project-fact:last-child {
+  border-bottom: 0;
+}
+
+.project-fact span {
+  color: var(--muted);
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.project-fact strong {
+  font-size: 0.86rem;
+}
+
+.project-fact code {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 0.72rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-git {
+  min-height: 38rem;
+}
+
+.project-git .project-tabs {
+  background: var(--panel-soft);
+  border-bottom: 1px solid var(--border);
+}
+
+.project-git > .row,
+.project-git > .hint {
+  margin-left: 1.15rem;
+  margin-right: 1.15rem;
+}
+
+.project-git > .row {
+  margin-top: 0.85rem;
+}
+
+.project-git .file-toolbar {
+  margin: 0;
+  padding: 0.85rem 1.15rem;
+  background: var(--panel-soft);
+  border-bottom: 1px solid var(--border);
+}
+
+.project-git .project-browser {
+  min-height: 31rem;
+}
+
+.project-empty-shell {
+  grid-column: 2 / -1;
+  min-width: 0;
+  overflow: hidden;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  box-shadow: var(--shadow);
+}
+
+.project-empty-shell .project-empty {
+  min-height: 38rem;
+}
+
+@media (max-width: 980px) {
+  .project-overview {
+    position: static;
+  }
+
+  .project-empty-shell {
+    grid-column: auto;
+  }
+}
+
+@media (max-width: 980px) {
+  .projects-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .projects-layout .project-overview,
+  .projects-layout .project-git,
+  .projects-layout .project-empty-shell {
+    grid-column: auto;
+  }
+
+  .project-overview {
+    position: static;
   }
 }
