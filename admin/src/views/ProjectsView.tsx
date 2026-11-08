@@ -699,18 +699,15 @@ export function ProjectsView() {
         <div className="project-topbar">
           <div className="project-topbar-main">
             <div className="project-topbar-title">
-              <span className="project-head-kicker">Repository</span>
               <h3>{selected.slug}</h3>
               <span className="pill pill-branch">{selected.default_branch}</span>
+              <code className="project-topbar-path">/项目/{selected.slug}/</code>
+              <span className="project-topbar-dot">·</span>
+              <code className="project-topbar-url">{gitUrl(selected.slug)}</code>
             </div>
             {selected.description && (
-              <p className="project-description">{selected.description}</p>
+              <p className="project-topbar-desc">{selected.description}</p>
             )}
-            <div className="project-topbar-meta">
-              <code>/项目/{selected.slug}/</code>
-              <span>·</span>
-              <code className="project-url">{gitUrl(selected.slug)}</code>
-            </div>
           </div>
           <div className="project-head-actions">
             <button type="button" onClick={copyGitUrl}>
