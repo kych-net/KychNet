@@ -1564,7 +1564,7 @@ code,
 /* ---------- project workspace ---------- */
 .projects-layout {
   display: grid;
-  grid-template-columns: minmax(220px, 280px) minmax(0, 1fr) minmax(180px, 280px);
+  grid-template-columns: minmax(220px, 260px) minmax(240px, 300px) minmax(0, 1fr);
   gap: 1.2rem;
   align-items: start;
 }
@@ -2186,16 +2186,6 @@ code,
   line-height: 1.4;
 }
 
-@media (max-width: 1200px) {
-  .projects-layout {
-    grid-template-columns: minmax(220px, 280px) minmax(0, 1fr);
-  }
-
-  .project-aux {
-    display: none;
-  }
-}
-
 @media (max-width: 980px) {
   .projects-layout {
     grid-template-columns: 1fr;
@@ -2520,5 +2510,613 @@ code,
 
   .contents-layout.show-tree .contents-main {
     display: none;
+  }
+}
+
+
+/* ---------- project overview / git workspace ---------- */
+.project-overview,
+.project-git {
+  min-width: 0;
+  overflow: hidden;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  box-shadow: var(--shadow);
+}
+
+.project-overview {
+  position: sticky;
+  top: 5.35rem;
+}
+
+.project-overview .project-head {
+  flex-direction: column;
+  gap: 0.9rem;
+  padding: 1.15rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.project-overview .project-head-actions {
+  width: 100%;
+}
+
+.project-overview .project-head-actions button {
+  flex: 1 1 auto;
+}
+
+.project-overview .project-meta-row {
+  align-items: flex-start;
+  flex-direction: column;
+}
+
+.project-overview .project-url {
+  max-width: 100%;
+}
+
+.project-overview-info {
+  display: flex;
+  flex-direction: column;
+}
+
+.project-fact {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  min-width: 0;
+  padding: 0.85rem 1.15rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.project-fact:last-child {
+  border-bottom: 0;
+}
+
+.project-fact span {
+  color: var(--muted);
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.project-fact strong {
+  font-size: 0.86rem;
+}
+
+.project-fact code {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 0.72rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-git {
+  min-height: 38rem;
+}
+
+.project-git .project-tabs {
+  background: var(--panel-soft);
+  border-bottom: 1px solid var(--border);
+}
+
+.project-git > .row,
+.project-git > .hint {
+  margin-left: 1.15rem;
+  margin-right: 1.15rem;
+}
+
+.project-git > .row {
+  margin-top: 0.85rem;
+}
+
+.project-git .file-toolbar {
+  margin: 0;
+  padding: 0.85rem 1.15rem;
+  background: var(--panel-soft);
+  border-bottom: 1px solid var(--border);
+}
+
+.project-git .project-browser {
+  min-height: 31rem;
+}
+
+.project-empty-shell {
+  grid-column: 2 / -1;
+  min-width: 0;
+  overflow: hidden;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  box-shadow: var(--shadow);
+}
+
+.project-empty-shell .project-empty {
+  min-height: 38rem;
+}
+
+@media (max-width: 980px) {
+  .project-overview {
+    position: static;
+  }
+
+  .project-empty-shell {
+    grid-column: auto;
+  }
+}
+
+@media (max-width: 980px) {
+  .projects-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .projects-layout .project-overview,
+  .projects-layout .project-git,
+  .projects-layout .project-empty-shell {
+    grid-column: auto;
+  }
+
+  .project-overview {
+    position: static;
+  }
+}
+
+
+.project-git-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.9rem 1.15rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.project-git-head > div {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+
+.project-git-kicker {
+  color: var(--accent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.62rem;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.project-git-head strong {
+  font-size: 0.95rem;
+  letter-spacing: -0.02em;
+}
+
+.project-git-meta {
+  overflow: hidden;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.7rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+
+/* ---------- middle files/discussions, right history/PR ---------- */
+.projects-layout {
+  grid-template-columns: minmax(220px, 260px) minmax(0, 1fr) minmax(300px, 380px);
+}
+
+.project-overview {
+  position: static;
+}
+
+.project-middle-tabs {
+  margin: 0;
+  padding: 0.55rem 1.15rem;
+  background: var(--panel-soft);
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
+.project-middle-tabs button {
+  min-height: 2rem;
+  padding: 0.3rem 0.75rem;
+}
+
+.project-files-panel,
+.project-discussion-panel {
+  min-width: 0;
+}
+
+.project-overview .file-toolbar {
+  margin: 0;
+  padding: 0.85rem 1.15rem;
+  background: var(--panel-soft);
+  border-bottom: 1px solid var(--border);
+}
+
+.project-overview .project-browser {
+  min-height: 32rem;
+}
+
+.project-overview .project-editor {
+  min-height: 32rem;
+}
+
+.project-git .collab-layout {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.project-git .collab-list {
+  border-right: 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.project-git .collab-detail {
+  padding: 1rem 1.15rem;
+}
+
+.project-git .project-tabs {
+  padding: 0.55rem 0.9rem;
+}
+
+@media (max-width: 980px) {
+  .projects-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .project-overview,
+  .project-git,
+  .project-empty-shell {
+    grid-column: auto;
+  }
+
+  .project-overview {
+    position: static;
+  }
+}
+
+/* ---------- project topbar + commit workspace ---------- */
+.project-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1.2rem;
+  margin: 0 0 1.1rem;
+  padding: 0.9rem 1.2rem;
+  background:
+    linear-gradient(110deg, color-mix(in srgb, var(--accent) 8%, transparent), transparent 46%),
+    var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: var(--shadow-soft);
+}
+
+.project-topbar-main {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.project-topbar-title {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+  min-width: 0;
+}
+
+.project-topbar-title h3 {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-size: clamp(1.25rem, 2.2vw, 1.65rem);
+  font-weight: 760;
+  letter-spacing: -0.04em;
+  line-height: 1.15;
+}
+
+.project-topbar-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.project-topbar-meta code {
+  overflow: hidden;
+  max-width: min(44rem, 100%);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-topbar .project-head-actions {
+  flex: 0 0 auto;
+}
+
+.projects-layout {
+  grid-template-columns: minmax(220px, 260px) minmax(0, 1fr) minmax(300px, 380px);
+}
+
+.project-workbench {
+  min-width: 0;
+  overflow: hidden;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  box-shadow: var(--shadow);
+}
+
+.project-workbench .project-middle-tabs {
+  margin: 0;
+  padding: 0.55rem 1.15rem;
+  background: var(--panel-soft);
+  border-bottom: 1px solid var(--border);
+}
+
+.project-workbench .file-toolbar {
+  margin: 0;
+  padding: 0.85rem 1.15rem;
+  background: var(--panel-soft);
+  border-bottom: 1px solid var(--border);
+}
+
+.project-workbench .project-browser {
+  min-height: 32rem;
+}
+
+.project-workbench .project-editor {
+  min-height: 32rem;
+}
+
+.project-commit-panel {
+  padding: 1rem;
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--accent) 7%, transparent), transparent 70%),
+    var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+
+.project-commit-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.65rem;
+}
+
+.project-commit-head > div {
+  display: flex;
+  align-items: baseline;
+  gap: 0.45rem;
+}
+
+.project-commit-kicker {
+  color: var(--accent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.6rem;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.project-commit-head strong {
+  font-size: 0.9rem;
+}
+
+.project-commit-count {
+  min-width: 1.4rem;
+  padding: 0.12rem 0.38rem;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 1px solid color-mix(in srgb, var(--accent) 20%, transparent);
+  border-radius: 999px;
+  font-size: 0.68rem;
+  font-weight: 800;
+  text-align: center;
+}
+
+.project-commit-panel textarea {
+  width: 100%;
+  min-height: 4.6rem;
+  margin: 0;
+  resize: vertical;
+  font-size: 0.8rem;
+}
+
+.project-pending-list {
+  max-height: 10rem;
+  margin: 0.55rem 0;
+  padding: 0;
+  overflow: auto;
+  list-style: none;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--panel-soft);
+}
+
+.project-pending-list li {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-width: 0;
+  padding: 0.38rem 0.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.project-pending-list li:last-child {
+  border-bottom: 0;
+}
+
+.project-pending-list li.hint {
+  display: block;
+  padding: 0.65rem;
+  border: 0;
+  font-size: 0.74rem;
+}
+
+.project-pending-list code {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 0.7rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pending-badge {
+  flex: 0 0 auto;
+  padding: 0.08rem 0.28rem;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-radius: 4px;
+  font-size: 0.62rem;
+  font-weight: 700;
+}
+
+.pending-delete {
+  color: var(--error-text);
+  background: var(--error-bg);
+}
+
+.project-commit-button {
+  width: 100%;
+  min-height: 2.5rem;
+  color: var(--accent-text);
+  background: var(--accent);
+  border-color: var(--accent);
+  font-weight: 750;
+}
+
+.project-commit-button:hover:not(:disabled) {
+  color: var(--accent-text);
+  background: color-mix(in srgb, var(--accent) 88%, #000);
+}
+
+.staged-badge {
+  margin-right: 0.4rem;
+  padding: 0.08rem 0.32rem;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-radius: 4px;
+  font-size: 0.65rem;
+  font-weight: 700;
+}
+
+.editor-actions .hint {
+  margin-left: auto;
+  font-size: 0.72rem;
+}
+
+@media (max-width: 980px) {
+  .project-topbar {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .project-topbar .project-head-actions {
+    width: 100%;
+  }
+
+  .projects-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .project-workbench,
+  .project-git,
+  .project-empty-shell {
+    grid-column: auto;
+  }
+
+  .editor-actions .hint {
+    margin-left: 0;
+  }
+}
+
+
+/* compact project header */
+.project-topbar {
+  min-height: 3.5rem;
+  padding: 0.55rem 0.9rem;
+  gap: 0.75rem;
+}
+
+.project-topbar-main {
+  gap: 0.12rem;
+}
+
+.project-topbar-title {
+  align-items: center;
+  gap: 0.45rem;
+  flex-wrap: nowrap;
+  overflow: hidden;
+}
+
+.project-topbar-title h3 {
+  flex: 0 1 auto;
+  font-size: 1.15rem;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.project-topbar-path,
+.project-topbar-url {
+  overflow: hidden;
+  max-width: 19rem;
+  color: var(--muted);
+  font-size: 0.7rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-topbar-dot {
+  color: var(--muted);
+  font-size: 0.65rem;
+}
+
+.project-topbar-desc {
+  overflow: hidden;
+  max-width: 62rem;
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.74rem;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-topbar .project-head-actions {
+  gap: 0.3rem;
+}
+
+.project-topbar .project-head-actions button {
+  min-height: 1.95rem;
+  padding: 0.28rem 0.55rem;
+  font-size: 0.74rem;
+}
+
+@media (max-width: 1100px) {
+  .project-topbar-title {
+    flex-wrap: wrap;
+    white-space: normal;
+  }
+
+  .project-topbar-url {
+    max-width: 14rem;
+  }
+}
+
+@media (max-width: 980px) {
+  .project-topbar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .project-topbar .project-head-actions {
+    width: 100%;
   }
 }

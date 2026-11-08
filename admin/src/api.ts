@@ -479,6 +479,18 @@ export const api = {
       { method: "POST", body: JSON.stringify(payload) },
     ),
 
+  commitProjectChanges: (
+    id: string,
+    payload: {
+      ref: string;
+      message?: string;
+      changes: Array<{ path: string; content?: string; delete?: boolean }>;
+    },
+  ) =>
+    request<{ item: { commit: string; paths: string[] } }>(`/projects/${id}/commit`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
   commits: (id: string, ref?: string, limit = 50, offset = 0) =>
     request<{ items: CommitSummary[] }>(
       `/projects/${id}/commits?limit=${limit}&offset=${offset}` +
