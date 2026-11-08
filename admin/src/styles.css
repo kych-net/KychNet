@@ -2537,3 +2537,43 @@ code,
     position: static;
   }
 }
+
+
+.project-git-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.9rem 1.15rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.project-git-head > div {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+
+.project-git-kicker {
+  color: var(--accent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.62rem;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.project-git-head strong {
+  font-size: 0.95rem;
+  letter-spacing: -0.02em;
+}
+
+.project-git-meta {
+  overflow: hidden;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.7rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
