@@ -14,9 +14,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use typst::diag::{FileError, FileResult};
 use typst::foundations::{Bytes, Datetime};
-use typst::html::HtmlDocument;
-use typst::layout::PagedDocument;
-use typst::syntax::{FileId, Source, VirtualPath};
+use typst::LibraryExt;
+use typst_html::HtmlDocument;
+use typst_layout::PagedDocument;
+use typst::syntax::{FileId, RootedPath, Source, VirtualPath, VirtualRoot};
 use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
 use typst::{Feature, Library, World};
@@ -213,7 +214,10 @@ impl TypstWorld {
         main_path: &str,
         files: &HashMap<String, Vec<u8>>,
     ) -> Self {
-        let main = FileId::new(None, VirtualPath::new(main_path));
+        let main = FileId::new(RootedPath::new(
+            VirtualRoot::Project,
+            VirtualPath::new(main_path).expect("主文件路径必须合法"),
+        ));
         let source = Source::new(main, body.to_string());
         let package_root = std::env::var_os("TYPST_PACKAGE_ROOT")
             .map(PathBuf::from)
@@ -248,16 +252,10 @@ impl TypstWorld {
     /// 项目仓库文件优先于磁盘内容目录。
     fn memory_file(&self, id: FileId) -> Option<&Vec<u8>> {
         // 包文件不能落到项目仓库的同名路径上（例如 typst.toml）。
-        if id.package().is_some() {
+        if matches!(id.root(), VirtualRoot::Package(_)) {
             return None;
         }
-        let key = id
-            .vpath()
-            .as_rooted_path()
-            .to_string_lossy()
-            .trim_start_matches('/')
-            .to_string();
-        self.files.get(&key)
+        self.files.get(id.vpath().get_without_slash())
     }
 
     /// 把 Typst 的虚拟路径安全地解析到内容根目录内。
@@ -269,8 +267,8 @@ impl TypstWorld {
     fn path_for(&self, id: FileId) -> FileResult<PathBuf> {
         let path = id
             .vpath()
-            .resolve(&self.root)
-            .ok_or_else(|| FileError::NotFound(id.vpath().as_rooted_path().to_path_buf()))?;
+            .realize(&self.root)
+            .map_err(|_| FileError::NotFound(PathBuf::from(id.vpath().get_with_slash())))?;
 
         // resolve 只做词法校验,符号链接仍可能逃出根目录。
         // 再对父目录做一次真实路径校验,确保最终读取位置确实位于 root 内。
@@ -367,20 +365,9 @@ impl TypstWorld {
                 entry.unpack_in(&temp_dir)?;
             }
             // 官方包根目录是 ./typst.toml；解压后临时目录就是包根。
-            let manifest = temp_dir.join("typst.toml");
-            if !manifest.is_file() {
+            if !temp_dir.join("typst.toml").is_file() {
                 anyhow::bail!("Typst 包缺少 typst.toml");
             }
-            // 当前内嵌 Typst 是 0.13；部分包（underhell/cmarker/mitex）
-            // 用 0.15 编译但实际逻辑仍兼容 0.13。去掉 compiler 硬门槛，
-            // 让构建继续；真正的 API 不兼容会由 Typst 编译错误暴露。
-            let text = std::fs::read_to_string(&manifest)?;
-            let patched: String = text
-                .lines()
-                .filter(|line| !line.trim_start().starts_with("compiler ="))
-                .collect::<Vec<_>>()
-                .join("\n");
-            std::fs::write(&manifest, format!("{patched}\n"))?;
             std::fs::rename(&temp_dir, &package_dir)?;
             Ok(())
         })();
@@ -393,9 +380,9 @@ impl TypstWorld {
     /// 外部包文件走独立的包缓存根目录。Typst 对 `@preview/foo:1.2.3`
     /// 会构造带 package spec 的 FileId，不能用 `path_for` 的内容根解析。
     fn package_path(&self, id: FileId) -> FileResult<PathBuf> {
-        let spec = id.package().ok_or_else(|| {
-            FileError::NotFound(id.vpath().as_rooted_path().to_path_buf())
-        })?;
+        let VirtualRoot::Package(spec) = id.root() else {
+            return Err(FileError::NotFound(PathBuf::from(id.vpath().get_with_slash())));
+        };
         let root = self
             .package_root
             .canonicalize()
@@ -411,7 +398,7 @@ impl TypstWorld {
         let path = id
             .vpath()
             .resolve(&package_dir)
-            .ok_or_else(|| FileError::NotFound(id.vpath().as_rooted_path().to_path_buf()))?;
+            .ok_or_else(|| FileError::NotFound(PathBuf::from(id.vpath().get_with_slash())))?;
         let parent = path.parent().unwrap_or(&package_dir);
         let real_parent = parent
             .canonicalize()
@@ -452,10 +439,10 @@ impl World for TypstWorld {
         }
         if let Some(data) = self.memory_file(id) {
             let text = String::from_utf8(data.to_vec())
-                .map_err(|_| FileError::NotFound(id.vpath().as_rooted_path().to_path_buf()))?;
+                .map_err(|_| FileError::NotFound(PathBuf::from(id.vpath().get_with_slash())))?;
             return Ok(Source::new(id, text));
         }
-        let path = if id.package().is_some() {
+        let path = if matches!(id.root(), VirtualRoot::Package(_)) {
             self.package_path(id)?
         } else {
             self.path_for(id)?
@@ -472,7 +459,7 @@ impl World for TypstWorld {
         if let Some(data) = self.memory_file(id) {
             return Ok(Bytes::new(data.to_vec()));
         }
-        let path = if id.package().is_some() {
+        let path = if matches!(id.root(), VirtualRoot::Package(_)) {
             self.package_path(id)?
         } else {
             self.path_for(id)?
@@ -485,7 +472,7 @@ impl World for TypstWorld {
         self.fonts.get(index).cloned()
     }
 
-    fn today(&self, _offset: Option<i64>) -> Option<Datetime> {
+    fn today(&self, _offset: Option<typst::foundations::Duration>) -> Option<Datetime> {
         None
     }
 }
@@ -507,7 +494,7 @@ fn render_typst(
     let html_doc = typst::compile::<HtmlDocument>(&world)
         .output
         .map_err(|errors| anyhow::anyhow!("Typst HTML 编译失败: {errors:?}"))?;
-    let full = typst_html::html(&html_doc)
+    let full = typst_html::html(&html_doc, &typst_html::HtmlOptions::default())
         .map_err(|errors| anyhow::anyhow!("Typst HTML 导出失败: {:?}", errors))?;
 
     Ok(Rendered {
@@ -609,10 +596,10 @@ mod tests {
 
         let world = TypstWorld::new("", &content, "main.typ", &HashMap::new());
         // 普通文件仍然可以解析。
-        let ok = world.path_for(FileId::new(None, VirtualPath::new("normal.txt")));
+        let ok = world.path_for(FileId::new(RootedPath::new(VirtualRoot::Project, VirtualPath::new("normal.txt").unwrap())));
         assert!(ok.is_ok(), "普通文件应通过: {ok:?}");
         // 指向 root 外的符号链接必须被拒绝，而不是被 read 跟进去。
-        let link = world.path_for(FileId::new(None, VirtualPath::new("link.txt")));
+        let link = world.path_for(FileId::new(RootedPath::new(VirtualRoot::Project, VirtualPath::new("link.txt").unwrap())));
         assert!(
             matches!(link, Err(FileError::NotFound(_))),
             "符号链接应被拒绝: {link:?}"

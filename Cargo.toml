@@ -45,10 +45,11 @@ tower-sessions = { version = "0.14", default-features = false, features = ["axum
 tower-sessions-sqlx-store = { version = "0.15", default-features = false, features = ["postgres"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-typst = "0.13"
-typst-assets = { version = "0.13", features = ["fonts"] }
-typst-html = "0.13"
-typst-pdf = "0.13"
+typst = "0.15"
+typst-assets = { version = "0.15", features = ["fonts"] }
+typst-html = "0.15"
+typst-layout = "0.15"
+typst-pdf = "0.15"
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
