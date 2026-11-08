@@ -122,7 +122,7 @@ async fn tick(state: &WorkflowState, build_queue: &BuildQueue) -> Result<bool> {
                   commit_oid, def_commit_oid, pr_number, actor_id, trust_level,
                   status, skipped_reason, lease_until)
                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,
-                       CASE WHEN $12 = 'queued' THEN NULL ELSE NULL END)"#,
+                       NULL)"#,
         )
         .bind(run_id)
         .bind(event.project_id)
