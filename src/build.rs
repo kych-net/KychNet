@@ -938,24 +938,26 @@ pub async fn run_one(
 
 /// 删除单页产物，并清掉因此变空的目录。
 fn remove_output(out: &Path, slug: &str) -> Result<()> {
-    if !service::valid_content_slug(slug) && !service::valid_style_slug(slug) {
+    if !service::valid_content_slug(slug)
+        && !service::valid_style_slug(slug)
+        && !service::valid_svg_slug(slug)
+    {
         return Ok(());
     }
-    let is_page = service::valid_content_slug(slug);
-    let html = safe_output_path(out, slug)?;
-    let pdf = if is_page {
+    let target = safe_output_path(out, slug)?;
+    let pdf = if service::valid_content_slug(slug) {
         Some(safe_output_path(out, &pdf_path(slug))?)
     } else {
         None
     };
-    for path in [Some(&html), pdf.as_ref()].into_iter().flatten() {
+    for path in [Some(&target), pdf.as_ref()].into_iter().flatten() {
         match std::fs::remove_file(path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
     }
-    let mut current = html.parent();
+    let mut current = target.parent();
     while let Some(dir) = current {
         if dir == out || !dir.starts_with(out) {
             break;
@@ -991,7 +993,11 @@ fn clean_generated(root: &Path) -> Result<()> {
                 }
             } else if file_type.is_file() {
                 let keep = match path.extension().and_then(|ext| ext.to_str()) {
-                    Some(ext) if ext.eq_ignore_ascii_case("html") || ext.eq_ignore_ascii_case("pdf") => {
+                    Some(ext)
+                        if ext.eq_ignore_ascii_case("html")
+                            || ext.eq_ignore_ascii_case("pdf")
+                            || ext.eq_ignore_ascii_case("svg") =>
+                    {
                         std::fs::remove_file(&path)?;
                         false
                     }
