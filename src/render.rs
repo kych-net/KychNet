@@ -367,9 +367,20 @@ impl TypstWorld {
                 entry.unpack_in(&temp_dir)?;
             }
             // 官方包根目录是 ./typst.toml；解压后临时目录就是包根。
-            if !temp_dir.join("typst.toml").is_file() {
+            let manifest = temp_dir.join("typst.toml");
+            if !manifest.is_file() {
                 anyhow::bail!("Typst 包缺少 typst.toml");
             }
+            // 当前内嵌 Typst 是 0.13；部分包（underhell/cmarker/mitex）
+            // 用 0.15 编译但实际逻辑仍兼容 0.13。去掉 compiler 硬门槛，
+            // 让构建继续；真正的 API 不兼容会由 Typst 编译错误暴露。
+            let text = std::fs::read_to_string(&manifest)?;
+            let patched: String = text
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("compiler ="))
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::write(&manifest, format!("{patched}\n"))?;
             std::fs::rename(&temp_dir, &package_dir)?;
             Ok(())
         })();
