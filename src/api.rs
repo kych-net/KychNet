@@ -1490,6 +1490,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
                 .delete(project_delete_file),
         )
         .route("/api/projects/{id}/move", post(project_move_file))
+        .route("/api/projects/{id}/commit", post(project_commit_changes))
         .route("/api/projects/{id}/commits", get(project_commits))
         .route(
             "/api/projects/{id}/workflows",
@@ -1645,6 +1646,23 @@ struct ProjectWriteBody {
 }
 
 #[derive(Deserialize)]
+struct ProjectCommitChange {
+    path: String,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    delete: bool,
+}
+
+#[derive(Deserialize)]
+struct ProjectCommitBody {
+    #[serde(rename = "ref", default = "main_branch")]
+    branch: String,
+    message: Option<String>,
+    changes: Vec<ProjectCommitChange>,
+}
+
+#[derive(Deserialize)]
 struct ProjectMoveBody {
     #[serde(rename = "ref", default = "main_branch")]
     branch: String,
@@ -1789,6 +1807,45 @@ async fn project_write_file(
             return Err(ApiError::with_status(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("文件已保存，但自动编译失败：{error}"),
+            ));
+        }
+    }
+    Ok(Json(json!({ "item": result })))
+}
+
+async fn project_commit_changes(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+    Json(body): Json<ProjectCommitBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = current_user(&state, &session).await?;
+    let Some(project) = crate::project::get_project(&state.pool, id).await? else {
+        api_reject!(StatusCode::NOT_FOUND, "项目不存在");
+    };
+    let changes: Vec<crate::project::FileChange> = body
+        .changes
+        .into_iter()
+        .map(|change| crate::project::FileChange {
+            path: change.path,
+            content: change.content,
+            delete: change.delete,
+        })
+        .collect();
+    let result = crate::project::commit_changes(
+        &state.pool,
+        &user,
+        id,
+        &body.branch,
+        body.message.as_deref(),
+        &changes,
+    )
+    .await?;
+    if body.branch == project.default_branch {
+        if let Err(error) = state.build_ctl.build_all().await {
+            return Err(ApiError::with_status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("更改已提交，但自动编译失败：{error}"),
             ));
         }
     }
