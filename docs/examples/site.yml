@@ -1,0 +1,57 @@
+# 放到站内项目仓库的 .<site_name>/工作流/site.yml
+# 同一份文件在 GitHub Actions 与 KychNet 站内都能跑：
+#   - GitHub 上 actions/checkout@v4 是真 checkout，工作区有 .git
+#   - 站内由 --local-repository 映射为 no-op，代码已由主服务快照铺好，无 .git
+# 因此工作流里不要调用 git log / git diff / git rev-parse。
+#
+# 站内约定：
+# 1) KychRunner 通过主服务 HTTP 接口取得 tar.gz 快照（模式 B），零 DB 凭据。
+# 2) 不需要写部署步骤。内置 site.build 由 kych-net 独立排队执行，
+#    与本工作流是否运行、执行器是否安装无关（容器内拿不到 DATABASE_URL）。
+# 3) concurrency 在站内由 workflow_events.dedupe_key 折叠连续 push。
+# 4) 新路径默认 disabled，需管理员在「工作流」页显式启用。
+
+name: site-check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: site-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 环境自检（工作区形态）
+        run: |
+          echo "commit=${KYCHNET_COMMIT_OID:-${GITHUB_SHA}}"
+          echo "trust=${KYCHNET_TRUST_LEVEL:-github}"
+          echo "event=${KYCHNET_EVENT_NAME:-${GITHUB_EVENT_NAME}}"
+          if [ -d .git ]; then
+            echo "GitHub Actions: real checkout"
+          else
+            echo "KychNet: snapshot workspace (no .git)"
+          fi
+          test -z "${GITHUB_TOKEN}"
+
+      - name: 断网自检
+        run: |
+          if command -v curl >/dev/null 2>&1; then
+            if curl -fsS --max-time 2 https://example.com >/dev/null 2>&1; then
+              echo "容器内不应能访问公网" >&2
+              exit 1
+            fi
+          fi
+          echo "network=none ok"
+
+      - name: 示例检查
+        run: |
+          test -f README.md || { echo "README.md 缺失"; exit 1; }
+          echo "check ok"

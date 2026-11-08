@@ -1,0 +1,30 @@
+{
+  "ref": "refs/heads/main",
+  "before": "0000000000000000000000000000000000000000",
+  "after": "1111111111111111111111111111111111111111",
+  "repository": {
+    "name": "demo",
+    "full_name": "kych-net/demo",
+    "default_branch": "main"
+  },
+  "pusher": { "name": "kych", "email": "kych@example.com" },
+  "sender": { "login": "kych" },
+  "commits": [
+    {
+      "id": "1111111111111111111111111111111111111111",
+      "message": "update content",
+      "author": { "name": "kych", "email": "kych@example.com" }
+    }
+  ],
+  "kychnet": {
+    "project_id": "00000000-0000-0000-0000-000000000000",
+    "project_slug": "demo",
+    "run_id": "00000000-0000-0000-0000-000000000000",
+    "commit_oid": "1111111111111111111111111111111111111111",
+    "def_commit_oid": "2222222222222222222222222222222222222222",
+    "ref": "refs/heads/main",
+    "trust_level": "default",
+    "pr_number": null,
+    "snapshot_source": "api"
+  }
+}
