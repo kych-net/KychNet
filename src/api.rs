@@ -2134,6 +2134,12 @@ async fn git_http_get(
         };
     }
 
+    // 工作树读取：与 packfile 通道并列，直接给出展开后的文件树。
+    // 调用方不需要 git 客户端、不需要 .git，也不必解析 packfile。
+    if let Some(rest) = action.strip_prefix("worktree/") {
+        return worktree_get(&state, &project, rest, &params).await;
+    }
+
     if action != "info/refs" {
         return git_plain(StatusCode::NOT_FOUND, "未知的 Git 路径");
     }
@@ -2170,6 +2176,121 @@ async fn git_http_get(
             body,
         ),
         Err(error) => git_plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
+}
+
+/// `/git/<slug>.git/worktree/{tree,file,archive}`。
+///
+/// 与 `git-upload-pack` 保持同等可见性：站内仓库内容本来就能匿名 fetch，
+/// 这里只是把 packfile 换成展开后的工作树，不额外放大暴露面。
+/// 若将来要给 `/git/` 整体加认证，这三个端点会一并生效。
+async fn worktree_get(
+    state: &AppState,
+    project: &crate::project::Project,
+    action: &str,
+    params: &HashMap<String, String>,
+) -> Response {
+    let Some(ref_name) = params
+        .get("ref")
+        .map(String::as_str)
+        .filter(|value| !value.is_empty())
+    else {
+        return git_plain(
+            StatusCode::BAD_REQUEST,
+            "缺少 ref 参数（分支名或 40 位 commit OID）",
+        );
+    };
+    let commit = match crate::git::worktree::resolve_ref(&state.pool, project.id, ref_name).await {
+        Ok(Some(oid)) => oid,
+        Ok(None) => return git_plain(StatusCode::NOT_FOUND, "ref 不存在"),
+        Err(error) => return git_plain(StatusCode::BAD_REQUEST, &error.to_string()),
+    };
+    let path = params.get("path").map(String::as_str).unwrap_or("");
+
+    match action {
+        "tree" => match crate::git::worktree::list(&state.pool, project.id, commit, path).await {
+            Ok(items) => match serde_json::to_vec(&serde_json::json!({
+                "commit": commit.to_hex(),
+                "path": path,
+                "items": items,
+            })) {
+                Ok(body) => git_json("application/json", body),
+                Err(error) => git_plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+            },
+            Err(error) => git_plain(StatusCode::BAD_REQUEST, &error.to_string()),
+        },
+        "file" => {
+            if path.is_empty() {
+                return git_plain(StatusCode::BAD_REQUEST, "缺少 path 参数");
+            }
+            match crate::git::worktree::read(
+                &state.pool,
+                project.id,
+                commit,
+                path,
+                &state.lfs_root,
+            )
+            .await
+            {
+                Ok(Some((oid, data, from_lfs))) => {
+                    let mut resp = git_binary("application/octet-stream", data);
+                    let h = resp.headers_mut();
+                    if let Ok(value) = HeaderValue::from_str(&oid.to_hex()) {
+                        h.insert("x-git-blob-oid", value);
+                    }
+                    if from_lfs {
+                        h.insert("x-git-lfs", HeaderValue::from_static("1"));
+                    }
+                    resp
+                }
+                Ok(None) => git_plain(StatusCode::NOT_FOUND, "文件不存在"),
+                Err(error) => git_plain(StatusCode::BAD_REQUEST, &error.to_string()),
+            }
+        }
+        "archive" => {
+            match crate::git::worktree::collect(
+                &state.pool,
+                project.id,
+                commit,
+                &state.lfs_root,
+            )
+            .await
+            {
+                Ok(files) => {
+                    let bytes = crate::git::worktree::total_bytes(&files);
+                    if bytes > crate::git::worktree::MAX_WORKTREE_BYTES {
+                        return git_plain(StatusCode::PAYLOAD_TOO_LARGE, "工作树超过字节上限");
+                    }
+                    let count = files.len();
+                    // tar 内直接是仓库相对路径，不带 code/ 前缀；打包实现与
+                    // runner 快照共用一份，避免主服务出现第二份 USTAR 代码。
+                    let entries: Vec<(String, Vec<u8>)> = files.into_iter().collect();
+                    let gz = match crate::workflow::snapshot::write_tar_gz(&entries) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            return git_plain(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                &error.to_string(),
+                            )
+                        }
+                    };
+                    let mut resp = git_binary("application/gzip", gz);
+                    let h = resp.headers_mut();
+                    if let Ok(value) = HeaderValue::from_str(&commit.to_hex()) {
+                        h.insert("x-git-commit", value);
+                    }
+                    if let Ok(value) = HeaderValue::from_str(&count.to_string()) {
+                        h.insert("x-git-files", value);
+                    }
+                    if let Ok(value) = HeaderValue::from_str(&bytes.to_string()) {
+                        h.insert("x-git-bytes", value);
+                    }
+                    resp
+                }
+                Err(error) => git_plain(StatusCode::BAD_REQUEST, &error.to_string()),
+            }
+        }
+        _ => git_plain(StatusCode::NOT_FOUND, "未知的工作树路径"),
     }
 }
 
