@@ -1309,6 +1309,7 @@ export function ProjectsView() {
             </>
           )}
         </div>
+        <aside className="project-aux" aria-hidden="true" />
       </div>
     </section>
   );

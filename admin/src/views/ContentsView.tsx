@@ -366,6 +366,7 @@ export function ContentsView() {
       </table>
       </div>
         </div>
+        <aside className="contents-aux" aria-hidden="true" />
       </div>
     </section>
   );
