@@ -68,8 +68,8 @@ async fn mark_reachable(
 }
 
 fn tag_target(data: &[u8]) -> Result<Option<Oid>> {
-    let text = std::str::from_utf8(data)
-        .map_err(|_| anyhow::anyhow!("tag 对象不是 UTF-8"))?;
+    // tag 头部行是 ASCII，对象整体不必是 UTF-8，lossy 解析不破坏头部。
+    let text = String::from_utf8_lossy(data);
     for line in text.lines() {
         if line.is_empty() {
             break;

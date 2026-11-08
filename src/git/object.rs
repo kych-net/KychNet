@@ -152,6 +152,7 @@ pub fn hash_object(kind: ObjectKind, data: &[u8]) -> Oid {
 /// Git 自己的二进制判定主要看 NUL；这里再要求整体是合法 UTF-8。
 /// 非文本内容走站内已实现的 LFS（`git/lfs.rs`），由 `project::write_file_bytes`
 /// 分流；`ensure_text` 只用于管理端文本编辑器这个入口。
+/// git push 入库不做此校验：git 允许对象是任意字节，仓库层按字节存储。
 pub fn is_text(data: &[u8]) -> bool {
     !data.contains(&0) && std::str::from_utf8(data).is_ok()
 }
@@ -276,8 +277,11 @@ pub fn encode_commit(
 }
 
 /// 从 commit 对象里取出根 tree。
+///
+/// git 不强制对象内容是 UTF-8（旧仓库常见 latin-1），头部行是 ASCII，
+/// lossy 解析不会破坏头部，只有用户写的身份名可能带替换符，可接受。
 pub fn commit_tree(data: &[u8]) -> Result<Oid> {
-    let text = std::str::from_utf8(data).map_err(|_| anyhow::anyhow!("commit 对象不是 UTF-8"))?;
+    let text = String::from_utf8_lossy(data);
     let line = text
         .lines()
         .next()
@@ -289,7 +293,7 @@ pub fn commit_tree(data: &[u8]) -> Result<Oid> {
 }
 
 pub fn commit_parents(data: &[u8]) -> Result<Vec<Oid>> {
-    let text = std::str::from_utf8(data).map_err(|_| anyhow::anyhow!("commit 对象不是 UTF-8"))?;
+    let text = String::from_utf8_lossy(data);
     let mut parents = Vec::new();
     for line in text.lines() {
         if let Some(value) = line.strip_prefix("parent ") {
@@ -368,5 +372,26 @@ mod tests {
         assert!(is_text("普通文本\n".as_bytes()));
         assert!(!is_text(&[0xff, 0xfe, 0x00]));
         assert!(!is_text(b"a\0b"));
+    }
+
+    #[test]
+    fn parses_commit_with_non_utf8_message() {
+        // latin-1 提交信息（旧 git 仓库常见），头部行必须照常解析。
+        let oid = Oid::from_hex("1111111111111111111111111111111111111111").unwrap();
+        let mut data = b"tree ".to_vec();
+        data.extend_from_slice(oid.to_hex().as_bytes());
+        data.extend_from_slice(b"\n\ncaf\xe9 latt\xe9\n");
+        assert!(std::str::from_utf8(&data).is_err());
+        assert_eq!(commit_tree(&data).unwrap(), oid);
+        let parents = commit_parents(&data).unwrap();
+        assert!(parents.is_empty());
+        // 带 parent 的头部同样不受非 UTF-8 消息影响。
+        let parent = Oid::from_hex("2222222222222222222222222222222222222222").unwrap();
+        let mut data = b"tree ".to_vec();
+        data.extend_from_slice(oid.to_hex().as_bytes());
+        data.extend_from_slice(b"\nparent ");
+        data.extend_from_slice(parent.to_hex().as_bytes());
+        data.extend_from_slice(b"\n\n\xff\xfe\n");
+        assert_eq!(commit_parents(&data).unwrap(), vec![parent]);
     }
 }

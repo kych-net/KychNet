@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use super::object::{
-    commit_tree, ensure_text, Object, ObjectKind, Oid, Tree, TreeEntry,
+    commit_tree, Object, ObjectKind, Oid, Tree, TreeEntry,
 };
 use super::proto;
 use super::store;
@@ -110,8 +110,8 @@ pub fn advertise_v2(service: &str) -> Vec<u8> {
 
 /// 读取 tag 对象指向的目标 OID。
 fn tag_target(data: &[u8]) -> Result<Option<Oid>> {
-    let text = std::str::from_utf8(data)
-        .map_err(|_| anyhow::anyhow!("tag 对象不是 UTF-8"))?;
+    // tag 头部行是 ASCII，对象整体不必是 UTF-8，lossy 解析不破坏头部。
+    let text = String::from_utf8_lossy(data);
     for line in text.lines() {
         if line.is_empty() {
             break;
@@ -616,8 +616,11 @@ struct CommitInfo {
 }
 
 fn parse_commit(data: &[u8]) -> Result<CommitInfo> {
-    let text = std::str::from_utf8(data)
-        .map_err(|_| anyhow::anyhow!("commit 对象不是 UTF-8，暂不支持"))?;
+    // git 允许提交内容是任意字节（旧仓库常见 latin-1）。头部行是 ASCII，
+    // lossy 解析不影响 tree/parent 的正确性；只有提交信息可能带替换符，
+    // 索引表里显示为 U+FFFD，原始对象字节保持不变。
+    let cow = String::from_utf8_lossy(data);
+    let text: &str = &cow;
     let (head, message) = text.split_once("\n\n").unwrap_or((text, ""));
     let mut tree = None;
     let mut parents = Vec::new();
@@ -675,11 +678,9 @@ async fn unpack_pack(
         }
     }
     let resolved = proto::resolve(&raw, &external)?;
-    for (oid, kind, object) in &resolved {
-        match kind {
-            ObjectKind::Blob | ObjectKind::Commit | ObjectKind::Tag => ensure_text(object)?,
-            ObjectKind::Tree => {}
-        }
+    // 入库不做 UTF-8 校验：git 允许对象是任意字节，这里按字节存。
+    // UTF-8 校验收敛到编辑边界（tree::write_blob）与渲染边界（project/build）。
+    for (_oid, kind, object) in &resolved {
         store::put_object(
             conn,
             project_id,
@@ -689,7 +690,6 @@ async fn unpack_pack(
             },
         )
         .await?;
-        let _ = oid;
     }
     Ok(resolved.len())
 }
@@ -1145,6 +1145,26 @@ hello\n";
         assert_eq!(info.author, "Kych");
         assert_eq!(info.message, "hello");
         assert_eq!(info.committed_at.timestamp(), 200);
+    }
+
+    #[test]
+    fn parses_non_utf8_commit_and_tag() {
+        // git 允许对象是任意字节：非 UTF-8 提交信息应 lossy 入索引，
+        // 头部（tree/parent/committer 时间戳）必须照常解析。
+        let data = b"tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
+author \xe9\x91 <a@b.c> 100 +0000\n\
+committer Kych <a@b.c> 200 +0000\n\
+\n\
+caf\xe9\n";
+        let info = parse_commit(data).unwrap();
+        assert_eq!(info.committed_at.timestamp(), 200);
+        assert!(info.message.contains('\u{FFFD}'));
+
+        let target = Oid::from_hex("1111111111111111111111111111111111111111").unwrap();
+        let mut tag_data = format!("object {}\ntype commit\ntag v1\n\nm", target.to_hex())
+            .into_bytes();
+        tag_data.extend_from_slice(b"\xe9ssage\n");
+        assert_eq!(tag_target(&tag_data).unwrap(), Some(target));
     }
 
     #[test]
