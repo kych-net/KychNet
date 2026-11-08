@@ -19,6 +19,8 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 dotenvy = "0.15"
 flate2 = "1"
+tar = "0.4"
+ureq = "2"
 ftml = "1"
 hex = "0.4"
 openssl = { version = "0.10", optional = true }

@@ -9,7 +9,9 @@ use pulldown_cmark::{html, Options, Parser};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use typst::diag::{FileError, FileResult};
 use typst::foundations::{Bytes, Datetime};
 use typst::html::HtmlDocument;
@@ -295,6 +297,86 @@ impl TypstWorld {
         Ok(target)
     }
 
+    /// 外部包缺失时按需从 Typst 官方 registry 下载到缓存。
+    /// 只允许 registry 包名/版本，不接受任意 URL；下载和缓存都加进程级锁。
+    fn ensure_package(&self, spec: &typst::syntax::package::PackageSpec) -> anyhow::Result<()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let package_dir = self
+            .package_root
+            .join(spec.namespace.as_str())
+            .join(spec.name.as_str())
+            .join(spec.version.to_string());
+        let manifest = package_dir.join("typst.toml");
+        if manifest.is_file() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(
+            package_dir
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("包缓存路径没有父目录"))?,
+        )?;
+        let url = format!(
+            "https://packages.typst.org/{}/{}-{}.tar.gz",
+            spec.namespace, spec.name, spec.version
+        );
+        tracing::info!(%url, "下载 Typst 包到缓存");
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(10))
+            .timeout_read(std::time::Duration::from_secs(30))
+            .build();
+        let response = agent
+            .get(&url)
+            .call()
+            .map_err(|error| anyhow::anyhow!("下载 {url} 失败: {error}"))?;
+        if response.status() != 200 {
+            anyhow::bail!("下载 {url} 返回 HTTP {}", response.status());
+        }
+        const MAX_PACKAGE_BYTES: u64 = 32 * 1024 * 1024;
+        let mut archive_bytes = Vec::new();
+        let mut reader = response.into_reader();
+        (&mut reader)
+            .take(MAX_PACKAGE_BYTES + 1)
+            .read_to_end(&mut archive_bytes)?;
+        if archive_bytes.len() as u64 > MAX_PACKAGE_BYTES {
+            anyhow::bail!("Typst 包 {url} 超过 32 MiB");
+        }
+        let temp_dir = self
+            .package_root
+            .join(format!(".download-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir)?;
+        let result = (|| -> anyhow::Result<()> {
+            let decoder = flate2::read::GzDecoder::new(archive_bytes.as_slice());
+            let mut archive = tar::Archive::new(decoder);
+            for entry in archive.entries()? {
+                let mut entry = entry?;
+                let path = entry.path()?.into_owned();
+                if path
+                    .components()
+                    .any(|part| !matches!(part, std::path::Component::Normal(_)))
+                {
+                    anyhow::bail!("Typst 包包含非法路径: {}", path.display());
+                }
+                if entry.header().entry_type().is_symlink()
+                    || entry.header().entry_type().is_hard_link()
+                {
+                    anyhow::bail!("Typst 包包含链接文件，拒绝解压");
+                }
+                entry.unpack_in(&temp_dir)?;
+            }
+            // 官方包根目录是 ./typst.toml；解压后临时目录就是包根。
+            if !temp_dir.join("typst.toml").is_file() {
+                anyhow::bail!("Typst 包缺少 typst.toml");
+            }
+            std::fs::rename(&temp_dir, &package_dir)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_dir_all(&temp_dir);
+        }
+        result
+    }
+
     /// 外部包文件走独立的包缓存根目录。Typst 对 `@preview/foo:1.2.3`
     /// 会构造带 package spec 的 FileId，不能用 `path_for` 的内容根解析。
     fn package_path(&self, id: FileId) -> FileResult<PathBuf> {
@@ -305,6 +387,10 @@ impl TypstWorld {
             .package_root
             .canonicalize()
             .map_err(|_| FileError::NotFound(self.package_root.clone()))?;
+        if let Err(error) = self.ensure_package(spec) {
+            tracing::warn!(%error, "Typst 包缓存准备失败");
+            return Err(FileError::NotFound(id.vpath().as_rooted_path().to_path_buf()));
+        }
         let package_dir = root
             .join(spec.namespace.as_str())
             .join(spec.name.as_str())
