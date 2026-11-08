@@ -33,9 +33,24 @@ impl BuildQueue {
                 // 合并窗口：把这 300ms 内到达的所有请求折叠成一次构建。
                 tokio::time::sleep(Duration::from_millis(300)).await;
                 while rx.try_recv().is_ok() {}
-                if let Err(error) = build_ctl.build_all().await {
-                    // 失败只记日志，不影响已提交的 push / PR 合并。
-                    warn!("内置 site.build 失败：{error:#}");
+                // BuildCtl 是单槽：管理端构建正在跑时 build_all 会直接失败。
+                // 短暂重试，直到当前构建结束，避免这期间到达的 push 被静默丢掉。
+                let mut retries = 0;
+                loop {
+                    match build_ctl.build_all().await {
+                        Ok(()) => break,
+                        Err(error)
+                            if error.to_string().contains("已有构建")
+                                && retries < 120 =>
+                        {
+                            retries += 1;
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                        }
+                        Err(error) => {
+                            warn!("内置 site.build 失败：{error:#}");
+                            break;
+                        }
+                    }
                 }
             }
         });

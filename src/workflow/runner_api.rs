@@ -242,34 +242,29 @@ async fn register(
         return Err(StatusCode::BAD_REQUEST);
     }
     let code_hash = Sha256::digest(req.code.as_bytes()).to_vec();
-    let runner: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM workflow_runners WHERE registration_code_hash = $1 AND enabled",
-    )
-    .bind(&code_hash)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(internal)?;
-    let runner_id = runner
-        .map(|(id,)| id)
-        .ok_or(StatusCode::FORBIDDEN)?;
-
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
     let token = hex::encode(bytes);
     let token_hash = Sha256::digest(token.as_bytes()).to_vec();
-    sqlx::query(
+    // 单条 UPDATE 完成「查注册码 + 消费 + 发 token」，并发请求同一注册码
+    // 只有一个能返回 row，避免 SELECT 后再 UPDATE 的双发竞态。
+    let runner: Option<(Uuid,)> = sqlx::query_as(
         r#"UPDATE workflow_runners
               SET token_hash = $1, name = $2, labels = $3,
                   last_seen_at = now(), registration_code_hash = NULL
-            WHERE id = $4"#,
+            WHERE registration_code_hash = $4 AND enabled
+            RETURNING id"#,
     )
     .bind(&token_hash)
     .bind(&req.name)
     .bind(req.labels.unwrap_or_default())
-    .bind(runner_id)
-    .execute(&state.pool)
+    .bind(&code_hash)
+    .fetch_optional(&state.pool)
     .await
     .map_err(internal)?;
+    let Some((runner_id,)) = runner else {
+        return Err(StatusCode::FORBIDDEN);
+    };
 
     Ok(Json(json!({ "runner_id": runner_id, "token": token })))
 }

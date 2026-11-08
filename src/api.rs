@@ -73,6 +73,8 @@ pub(crate) struct AppState {
     /// 管理端触发整站重建的协调器。构建独立成子进程跑，serve 自身
     /// 不引入 Typst 渲染逻辑（见 `BuildCtl` 注释）。
     pub(crate) build_ctl: Arc<BuildCtl>,
+    /// 与 workflow 模块共享的发布队列：worktree 写入不再同步阻塞构建。
+    pub(crate) build_queue: crate::workflow::queue::BuildQueue,
     /// Git LFS 二进制对象的落盘根目录。
     pub(crate) lfs_root: PathBuf,
 }
@@ -1185,6 +1187,9 @@ async fn put_settings(
     if site.site_name.trim().is_empty() || site.site_name.chars().count() > 64 {
         api_bail!("站点名称需为 1-64 个字符");
     }
+    if site.description.chars().count() > 300 {
+        api_bail!("站点描述最多 300 个字符");
+    }
     if site.nav.len() > 12 {
         api_bail!("导航链接最多 12 条");
     }
@@ -1255,8 +1260,13 @@ pub async fn serve(cfg: Config) -> Result<()> {
     let pool = crate::db::connect(&cfg.database_url).await?;
     crate::db::migrate(&pool).await?;
     spawn_flow_pruner(pool.clone());
+    if let Err(error) = oauth::gc(&pool).await {
+        tracing::warn!(%error, "OAuth 过期数据清理失败");
+    }
 
     let auth = Arc::new(Auth::new(&cfg.rp_id, &cfg.rp_origin)?);
+    let build_ctl = Arc::new(BuildCtl::new(cfg.build_out_dir.clone()));
+    let build_queue = crate::workflow::queue::BuildQueue::start(build_ctl.clone());
     let state = AppState {
         pool,
         auth,
@@ -1264,7 +1274,8 @@ pub async fn serve(cfg: Config) -> Result<()> {
         limits: RateLimiter::default(),
         trust_proxy_headers: cfg.trust_proxy_headers,
         content_root: cfg.content_root.clone(),
-        build_ctl: Arc::new(BuildCtl::new(cfg.build_out_dir.clone())),
+        build_ctl: build_ctl.clone(),
+        build_queue: build_queue.clone(),
         lfs_root: cfg.lfs_root.clone(),
     };
 
@@ -1453,7 +1464,8 @@ pub async fn serve(cfg: Config) -> Result<()> {
 
     // 工作流 runner API 与管理端中间件分开挂：runner 用 token 认证、不带浏览器
     // Origin，且日志分片可能超过管理端的 2 MiB 请求体上限。
-    let wf_state = crate::workflow::build_state(wf_pool, wf_build_ctl);
+    let wf_state =
+        crate::workflow::build_state(wf_pool, wf_build_ctl, build_queue.clone());
     crate::workflow::spawn_pruner(wf_state.clone());
     crate::workflow::dispatch::spawn_dispatcher(wf_state.clone(), wf_state.build_queue.clone());
     let app = app.nest("/api/runner", crate::workflow::router(wf_state));
@@ -2360,6 +2372,16 @@ async fn worktree_get(
             }
         }
         "archive" => {
+            if let Err(error) = crate::git::worktree::ensure_within_limit(
+                &state.pool,
+                project.id,
+                commit,
+                crate::git::worktree::MAX_WORKTREE_BYTES,
+            )
+            .await
+            {
+                return git_plain(StatusCode::PAYLOAD_TOO_LARGE, &error.to_string());
+            }
             match crate::git::worktree::collect(
                 &state.pool,
                 project.id,
@@ -2670,14 +2692,9 @@ async fn worktree_put(
         Err(error) => return git_plain(StatusCode::BAD_REQUEST, &error.to_string()),
     };
     if branch == project.default_branch {
-        if let Err(error) = state.build_ctl.build_all().await {
-            return git_plain(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("文件已保存，但自动编译失败：{error}"),
-            );
-        }
+        state.build_queue.enqueue();
     }
-    match serde_json::to_vec(&serde_json::json!({ "item": result })) {
+    match serde_json::to_vec(&serde_json::json!({ "item": result, "build": "queued" })) {
         Ok(data) => git_json("application/json", data),
         Err(error) => git_plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     }
@@ -2732,12 +2749,7 @@ async fn worktree_delete(
         return git_plain(StatusCode::BAD_REQUEST, &error.to_string());
     }
     if branch == project.default_branch {
-        if let Err(error) = state.build_ctl.build_all().await {
-            return git_plain(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("文件已删除，但自动编译失败：{error}"),
-            );
-        }
+        state.build_queue.enqueue();
     }
     StatusCode::NO_CONTENT.into_response()
 }
