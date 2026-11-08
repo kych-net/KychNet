@@ -399,8 +399,7 @@ cd admin && pnpm install && cp .env.example .env && pnpm dev
 ## 构建与部署
 
 1. [.github/workflows/build.yml](.github/workflows/build.yml) 在 push、PR 和手动触发时运行测试,并编译 Linux 二进制;推送 `v*` 标签时自动创建 Release.
-   - `x86_64-unknown-linux-gnu`:依赖系统 glibc,在 Ubuntu 22.04 上构建.
-   - `x86_64-unknown-linux-musl`:静态链接,启用 `vendored-openssl` 特性,适配 Alpine 与老版本发行版.
+   - `x86_64-unknown-linux-gnu`:依赖系统 glibc,在 Ubuntu 26.04 x86-64 runner 上构建并 strip 符号表.
 2. 管理端保存内容后会自动编译当前页(改路径时同时删除旧产物);「站点设置 → 整站重建」或 `kych-net build --out dist` 重建全站.Typst 页面同时产出 `.pdf`.构建会先渲染到内存,全部成功后才清理旧的 `.html/.pdf` 并写入新路径(不再统一放 `posts/`),中途失败不会破坏现有站点.
 3. 内容站 `dist/` 由 EdgeOne 加速;管理前端构建为独立静态产物,由 EdgeOne Pages 发布.
 4. 服务器 nginx 只把 `/api/`、`/git/`、`/mcp` 等后端路径反代到 `127.0.0.1:8080`;`api.kych.net` 只作为回源 Host.
