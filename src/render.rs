@@ -193,6 +193,8 @@ fn render_markdown(body: &str) -> String {
 
 struct TypstWorld {
     root: PathBuf,
+    /// `@preview/...` 外部包缓存根目录；结构为 <namespace>/<name>/<version>/。
+    package_root: PathBuf,
     main: FileId,
     source: Source,
     /// 项目仓库文件，key 是相对项目根的路径。
@@ -211,6 +213,9 @@ impl TypstWorld {
     ) -> Self {
         let main = FileId::new(None, VirtualPath::new(main_path));
         let source = Source::new(main, body.to_string());
+        let package_root = std::env::var_os("TYPST_PACKAGE_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| root.join("typst-packages"));
 
         let mut book = FontBook::new();
         let mut fonts = Vec::new();
@@ -228,6 +233,7 @@ impl TypstWorld {
 
         Self {
             root: root.to_path_buf(),
+            package_root,
             main,
             source,
             files: files.clone(),
@@ -239,6 +245,10 @@ impl TypstWorld {
 
     /// 项目仓库文件优先于磁盘内容目录。
     fn memory_file(&self, id: FileId) -> Option<&Vec<u8>> {
+        // 包文件不能落到项目仓库的同名路径上（例如 typst.toml）。
+        if id.package().is_some() {
+            return None;
+        }
         let key = id
             .vpath()
             .as_rooted_path()
@@ -284,6 +294,44 @@ impl TypstWorld {
         }
         Ok(target)
     }
+
+    /// 外部包文件走独立的包缓存根目录。Typst 对 `@preview/foo:1.2.3`
+    /// 会构造带 package spec 的 FileId，不能用 `path_for` 的内容根解析。
+    fn package_path(&self, id: FileId) -> FileResult<PathBuf> {
+        let spec = id.package().ok_or_else(|| {
+            FileError::NotFound(id.vpath().as_rooted_path().to_path_buf())
+        })?;
+        let root = self
+            .package_root
+            .canonicalize()
+            .map_err(|_| FileError::NotFound(self.package_root.clone()))?;
+        let package_dir = root
+            .join(spec.namespace.as_str())
+            .join(spec.name.as_str())
+            .join(spec.version.to_string());
+        let path = id
+            .vpath()
+            .resolve(&package_dir)
+            .ok_or_else(|| FileError::NotFound(id.vpath().as_rooted_path().to_path_buf()))?;
+        let parent = path.parent().unwrap_or(&package_dir);
+        let real_parent = parent
+            .canonicalize()
+            .map_err(|_| FileError::NotFound(path.clone()))?;
+        if !real_parent.starts_with(&package_dir) {
+            return Err(FileError::NotFound(path));
+        }
+        let target = real_parent.join(path.file_name().unwrap_or_default());
+        let meta = std::fs::symlink_metadata(&target)
+            .map_err(|_| FileError::NotFound(target.clone()))?;
+        if meta.file_type().is_symlink() {
+            return Err(FileError::NotFound(target));
+        }
+        // 防止包缓存里出现版本目录穿越。
+        if !target.starts_with(&package_dir) {
+            return Err(FileError::NotFound(target));
+        }
+        Ok(target)
+    }
 }
 
 impl World for TypstWorld {
@@ -308,7 +356,11 @@ impl World for TypstWorld {
                 .map_err(|_| FileError::NotFound(id.vpath().as_rooted_path().to_path_buf()))?;
             return Ok(Source::new(id, text));
         }
-        let path = self.path_for(id)?;
+        let path = if id.package().is_some() {
+            self.package_path(id)?
+        } else {
+            self.path_for(id)?
+        };
         let text = std::fs::read_to_string(&path)
             .map_err(|_| FileError::NotFound(path.clone()))?;
         Ok(Source::new(id, text))
@@ -321,7 +373,11 @@ impl World for TypstWorld {
         if let Some(data) = self.memory_file(id) {
             return Ok(Bytes::new(data.to_vec()));
         }
-        let path = self.path_for(id)?;
+        let path = if id.package().is_some() {
+            self.package_path(id)?
+        } else {
+            self.path_for(id)?
+        };
         let data = std::fs::read(&path).map_err(|_| FileError::NotFound(path.clone()))?;
         Ok(Bytes::new(data))
     }
