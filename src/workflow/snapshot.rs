@@ -202,7 +202,7 @@ fn parse_lfs_pointer(data: &[u8]) -> Option<LfsPointer> {
 }
 
 /// 手写 USTAR：512 字节头 + 数据按 512 补齐 + 两个零块，外层 gzip。
-/// `/git/<slug>.git/worktree/archive` 也复用这里，避免主服务出现第二份打包实现。
+/// `/git/<项目>/archive` 也复用这里，避免主服务出现第二份打包实现。
 pub(crate) fn write_tar_gz(entries: &[(String, Vec<u8>)]) -> Result<Vec<u8>> {
     let enc = GzEncoder::new(Vec::new(), Compression::default());
     let mut w = enc;

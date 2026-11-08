@@ -1045,18 +1045,34 @@ pub async fn receive_pack(
     Ok(ReceiveOutcome { response: out })
 }
 
-/// 从 `/git/<项目>.git/...` 的剩余路径里解析仓库名与动作。
-pub fn split_target(path: &str) -> Result<(String, String)> {
+/// `/git/` 下并列的两类通道。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitChannel {
+    /// `<slug>.git/...`：Git 客户端用的 smart HTTP（info/refs、upload-pack、
+    /// receive-pack、LFS），保留原有 Git 协议行为。
+    Smart,
+    /// `<slug>/...`：站内文件树接口（tree / file / archive），可读；
+    /// 登录用户可写。
+    Worktree,
+}
+
+/// 解析 `/git/<...>/...` 为项目名、动作与通道。
+///
+/// 以 `.git` 结尾的是 Git 客户端的仓库地址；不带后缀的是文件树接口。
+/// 两者读的是同一份 PG `git_objects`，只是输出形式不同（packfile /
+/// 展开后的文件树）。
+pub fn split_git_path(path: &str) -> Result<(String, String, GitChannel)> {
     let (repo, action) = path
         .split_once('/')
         .ok_or_else(|| anyhow::anyhow!("Git 路径不完整"))?;
-    let slug = repo
-        .strip_suffix(".git")
-        .ok_or_else(|| anyhow::anyhow!("Git 仓库地址必须以 .git 结尾"))?;
+    let (slug, channel) = match repo.strip_suffix(".git") {
+        Some(value) => (value, GitChannel::Smart),
+        None => (repo, GitChannel::Worktree),
+    };
     if slug.is_empty() {
         bail!("缺少项目名");
     }
-    Ok((percent_decode(slug)?, action.to_string()))
+    Ok((percent_decode(slug)?, action.to_string(), channel))
 }
 
 /// 只接受 `%XX` 形式的百分号编码，避免把项目名里的 `+` 误当成空格。
@@ -1094,9 +1110,20 @@ mod tests {
 
     #[test]
     fn splits_git_target_and_decodes_unicode() {
-        let (slug, action) = split_target("%E6%88%91%E7%9A%84%E9%A1%B9%E7%9B%AE.git/info/refs").unwrap();
+        let (slug, action, channel) =
+            split_git_path("%E6%88%91%E7%9A%84%E9%A1%B9%E7%9B%AE.git/info/refs").unwrap();
         assert_eq!(slug, "我的项目");
         assert_eq!(action, "info/refs");
+        assert_eq!(channel, GitChannel::Smart);
+    }
+
+    #[test]
+    fn splits_worktree_target_without_dot_git() {
+        let (slug, action, channel) =
+            split_git_path("%E6%88%91%E7%9A%84%E9%A1%B9%E7%9B%AE/tree").unwrap();
+        assert_eq!(slug, "我的项目");
+        assert_eq!(action, "tree");
+        assert_eq!(channel, GitChannel::Worktree);
     }
 
     #[test]

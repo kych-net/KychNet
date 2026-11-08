@@ -1420,13 +1420,15 @@ pub async fn serve(cfg: Config) -> Result<()> {
             get(git_token_list).post(git_token_create),
         )
         .route("/api/git-tokens/{id}", delete(git_token_revoke))
-        // Git smart HTTP：公开仓库匿名可 clone，写入需要令牌认证。
-        // 推送的 pack 可能远大于普通 API 请求，单独放宽这一条路由的上限。
+        // /git/ 下有两类通道：<slug>.git/... 是 Git smart HTTP（匿名 clone，
+        // 写入需 Git 令牌或登录会话）；<slug>/... 是站内文件树接口（公开只读，
+        // 登录用户可写）。推送的 pack 可能远大于普通 API 请求，放宽上限。
         .route(
             "/git/{*path}",
             get(git_http_get)
                 .post(git_http_post)
                 .put(git_http_put)
+                .delete(git_http_delete)
                 .layer(DefaultBodyLimit::max(GIT_MAX_BODY_BYTES)),
         )
         .route("/api/invites", get(invites).post(create_invite))
@@ -2110,13 +2112,78 @@ async fn git_project(
     }
 }
 
+/// `/git/` 写操作认证：Git 令牌优先，登录会话兜底。
+///
+/// 登录用户不必另建 Git 令牌就能 push、上传 LFS、编辑文件树；匿名客户端
+/// 仍必须带令牌。禁用账号两条路径都不放行。
+async fn git_write_user(
+    state: &AppState,
+    headers: &HeaderMap,
+    session: &Session,
+) -> std::result::Result<Option<User>, String> {
+    match crate::git::token::authenticate(&state.pool, headers).await {
+        Ok(Some(user)) => return Ok(Some(user)),
+        Ok(None) => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    let Ok(Some(id)) = session.get::<Uuid>("user_id").await else {
+        return Ok(None);
+    };
+    match service::find_user_by_id(&state.pool, id).await {
+        Ok(Some(user)) if !user.disabled => Ok(Some(user)),
+        Ok(_) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// 把认证结果翻译成 handler 可直接返回的用户 / 响应。
+/// `Response` 较大是 axum 固有，与既有 `git_project()` 同构。
+#[allow(clippy::result_large_err)]
+fn git_need_user(
+    result: std::result::Result<Option<User>, String>,
+) -> std::result::Result<User, Response> {
+    match result {
+        Ok(Some(user)) => Ok(user),
+        Ok(None) => Err(git_unauthorized()),
+        Err(error) => Err(git_plain(StatusCode::INTERNAL_SERVER_ERROR, &error)),
+    }
+}
+
+/// 文件树写要更新分支 ref，所以只接受分支名，不接受 commit OID。
+#[allow(clippy::result_large_err)]
+fn worktree_write_ref(params: &HashMap<String, String>) -> std::result::Result<&str, Response> {
+    let value = params
+        .get("ref")
+        .map(String::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| git_plain(StatusCode::BAD_REQUEST, "缺少 ref 参数（分支名）"))?;
+    if !crate::project::valid_branch(value) {
+        return Err(git_plain(StatusCode::BAD_REQUEST, "非法分支名"));
+    }
+    Ok(value)
+}
+
+#[allow(clippy::result_large_err)]
+fn worktree_write_path(params: &HashMap<String, String>) -> std::result::Result<&str, Response> {
+    let value = params
+        .get("path")
+        .map(String::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| git_plain(StatusCode::BAD_REQUEST, "缺少 path 参数"))?;
+    if !crate::project::valid_file_path(value) {
+        return Err(git_plain(StatusCode::BAD_REQUEST, "非法文件路径"));
+    }
+    Ok(value)
+}
+
 async fn git_http_get(
     State(state): State<AppState>,
     Path(path): Path<String>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
+    session: Session,
 ) -> Response {
-    let (slug, action) = match crate::git::http::split_target(&path) {
+    let (slug, action, channel) = match crate::git::http::split_git_path(&path) {
         Ok(value) => value,
         Err(error) => return git_plain(StatusCode::NOT_FOUND, &error.to_string()),
     };
@@ -2124,6 +2191,12 @@ async fn git_http_get(
         Ok(project) => project,
         Err(response) => return response,
     };
+
+    // 文件树通道：`/git/<项目>/{tree,file,archive}`，公开只读。
+    // 调用方不需要 git 客户端、不需要 .git，也不必解析 packfile。
+    if channel == crate::git::http::GitChannel::Worktree {
+        return worktree_get(&state, &project, &action, &params).await;
+    }
 
     // Git LFS 下载：公开可读，文件落在 LFS_ROOT 下。
     if let Some(oid) = action.strip_prefix("info/lfs/objects/") {
@@ -2134,12 +2207,6 @@ async fn git_http_get(
         };
     }
 
-    // 工作树读取：与 packfile 通道并列，直接给出展开后的文件树。
-    // 调用方不需要 git 客户端、不需要 .git，也不必解析 packfile。
-    if let Some(rest) = action.strip_prefix("worktree/") {
-        return worktree_get(&state, &project, rest, &params).await;
-    }
-
     if action != "info/refs" {
         return git_plain(StatusCode::NOT_FOUND, "未知的 Git 路径");
     }
@@ -2148,13 +2215,11 @@ async fn git_http_get(
         return git_plain(StatusCode::BAD_REQUEST, "缺少或非法的 service 参数");
     }
     // receive-pack 的广告也要求认证，Git 客户端才会主动带上凭据。
+    // 登录会话也算数：浏览器里登录过的用户不必另建 Git 令牌。
     if service == "git-receive-pack" {
-        match crate::git::token::authenticate(&state.pool, &headers).await {
-            Ok(Some(_)) => {}
-            Ok(None) => return git_unauthorized(),
-            Err(error) => {
-                return git_plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
-            }
+        match git_need_user(git_write_user(&state, &headers, &session).await) {
+            Ok(_) => {}
+            Err(response) => return response,
         }
     }
 
@@ -2179,11 +2244,11 @@ async fn git_http_get(
     }
 }
 
-/// `/git/<slug>.git/worktree/{tree,file,archive}`。
+/// `/git/<项目>/{tree,file,archive}`（不带 `.git` 后缀）。
 ///
 /// 与 `git-upload-pack` 保持同等可见性：站内仓库内容本来就能匿名 fetch，
-/// 这里只是把 packfile 换成展开后的工作树，不额外放大暴露面。
-/// 若将来要给 `/git/` 整体加认证，这三个端点会一并生效。
+/// 这里只是把 packfile 换成展开后的文件树，不额外放大暴露面。
+/// 写操作不在这里，走 `git_http_put` / `git_http_delete`，需登录会话。
 async fn worktree_get(
     state: &AppState,
     project: &crate::project::Project,
@@ -2351,19 +2416,26 @@ async fn git_http_post(
     State(state): State<AppState>,
     Path(path): Path<String>,
     headers: HeaderMap,
+    session: Session,
     body: Bytes,
 ) -> Response {
-    let (slug, action) = match crate::git::http::split_target(&path) {
+    let (slug, action, channel) = match crate::git::http::split_git_path(&path) {
         Ok(value) => value,
         Err(error) => return git_plain(StatusCode::NOT_FOUND, &error.to_string()),
     };
+    if channel == crate::git::http::GitChannel::Worktree {
+        return git_plain(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "文件树写请用 PUT / DELETE /git/<项目>/file",
+        );
+    }
     let project = match git_project(&state, &slug).await {
         Ok(project) => project,
         Err(response) => return response,
     };
     match action.as_str() {
         "info/lfs/objects/batch" => {
-            let authenticated = crate::git::token::authenticate(&state.pool, &headers)
+            let authenticated = git_write_user(&state, &headers, &session)
                 .await
                 .map(|user| user.is_some())
                 .unwrap_or(false);
@@ -2379,8 +2451,10 @@ async fn git_http_post(
             .await
             {
                 Ok(result) if result.unauthorized => {
-                    let mut response =
-                        git_plain(StatusCode::UNAUTHORIZED, "上传 LFS 对象需要 Git 令牌");
+                    let mut response = git_plain(
+                        StatusCode::UNAUTHORIZED,
+                        "上传 LFS 对象需要登录会话或 Git 令牌",
+                    );
                     response.headers_mut().insert(
                         "lfs-authenticate",
                         HeaderValue::from_static("Basic realm=\"Git LFS\""),
@@ -2407,19 +2481,22 @@ async fn git_http_post(
                 Err(error) => git_plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
             }
         }
-        "git-receive-pack" => git_receive(&state, &project, &headers, &body).await,
+        "git-receive-pack" => git_receive(&state, &project, &headers, &session, &body).await,
         _ => git_plain(StatusCode::NOT_FOUND, "未知的 Git 路径"),
     }
 }
 
-/// Git LFS 上传。只有携带令牌的写请求才允许落盘。
+/// PUT：`<slug>.git/info/lfs/objects/<oid>` 上传 LFS 对象；`<slug>/file`
+/// 写文件树。两者都要求 Git 令牌或登录会话。
 async fn git_http_put(
     State(state): State<AppState>,
     Path(path): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
+    session: Session,
     body: Bytes,
 ) -> Response {
-    let (slug, action) = match crate::git::http::split_target(&path) {
+    let (slug, action, channel) = match crate::git::http::split_git_path(&path) {
         Ok(value) => value,
         Err(error) => return git_plain(StatusCode::NOT_FOUND, &error.to_string()),
     };
@@ -2427,15 +2504,15 @@ async fn git_http_put(
         Ok(project) => project,
         Err(response) => return response,
     };
+    if channel == crate::git::http::GitChannel::Worktree {
+        return worktree_put(&state, &project, &action, &params, &headers, &session, &body).await;
+    }
     let Some(oid) = action.strip_prefix("info/lfs/objects/") else {
         return git_plain(StatusCode::NOT_FOUND, "未知的 Git 路径");
     };
-    match crate::git::token::authenticate(&state.pool, &headers).await {
-        Ok(Some(_)) => {}
-        Ok(None) => return git_unauthorized(),
-        Err(error) => {
-            return git_plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
-        }
+    match git_need_user(git_write_user(&state, &headers, &session).await) {
+        Ok(_) => {}
+        Err(response) => return response,
     }
     match crate::git::lfs::store(&state.pool, &state.lfs_root, project.id, oid, &body).await {
         Ok(()) => StatusCode::OK.into_response(),
@@ -2447,12 +2524,12 @@ async fn git_receive(
     state: &AppState,
     project: &crate::project::Project,
     headers: &HeaderMap,
+    session: &Session,
     body: &[u8],
 ) -> Response {
-    let user = match crate::git::token::authenticate(&state.pool, headers).await {
-        Ok(Some(user)) => user,
-        Ok(None) => return git_unauthorized(),
-        Err(error) => return git_plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    let user = match git_need_user(git_write_user(state, headers, session).await) {
+        Ok(user) => user,
+        Err(response) => return response,
     };
     let outcome = match crate::git::http::receive_pack(&state.pool, project, &user, body).await {
         Ok(outcome) => outcome,
@@ -2461,6 +2538,134 @@ async fn git_receive(
     // 事件已在 receive_pack 的事务里入队，分发器负责触发内置 site.build；
     // push 响应不等构建，构建失败也不影响已提交的 refs（修掉原来的静默丢更新）。
     git_binary("application/x-git-receive-pack-result", outcome.response)
+}
+
+/// DELETE `/git/<项目>/file`：登录用户删除文件并生成一个新 commit。
+async fn git_http_delete(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    session: Session,
+) -> Response {
+    let (slug, action, channel) = match crate::git::http::split_git_path(&path) {
+        Ok(value) => value,
+        Err(error) => return git_plain(StatusCode::NOT_FOUND, &error.to_string()),
+    };
+    if channel != crate::git::http::GitChannel::Worktree {
+        return git_plain(
+            StatusCode::NOT_FOUND,
+            "smart HTTP 通道不支持 DELETE",
+        );
+    }
+    let project = match git_project(&state, &slug).await {
+        Ok(project) => project,
+        Err(response) => return response,
+    };
+    worktree_delete(&state, &project, &action, &params, &headers, &session).await
+}
+
+/// PUT `/git/<项目>/file`：登录用户写文件并生成一个新 commit。
+///
+/// 请求体就是文件原始字节：UTF-8 文本直接进 blob，二进制走站内已实现的
+/// LFS（对象落盘 + 仓库里存 pointer）。可选 `message` 与 `base_oid`（乐观锁）。
+#[allow(clippy::too_many_arguments)]
+async fn worktree_put(
+    state: &AppState,
+    project: &crate::project::Project,
+    action: &str,
+    params: &HashMap<String, String>,
+    headers: &HeaderMap,
+    session: &Session,
+    body: &[u8],
+) -> Response {
+    if action != "file" {
+        return git_plain(StatusCode::NOT_FOUND, "未知的文件树路径");
+    }
+    let user = match git_need_user(git_write_user(state, headers, session).await) {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let branch = match worktree_write_ref(params) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let path = match worktree_write_path(params) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let message = params.get("message").map(String::as_str);
+    let base_oid = params.get("base_oid").map(String::as_str);
+    let result = match crate::project::write_file_bytes(
+        &state.pool,
+        &user,
+        project.id,
+        branch,
+        path,
+        body,
+        message,
+        base_oid,
+        &state.lfs_root,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => return git_plain(StatusCode::BAD_REQUEST, &error.to_string()),
+    };
+    if branch == project.default_branch {
+        if let Err(error) = state.build_ctl.build_all().await {
+            return git_plain(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("文件已保存，但自动编译失败：{error}"),
+            );
+        }
+    }
+    match serde_json::to_vec(&serde_json::json!({ "item": result })) {
+        Ok(data) => git_json("application/json", data),
+        Err(error) => git_plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
+}
+
+/// 文件树删除：复用管理端 `project::delete_file`，语义完全一致。
+#[allow(clippy::too_many_arguments)]
+async fn worktree_delete(
+    state: &AppState,
+    project: &crate::project::Project,
+    action: &str,
+    params: &HashMap<String, String>,
+    headers: &HeaderMap,
+    session: &Session,
+) -> Response {
+    if action != "file" {
+        return git_plain(StatusCode::NOT_FOUND, "未知的文件树路径");
+    }
+    let user = match git_need_user(git_write_user(state, headers, session).await) {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let branch = match worktree_write_ref(params) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let path = match worktree_write_path(params) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let message = params.get("message").map(String::as_str);
+    if let Err(error) =
+        crate::project::delete_file(&state.pool, &user, project.id, branch, path, message).await
+    {
+        return git_plain(StatusCode::BAD_REQUEST, &error.to_string());
+    }
+    if branch == project.default_branch {
+        if let Err(error) = state.build_ctl.build_all().await {
+            return git_plain(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("文件已删除，但自动编译失败：{error}"),
+            );
+        }
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// 定期清理过期的认证流程。
