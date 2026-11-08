@@ -12,7 +12,8 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    # Ubuntu 26.04 x86-64 runner（GitHub 已 GA）。
+    runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
       matrix:
