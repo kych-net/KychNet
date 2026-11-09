@@ -19,15 +19,12 @@ use crate::models::User;
 pub const PROJECT_NAMESPACE: &str = "项目";
 
 /// 项目图标的候选文件名（按优先级），放在项目根目录即可被站点识别。
-/// `.svg.txt` 用于兼容平台把 `.svg` 当作内容格式生成页面的行为：仓库里
-/// 存成纯文本，构建时仍以 `.svg` 输出，不会被编译成 `.html` 页面。
+/// 平台把 `.svg` 也当作内容格式，因此构建时会对这些源文件跳过页面编译，
+/// 只把内容原样输出成 `icon.svg`，不会被编译成内容页面。
 pub const PROJECT_ICON_FILES: &[&str] = &[
     "图标.svg",
     "favicon.svg",
     "logo.svg",
-    "图标.svg.txt",
-    "favicon.svg.txt",
-    "logo.svg.txt",
 ];
 
 /// 项目图标在内容站的固定输出名。
