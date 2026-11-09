@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tower_sessions::Session;
 use url::Url;
+use askama::Template;
 use std::net::SocketAddr;
 use uuid::Uuid;
 
@@ -74,33 +75,30 @@ fn pkce_challenge(verifier: &str) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
 }
 
-fn html_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
+/// OAuth 页面统一走 askama 模板（自动转义），不再手拼 HTML。
+/// 模板继承自 `templates/oauth/base.html`，样式与原实现保持一致。
+
+#[derive(askama::Template)]
+#[template(path = "oauth/login.html")]
+struct LoginView<'a> {
+    fields: &'a OAuthFields,
+    error: Option<&'a str>,
+    next: String,
 }
 
-fn page(title: &str, body: &str) -> Html<String> {
-    Html(format!(
-        r#"<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title}</title><style>body{{font-family:system-ui,-apple-system,sans-serif;max-width:42rem;margin:3rem auto;padding:0 1.2rem;line-height:1.6;color:#1f2937}}h1{{font-size:1.4rem}}label{{display:block;margin:1rem 0 .3rem}}input,button{{font:inherit;padding:.6rem .8rem;width:100%;box-sizing:border-box}}button{{margin-top:1.2rem;background:#111827;color:#fff;border:0;border-radius:.4rem;cursor:pointer}}code{{background:#f3f4f6;padding:.1rem .3rem;border-radius:.25rem}}.error{{color:#b91c1c}}.muted{{color:#6b7280;font-size:.9rem}}</style></head><body>{body}</body></html>"#,
-        title = html_escape(title),
-        body = body
-    ))
+#[derive(askama::Template)]
+#[template(path = "oauth/consent.html")]
+struct ConsentView<'a> {
+    fields: &'a OAuthFields,
+    username: &'a str,
+    csrf: &'a str,
 }
 
-fn hidden_fields(f: &OAuthFields) -> String {
-    format!(
-        r#"<input type="hidden" name="client_id" value="{client_id}"><input type="hidden" name="redirect_uri" value="{redirect_uri}"><input type="hidden" name="state" value="{state}"><input type="hidden" name="scope" value="{scope}"><input type="hidden" name="code_challenge" value="{challenge}"><input type="hidden" name="code_challenge_method" value="{method}"><input type="hidden" name="resource" value="{resource}">"#,
-        client_id = html_escape(&f.client_id),
-        redirect_uri = html_escape(&f.redirect_uri),
-        state = html_escape(&f.state),
-        scope = html_escape(&f.scope),
-        challenge = html_escape(&f.code_challenge),
-        method = html_escape(&f.code_challenge_method),
-        resource = html_escape(&f.resource),
-    )
+#[derive(askama::Template)]
+#[template(path = "oauth/message.html")]
+struct MessageView<'a> {
+    title: &'a str,
+    message: &'a str,
 }
 
 fn authorize_query(f: &OAuthFields) -> String {
@@ -117,32 +115,29 @@ fn authorize_query(f: &OAuthFields) -> String {
 }
 
 fn login_page(f: &OAuthFields, error: Option<&str>) -> Html<String> {
-    let error = error
-        .map(|message| format!("<p class=\"error\">{}</p>", html_escape(message)))
-        .unwrap_or_default();
     let next = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("next", &authorize_query(f))
         .finish();
-    page(
-        "登录 KychNet MCP",
-        &format!(
-            r#"<h1>登录 KychNet MCP</h1><p class="muted">客户端正在请求访问站点。请使用管理员或成员账号登录。</p>{error}<form method="post" action="/oauth/login">{hidden}<label>用户名<input name="username" autocomplete="username" required></label><label>动态验证码<input name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{{6}}" required></label><button type="submit">登录并继续</button></form><p class="muted">使用通行密钥：<a href="https://m.kych.net/?{next}">先在管理端登录，再返回授权</a></p>"#,
-            hidden = hidden_fields(f),
-            next = html_escape(&next),
-        ),
+    Html(
+        LoginView {
+            fields: f,
+            error,
+            next,
+        }
+        .render()
+        .unwrap_or_else(|_| "登录页渲染失败".to_string()),
     )
 }
 
 fn consent_page(f: &OAuthFields, csrf: &str, username: &str) -> Html<String> {
-    page(
-        "授权 KychNet MCP",
-        &format!(
-            r#"<h1>授权 KychNet MCP</h1><p>已登录为 <strong>{username}</strong>。</p><p>客户端 <code>{client}</code> 请求以下权限：</p><ul><li>读取站点内容</li><li>写入/删除站点内容</li><li>读取项目 Git 文件</li><li>写入/删除项目 Git 文件</li></ul><form method="post" action="/oauth/approve">{hidden}<input type="hidden" name="csrf" value="{csrf}"><button type="submit">允许并继续</button></form><p class="muted">授权后可随时通过重新登录或撤销 token 停止访问。</p>"#,
-            username = html_escape(username),
-            client = html_escape(&f.client_id),
-            hidden = hidden_fields(f),
-            csrf = html_escape(csrf),
-        ),
+    Html(
+        ConsentView {
+            fields: f,
+            username,
+            csrf,
+        }
+        .render()
+        .unwrap_or_else(|_| "授权页渲染失败".to_string()),
     )
 }
 
@@ -295,7 +290,12 @@ pub async fn authorize(
     }
     let fields = query.fields();
     if let Err(error) = validate_authorize(&state, &fields).await {
-        return (StatusCode::BAD_REQUEST, Html(html_escape(&error))).into_response();
+        return (StatusCode::BAD_REQUEST, Html(
+            MessageView { title: "请求无法处理", message: &error }
+                .render()
+                .unwrap_or_else(|_| "请求无法处理".to_string()),
+        ))
+        .into_response();
     }
     match session_user(&state, &session).await {
         None => login_page(&fields, None).into_response(),
@@ -333,7 +333,12 @@ pub async fn login(
     }
     let fields = form.fields();
     if let Err(error) = validate_authorize(&state, &fields).await {
-        return (StatusCode::BAD_REQUEST, Html(html_escape(&error))).into_response();
+        return (StatusCode::BAD_REQUEST, Html(
+            MessageView { title: "请求无法处理", message: &error }
+                .render()
+                .unwrap_or_else(|_| "请求无法处理".to_string()),
+        ))
+        .into_response();
     }
     let Some(user) = service::find_user_by_username(&state.pool, form.username.trim())
         .await
@@ -369,7 +374,12 @@ pub async fn approve(
 ) -> Response {
     let fields = form.fields();
     if let Err(error) = validate_authorize(&state, &fields).await {
-        return (StatusCode::BAD_REQUEST, Html(html_escape(&error))).into_response();
+        return (StatusCode::BAD_REQUEST, Html(
+            MessageView { title: "请求无法处理", message: &error }
+                .render()
+                .unwrap_or_else(|_| "请求无法处理".to_string()),
+        ))
+        .into_response();
     }
     let Some(user) = session_user(&state, &session).await else {
         return Redirect::to(&authorize_query(&fields)).into_response();
