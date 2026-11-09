@@ -1,8 +1,9 @@
 //! 项目协作：Pull Request 与项目讨论。
 //!
-//! PR 差异使用三点比较（merge-base → 来源分支），合并时能快进就快进；
-//! 不能快进时在服务端生成一个双亲 merge commit，树直接取来源分支，
-//! 因此目标分支独有的改动会被覆盖，详情接口会通过警示字段告知前端。
+//! PR 差异使用三点比较（merge-base → 来源分支）。合并时能快进就快进；
+//! 不能快进时以 merge-base 为基点做逐文件三方合并，生成双亲 merge commit。
+//! 两侧同时改动同一文件且结果不同时判定为冲突并拒绝合并，绝不静默丢弃
+//! 目标分支独有的改动；详情接口用 `conflicts` 把冲突文件列给前端。
 //! 所有写操作都在项目级 advisory lock 下串行执行，与 `project.rs` 的文件编辑共用同一把锁。
 
 use anyhow::{bail, Context, Result};
@@ -13,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use uuid::Uuid;
 
 use crate::git::object::{
-    encode_commit, identity_name, is_text, Object, ObjectKind, Oid, TreeEntry,
+    encode_commit, identity_name, is_text, Object, ObjectKind, Oid, Tree, TreeEntry,
 };
 use crate::git::store;
 use crate::git::tree;
@@ -101,17 +102,19 @@ pub struct PrDetail {
     #[serde(flatten)]
     pub pr: PullRequest,
     pub files: Vec<FileDiff>,
-    /// 两个分支都存在时就可以合并（非快进会生成 merge commit）。
+    /// 两个分支都存在且没有冲突时就可以合并（非快进会生成 merge commit）。
     pub mergeable: bool,
     /// 目标分支是否已经是来源分支的祖先。
     pub is_fast_forward: bool,
-    /// 非快进合并会用来源分支的树覆盖目标分支，前端需要明确警示。
+    /// 保留字段以兼容旧前端；三方合并后恒为 false，不再覆盖目标分支。
     pub overwrites_target: bool,
+    /// 两侧相对合并基点都有不同改动的文件；非空时禁止合并。
+    pub conflicts: Vec<String>,
     pub merge_base: Option<String>,
     pub comments: Vec<PrComment>,
 }
 
-/// 合并结果。非快进时 `overwrote_target` 为 true。
+/// 合并结果。`overwrote_target` 保留以兼容旧前端，三方合并后恒为 false。
 pub struct MergeOutcome {
     pub pr: PullRequest,
     pub overwrote_target: bool,
@@ -322,6 +325,113 @@ async fn blob_map(
         }
     }
     Ok(files)
+}
+
+/// 逐文件三方合并。
+///
+/// 以 merge-base 的快照为基准：只有一侧改动的路径取改动过的一侧；两侧改动
+/// 结果相同也直接采用；两侧都改了同一路径且结果不同则记入冲突。返回值是
+/// 合并后的 `路径 → blob OID`；冲突时返回冲突路径列表，由调用方拒绝合并，
+/// 绝不静默丢弃目标分支独有的改动。
+fn three_way_merge<T>(
+    base: &BTreeMap<String, T>,
+    target: &BTreeMap<String, T>,
+    source: &BTreeMap<String, T>,
+) -> std::result::Result<BTreeMap<String, T>, Vec<String>>
+where
+    T: Clone + Eq,
+{
+    let mut paths = BTreeSet::new();
+    paths.extend(base.keys().cloned());
+    paths.extend(target.keys().cloned());
+    paths.extend(source.keys().cloned());
+
+    let mut merged = BTreeMap::new();
+    let mut conflicts = Vec::new();
+    for path in paths {
+        let b = base.get(&path);
+        let t = target.get(&path);
+        let s = source.get(&path);
+        let chosen = if t == s {
+            t
+        } else if t == b {
+            s
+        } else if s == b {
+            t
+        } else {
+            conflicts.push(path);
+            continue;
+        };
+        if let Some(value) = chosen {
+            merged.insert(path, value.clone());
+        }
+    }
+    if conflicts.is_empty() {
+        Ok(merged)
+    } else {
+        Err(conflicts)
+    }
+}
+
+/// 读取某个提交的 `路径 → blob OID` 快照。
+async fn commit_files(
+    conn: &mut PgConnection,
+    project_id: Uuid,
+    commit: Oid,
+) -> Result<BTreeMap<String, Oid>> {
+    let root = tree::read_commit_tree(conn, project_id, commit).await?;
+    blob_map(conn, project_id, root).await
+}
+
+/// 计算三方合并的冲突文件；没有共同祖先时视为整体冲突。
+async fn merge_conflicts(
+    conn: &mut PgConnection,
+    project_id: Uuid,
+    base: Option<Oid>,
+    target: Oid,
+    source: Oid,
+) -> Result<Vec<String>> {
+    let Some(base) = base else {
+        return Ok(vec!["<两个分支没有共同祖先>".to_string()]);
+    };
+    let base_files = commit_files(conn, project_id, base).await?;
+    let target_files = commit_files(conn, project_id, target).await?;
+    let source_files = commit_files(conn, project_id, source).await?;
+    Ok(match three_way_merge(&base_files, &target_files, &source_files) {
+        Ok(_) => Vec::new(),
+        Err(conflicts) => conflicts,
+    })
+}
+
+/// 生成三方合并后的根 tree；冲突时直接返回错误，事务会整体回滚。
+async fn merged_tree(
+    conn: &mut PgConnection,
+    project_id: Uuid,
+    base: Option<Oid>,
+    target: Oid,
+    source: Oid,
+) -> Result<Oid> {
+    let base = base.context("两个分支没有共同祖先，无法合并；请先 rebase")?;
+    let base_files = commit_files(conn, project_id, base).await?;
+    let target_files = commit_files(conn, project_id, target).await?;
+    let source_files = commit_files(conn, project_id, source).await?;
+    let merged = three_way_merge(&base_files, &target_files, &source_files).map_err(
+        |conflicts| {
+            anyhow::anyhow!(
+                "合并存在冲突，请先把目标分支合并到来源分支后重试：{}",
+                conflicts.join("、")
+            )
+        },
+    )?;
+    // 复用已有 blob OID 重建树，不重写对象内容，也不受 UTF-8 校验限制。
+    let mut root: Option<Oid> = None;
+    for (path, blob) in &merged {
+        root = Some(tree::update_path(conn, project_id, root, path, Some(*blob)).await?);
+    }
+    match root {
+        Some(oid) => Ok(oid),
+        None => tree::write_tree(conn, project_id, &Tree::default()).await,
+    }
 }
 
 async fn diff_roots(
@@ -622,7 +732,7 @@ pub async fn pr_detail(
 
     let source = store::resolve_branch(&mut conn, project_id, &pr.source_branch).await?;
     let target = store::resolve_branch(&mut conn, project_id, &pr.target_branch).await?;
-    let (files, mergeable, is_fast_forward, overwrites_target, merge_base) =
+    let (files, mergeable, is_fast_forward, conflicts, merge_base) =
         match (source, target) {
             (Some(source_oid), Some(target_oid)) => {
                 // 三点差异：以两个分支的合并基点为基准，避免把目标分支
@@ -631,15 +741,35 @@ pub async fn pr_detail(
                 let files = diff_commits(&mut conn, project_id, base, source_oid).await?;
                 let fast_forward = source_oid == target_oid
                     || is_ancestor(&mut conn, project_id, target_oid, source_oid).await?;
+                // 非快进合并要逐文件三方合并；提前把冲突文件列给前端，
+                // 让「合并」按钮在冲突时不再是可点的假动作。
+                let conflicts = if fast_forward {
+                    Vec::new()
+                } else {
+                    merge_conflicts(
+                        &mut conn,
+                        project_id,
+                        base,
+                        target_oid,
+                        source_oid,
+                    )
+                    .await?
+                };
                 (
                     files,
-                    true,
+                    conflicts.is_empty(),
                     fast_forward,
-                    !fast_forward,
+                    conflicts,
                     base.map(|oid| oid.to_hex()),
                 )
             }
-            _ => (Vec::new(), false, false, false, None),
+            _ => (
+                Vec::new(),
+                false,
+                false,
+                vec!["<来源或目标分支不存在>".to_string()],
+                None,
+            ),
         };
 
     Ok(Some(PrDetail {
@@ -647,7 +777,8 @@ pub async fn pr_detail(
         files,
         mergeable,
         is_fast_forward,
-        overwrites_target,
+        overwrites_target: false,
+        conflicts,
         merge_base,
         comments,
     }))
@@ -730,11 +861,13 @@ pub async fn merge_pr(
 
     let fast_forward = target == source || is_ancestor(&mut tx, project_id, target, source).await?;
     let merge_oid = if fast_forward {
+        // 目标分支是来源分支的祖先，source 已包含 target 的全部改动。
         source
     } else {
-        // 非快进：创建双亲 merge commit，树直接取来源分支。
-        // 目标分支独有的改动会被覆盖，详情接口已提前给出警示。
-        let tree_oid = tree::read_commit_tree(&mut tx, project_id, source).await?;
+        // 非快进：以 merge-base 为基点逐文件三方合并，两侧改动都保留；
+        // 同一文件两侧改动不同则拒绝合并，绝不拿来源分支的树覆盖目标分支。
+        let base = merge_base(&mut tx, project_id, target, source).await?;
+        let tree_oid = merged_tree(&mut tx, project_id, base, target, source).await?;
         let identity = format!("{} <noreply@kych.net>", identity_name(&user.username));
         let timestamp = Utc::now().timestamp();
         let message = format!(
@@ -815,7 +948,7 @@ pub async fn merge_pr(
         .context("PR 合并后无法读取")?;
     Ok(MergeOutcome {
         pr,
-        overwrote_target: !fast_forward,
+        overwrote_target: false,
     })
 }
 
@@ -1058,5 +1191,86 @@ mod tests {
         graph.insert(c, vec![b]);
         assert!(reachable_in_graph(&graph, c, a));
         assert!(!reachable_in_graph(&graph, a, c));
+    }
+
+    fn oids(items: &[(&str, u8)]) -> BTreeMap<String, Oid> {
+        items
+            .iter()
+            .map(|(path, byte)| {
+                (
+                    (*path).to_string(),
+                    Oid::from_hex(&format!("{byte:040x}")).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn three_way_merge_keeps_changes_from_both_sides() {
+        // 回归：旧实现直接用来源分支的树，目标分支独有的 target-only.txt 会丢失。
+        let base = oids(&[("shared.txt", 1)]);
+        let target = oids(&[("shared.txt", 1), ("target-only.txt", 2)]);
+        let source = oids(&[("shared.txt", 1), ("source-only.txt", 3)]);
+        let merged = three_way_merge(&base, &target, &source).unwrap();
+        assert_eq!(
+            merged.keys().cloned().collect::<Vec<_>>(),
+            vec!["shared.txt", "source-only.txt", "target-only.txt"]
+        );
+        assert_eq!(merged["target-only.txt"], target["target-only.txt"]);
+        assert_eq!(merged["source-only.txt"], source["source-only.txt"]);
+    }
+
+    #[test]
+    fn three_way_merge_takes_the_changed_side() {
+        let base = oids(&[("a.txt", 1), ("b.txt", 1)]);
+        let target = oids(&[("a.txt", 1), ("b.txt", 2)]);
+        let source = oids(&[("a.txt", 3), ("b.txt", 1)]);
+        let merged = three_way_merge(&base, &target, &source).unwrap();
+        assert_eq!(merged["a.txt"], source["a.txt"]);
+        assert_eq!(merged["b.txt"], target["b.txt"]);
+    }
+
+    #[test]
+    fn three_way_merge_reports_conflicting_edits() {
+        let base = oids(&[("a.txt", 1)]);
+        let target = oids(&[("a.txt", 2)]);
+        let source = oids(&[("a.txt", 3)]);
+        assert_eq!(
+            three_way_merge(&base, &target, &source).unwrap_err(),
+            vec!["a.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn three_way_merge_handles_identical_edits_and_deletes() {
+        let base = oids(&[("a.txt", 1), ("gone.txt", 1)]);
+        // 两侧改动相同不算冲突。
+        let target = oids(&[("a.txt", 2)]);
+        let source = oids(&[("a.txt", 2)]);
+        let merged = three_way_merge(&base, &target, &source).unwrap();
+        assert_eq!(merged["a.txt"], target["a.txt"]);
+        assert!(!merged.contains_key("gone.txt"));
+
+        // 一侧删除、另一侧修改必须判冲突，避免静默丢改动。
+        let source = oids(&[("a.txt", 2), ("gone.txt", 3)]);
+        assert_eq!(
+            three_way_merge(&base, &oids(&[("a.txt", 2)]), &source).unwrap_err(),
+            vec!["gone.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn three_way_merge_is_byte_safe() {
+        // 合并比较的是 blob OID / 原始字节，非 UTF-8 内容同样成立。
+        let mut base = BTreeMap::new();
+        base.insert("bin".to_string(), vec![0u8, 159, 255]);
+        let mut target = base.clone();
+        target.insert("bin".to_string(), vec![0u8, 1, 255]);
+        let mut source = base.clone();
+        source.insert("bin".to_string(), vec![0u8, 2, 255]);
+        assert_eq!(
+            three_way_merge(&base, &target, &source).unwrap_err(),
+            vec!["bin".to_string()]
+        );
     }
 }
