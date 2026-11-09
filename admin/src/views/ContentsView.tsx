@@ -79,8 +79,8 @@ export function ContentsView() {
   const [previewHtml, setPreviewHtml] = useState("");
   const [previewError, setPreviewError] = useState("");
   const [previewLoading, setPreviewLoading] = useState(false);
-  const [mobileTreeOpen, setMobileTreeOpen] = useState(false);
-  const [mobileHistoryOpen, setMobileHistoryOpen] = useState(false);
+  // 窄屏三选一视图：编辑器（默认）/ 目录 / Git 历史。
+  const [mobilePane, setMobilePane] = useState<"editor" | "tree" | "git">("editor");
   // 保存/删除会让右栏 git 历史重新拉取（contentId 不变时也需要）。
   const [historyKey, setHistoryKey] = useState(0);
 
@@ -213,10 +213,12 @@ export function ContentsView() {
 
   function editFromTree(item: Content) {
     edit(item);
-    setMobileTreeOpen(false);
+    // 从目录打开文件后回到编辑器视图。
+    setMobilePane("editor");
   }
 
   function newContent() {
+    setMobilePane("editor");
     setContentId(null);
     setSlug("");
     setFormat("markdown");
@@ -233,35 +235,29 @@ export function ContentsView() {
       {error && <p className="error">{error}</p>}
       {notice && <p className="notice">{notice}</p>}
 
-      <div className="contents-mobile-toggle-row">
-        <button
-          className="contents-mobile-toggle contents-tree-toggle"
-          type="button"
-          onClick={() => {
-            setMobileTreeOpen((value) => !value);
-            setMobileHistoryOpen(false);
-          }}
-        >
-          {mobileTreeOpen ? "编辑器" : "目录"}
-        </button>
-        <button
-          className="contents-mobile-toggle contents-history-toggle"
-          type="button"
-          aria-expanded={mobileHistoryOpen}
-          onClick={() => {
-            setMobileHistoryOpen((value) => !value);
-            setMobileTreeOpen(false);
-          }}
-        >
-          {mobileHistoryOpen ? "收起历史" : "版本历史"}
-        </button>
+      {/* 窄屏选项卡：一次只显示一个视图，默认编辑器；宽屏三栏同屏不显示。 */}
+      <div className="contents-mobile-tabs" role="tablist" aria-label="内容视图">
+        {(
+          [
+            ["editor", "编辑器"],
+            ["tree", "目录"],
+            ["git", "Git"],
+          ] as const
+        ).map(([pane, label]) => (
+          <button
+            key={pane}
+            type="button"
+            role="tab"
+            aria-selected={mobilePane === pane}
+            className={mobilePane === pane ? "active" : ""}
+            onClick={() => setMobilePane(pane)}
+          >
+            {label}
+          </button>
+        ))}
       </div>
 
-      <div
-        className={`contents-layout ${mobileTreeOpen ? "show-tree" : ""} ${
-          mobileHistoryOpen ? "show-history" : ""
-        }`}
-      >
+      <div className="contents-layout" data-pane={mobilePane}>
         <aside className="contents-tree">
           <div className="contents-tree-head">
             <div>

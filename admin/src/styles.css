@@ -2217,19 +2217,30 @@ code,
 }
 
 /* ---------- content URL tree ---------- */
-.contents-mobile-toggle-row {
+/* 窄屏三选一选项卡：编辑器 / 目录 / Git；宽屏三栏同屏，不显示。 */
+.contents-mobile-tabs {
   display: none;
-  justify-content: flex-end;
+  gap: 0.3rem;
   margin: -0.2rem 0 0.8rem;
+  padding: 0.25rem;
+  background: var(--panel-soft);
+  border: 1px solid var(--border);
+  border-radius: 11px;
 }
-
-.contents-mobile-toggle {
+.contents-mobile-tabs > button {
+  flex: 1;
   min-height: 2.2rem;
-  padding: 0.35rem 0.75rem;
+  padding: 0.35rem 0.5rem;
+  color: var(--muted);
+  background: transparent;
+  border-color: transparent;
+  font-size: 0.8rem;
+}
+.contents-mobile-tabs > button.active {
   color: var(--accent);
   background: var(--accent-soft);
   border-color: color-mix(in srgb, var(--accent) 22%, transparent);
-  font-size: 0.8rem;
+  font-weight: 600;
 }
 
 .contents-layout {
@@ -2484,24 +2495,25 @@ code,
     grid-template-columns: minmax(220px, 270px) minmax(0, 1fr);
   }
 
+  /* 右栏隐藏后，用选项卡在三个视图之间切换。 */
+  .contents-mobile-tabs {
+    display: flex;
+  }
   .contents-aux {
     display: none;
   }
 
-  /* 右栏已隐藏：按钮行随之出现，让用户能展开版本历史。 */
-  .contents-mobile-toggle-row {
-    display: flex;
-  }
-  /* 这一档目录仍可见，先隐藏「目录」按钮，只留「版本历史」。 */
-  .contents-tree-toggle {
+  /* 选「目录」或「Git」时让出编辑器位置；「编辑器」是默认视图。 */
+  .contents-layout[data-pane="tree"] .contents-main,
+  .contents-layout[data-pane="git"] .contents-main {
     display: none;
   }
-  /* 与 show-tree 同样的互斥视图：显示历史就隐藏编辑器。 */
-  .contents-layout.show-history .contents-aux {
+  .contents-layout[data-pane="git"] .contents-tree {
+    display: none;
+  }
+  .contents-layout[data-pane="git"] .contents-aux {
     display: block;
-  }
-  .contents-layout.show-history .contents-main {
-    display: none;
+    grid-column: 1 / -1;
   }
 }
 
@@ -2510,24 +2522,17 @@ code,
     grid-template-columns: 1fr;
   }
 
-  /* 目录被隐藏，「目录」按钮恢复；两个按钮互斥切换三个视图。 */
-  .contents-tree-toggle {
-    display: inline-flex;
-  }
-
+  /* 单列：目录默认隐藏，选中「目录」时完整显示（取消 sticky/高度限制）。 */
   .contents-tree {
     display: none;
     position: static;
     max-height: none;
   }
-
-  .contents-layout.show-tree .contents-tree {
+  .contents-layout[data-pane="tree"] .contents-tree {
     display: block;
   }
-
-  .contents-layout.show-tree .contents-main,
-  .contents-layout.show-history .contents-main {
-    display: none;
+  .contents-layout[data-pane="git"] .contents-aux {
+    grid-column: auto;
   }
 }
 
@@ -3176,19 +3181,13 @@ code,
   cursor: pointer;
 }
 
-/* ---------- 窄屏版本历史：与「目录」同构的互斥视图 ---------- */
-/* 两个按钮共用一行，互斥切换（见 ContentsView 的 setMobile*Open）。 */
-.contents-history-toggle {
-  margin-left: 0.5rem;
-}
-
-/* 展开历史时取消右栏的高度/滚动限制，和目录 tree 取消 sticky/max-height 一致。
-   show-history 只由窄屏按钮触发，宽屏永不激活，因此不需要媒体查询。 */
-.contents-layout.show-history .contents-aux {
+/* 选中 Git 时取消右栏的高度/滚动限制，与目录 tree 取消 sticky/max-height 一致。
+   data-pane="git" 只由窄屏选项卡触发，宽屏恒为 editor。 */
+.contents-layout[data-pane="git"] .contents-aux {
   position: static;
   min-height: 0;
 }
-.contents-layout.show-history .revision-panel {
+.contents-layout[data-pane="git"] .revision-panel {
   max-height: none;
   overflow: visible;
 }
