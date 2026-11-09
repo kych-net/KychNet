@@ -2726,8 +2726,28 @@ code,
 }
 
 .project-files-panel,
-.project-discussion-panel {
+.project-discussion-panel,
+.project-workflow-panel {
   min-width: 0;
+}
+
+.project-workflow-panel {
+  padding: 1.15rem;
+  overflow-x: auto;
+}
+
+.project-workflow-panel > .row {
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.project-workflow-panel h4 {
+  margin: 1.25rem 0 0.5rem;
+}
+
+.project-workflow-panel table {
+  width: 100%;
 }
 
 .project-overview .file-toolbar {
@@ -3119,4 +3139,21 @@ code,
   .project-topbar .project-head-actions {
     width: 100%;
   }
+}
+
+/* 已归档项目:可在项目详情里取消归档或永久删除 */
+.pill-archived {
+  flex: 0 0 auto;
+  color: var(--muted);
+  background: transparent;
+  border-color: color-mix(in srgb, var(--muted) 35%, transparent);
+}
+.project-archive-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0 0 0.6rem;
+  color: var(--muted);
+  font-size: 0.85rem;
+  cursor: pointer;
 }

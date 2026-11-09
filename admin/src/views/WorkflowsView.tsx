@@ -1,64 +1,64 @@
 import { useEffect, useState } from "react";
-import { api, Project, WorkflowItem, WorkflowRun, WorkflowRunner } from "../api";
+import { api, WorkflowItem, WorkflowRun } from "../api";
 
 function fmt(value: string | null): string {
   return value ? new Date(value).toLocaleString() : "—";
 }
 
-export function WorkflowsView() {
-  const [projects, setProjects] = useState<Project[]>([]);
-  const [projectId, setProjectId] = useState("");
+type Props = {
+  projectId: string;
+  projectSlug: string;
+};
+
+/**
+ * 项目级工作流面板。工作流定义与运行记录都属于项目，因此由 ProjectsView
+ * 传入当前选中的项目，不再自带项目选择器，也不会一次加载全部项目的数据。
+ * 执行器是站点级资源，放在独立的 RunnersView 中管理。
+ */
+export function ProjectWorkflowsPanel({ projectId, projectSlug }: Props) {
   const [workflowDir, setWorkflowDir] = useState("");
   const [items, setItems] = useState<WorkflowItem[]>([]);
   const [runs, setRuns] = useState<WorkflowRun[]>([]);
-  const [runners, setRunners] = useState<WorkflowRunner[]>([]);
-  const [runnerName, setRunnerName] = useState("");
-  const [code, setCode] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [refreshKey, setRefreshKey] = useState(0);
 
   useEffect(() => {
-    api
-      .projects()
-      .then((result) => {
-        setProjects(result.items);
-        if (result.items[0]) setProjectId(result.items[0].id);
-      })
-      .catch((e) => setError((e as Error).message));
-    void loadRunners();
-  }, []);
-
-  useEffect(() => {
-    if (projectId) void loadProject(projectId);
-  }, [projectId]);
-
-  async function loadProject(id: string) {
+    let cancelled = false;
     setError("");
-    try {
-      const [wf, runResult] = await Promise.all([api.projectWorkflows(id), api.projectRuns(id)]);
-      setWorkflowDir(wf.workflow_dir);
-      setItems(wf.items);
-      setRuns(runResult.items);
-    } catch (e) {
-      setError((e as Error).message);
-    }
-  }
-
-  async function loadRunners() {
-    try {
-      setRunners((await api.runners()).items);
-    } catch {
-      // 非管理员或其他加载失败不阻塞工作流列表。
-    }
-  }
+    setNotice("");
+    setWorkflowDir("");
+    setItems([]);
+    setRuns([]);
+    if (!projectId) return;
+    (async () => {
+      try {
+        // 只请求当前项目的工作流与运行记录。
+        const [wf, runResult] = await Promise.all([
+          api.projectWorkflows(projectId),
+          api.projectRuns(projectId),
+        ]);
+        if (cancelled) return;
+        setWorkflowDir(wf.workflow_dir);
+        setItems(wf.items);
+        setRuns(runResult.items);
+      } catch (e) {
+        if (!cancelled) setError((e as Error).message);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, refreshKey]);
 
   async function toggle(item: WorkflowItem) {
     if (!projectId) return;
+    setError("");
     setNotice("");
     try {
       await api.setProjectWorkflow(projectId, item.path, !item.enabled);
       setNotice(item.enabled ? "已停用工作流" : "已启用工作流");
-      await loadProject(projectId);
+      setRefreshKey((key) => key + 1);
     } catch (e) {
       setError((e as Error).message);
     }
@@ -66,60 +66,34 @@ export function WorkflowsView() {
 
   async function dispatch() {
     if (!projectId) return;
+    setError("");
     setNotice("");
     try {
       await api.dispatchProjectWorkflow(projectId);
       setNotice("已排入手动执行事件，稍后刷新运行记录");
-      setTimeout(() => void loadProject(projectId), 1200);
-    } catch (e) {
-      setError((e as Error).message);
-    }
-  }
-
-  async function registerRunner(event: React.FormEvent) {
-    event.preventDefault();
-    setCode("");
-    try {
-      const result = await api.createRunner(runnerName, []);
-      setCode(result.registration_code);
-      setRunnerName("");
-      setNotice("注册码只显示一次，请立即交给 kychrunner");
-      await loadRunners();
-    } catch (e) {
-      setError((e as Error).message);
-    }
-  }
-
-  async function toggleRunner(runner: WorkflowRunner) {
-    try {
-      await api.setRunnerEnabled(runner.id, !runner.enabled);
-      await loadRunners();
+      window.setTimeout(() => setRefreshKey((key) => key + 1), 1200);
     } catch (e) {
       setError((e as Error).message);
     }
   }
 
   return (
-    <section>
-      <h2>工作流</h2>
-      {error && <p className="error">{error}</p>}
-      {notice && <p className="notice">{notice}</p>}
+    <div className="project-workflow-panel">
       <div className="row">
-        <label>
-          项目
-          <select value={projectId} onChange={(e) => setProjectId(e.target.value)}>
-            {projects.map((project) => (
-              <option key={project.id} value={project.id}>
-                {project.slug}
-              </option>
-            ))}
-          </select>
-        </label>
+        <p className="hint">
+          项目 <strong>{projectSlug}</strong> 的工作流目录：
+          <code>{workflowDir || "—"}</code>
+        </p>
         <button type="button" onClick={dispatch} disabled={!projectId}>
           手动触发一次
         </button>
+        <button type="button" onClick={() => setRefreshKey((key) => key + 1)} disabled={!projectId}>
+          刷新
+        </button>
       </div>
-      <p className="hint">工作流目录：<code>{workflowDir || "—"}</code></p>
+      {error && <p className="error">{error}</p>}
+      {notice && <p className="notice">{notice}</p>}
+      <h4>工作流定义</h4>
       <table>
         <thead>
           <tr><th>定义</th><th>状态</th><th /></tr>
@@ -136,7 +110,7 @@ export function WorkflowsView() {
         </tbody>
       </table>
 
-      <h3>最近运行</h3>
+      <h4>最近运行</h4>
       <table>
         <thead><tr><th>工作流</th><th>事件</th><th>状态</th><th>创建时间</th></tr></thead>
         <tbody>
@@ -151,30 +125,6 @@ export function WorkflowsView() {
           {runs.length === 0 && <tr><td colSpan={4}>暂无运行记录。</td></tr>}
         </tbody>
       </table>
-
-      <h3>执行器</h3>
-      <form className="row" onSubmit={registerRunner}>
-        <label>
-          名称
-          <input value={runnerName} onChange={(e) => setRunnerName(e.target.value)} required placeholder="runner-1" />
-        </label>
-        <button type="submit">生成注册码</button>
-      </form>
-      {code && <p className="notice">注册码（只显示一次）：<code>{code}</code></p>}
-      <table>
-        <thead><tr><th>名称</th><th>协议</th><th>在线</th><th /></tr></thead>
-        <tbody>
-          {runners.map((runner) => (
-            <tr key={runner.id}>
-              <td>{runner.name}</td>
-              <td>v{runner.protocol_version}</td>
-              <td>{runner.last_seen_at ? fmt(runner.last_seen_at) : "从未"}</td>
-              <td><button type="button" onClick={() => toggleRunner(runner)}>{runner.enabled ? "禁用" : "启用"}</button></td>
-            </tr>
-          ))}
-          {runners.length === 0 && <tr><td colSpan={4}>暂无执行器。</td></tr>}
-        </tbody>
-      </table>
-    </section>
+    </div>
   );
 }

@@ -18,6 +18,64 @@ use crate::models::User;
 /// 项目在内容站的固定命名空间。
 pub const PROJECT_NAMESPACE: &str = "项目";
 
+/// 项目图标的候选文件名（按优先级），放在项目根目录即可被站点识别。
+/// `.svg.txt` 用于兼容平台把 `.svg` 当作内容格式生成页面的行为：仓库里
+/// 存成纯文本，构建时仍以 `.svg` 输出，不会被编译成 `.html` 页面。
+pub const PROJECT_ICON_FILES: &[&str] = &[
+    "图标.svg",
+    "favicon.svg",
+    "logo.svg",
+    "图标.svg.txt",
+    "favicon.svg.txt",
+    "logo.svg.txt",
+];
+
+/// 项目图标在内容站的固定输出名。
+pub const PROJECT_ICON_ASSET: &str = "icon.svg";
+
+/// 从项目默认分支的文件快照里挑出自定义图标（第一个存在的候选）。
+pub fn project_icon_source<'a>(
+    files: &'a BTreeMap<String, Vec<u8>>,
+) -> Option<(&'a str, &'a Vec<u8>)> {
+    for name in PROJECT_ICON_FILES {
+        if let Some(data) = files.get(*name) {
+            if is_text(data) && !lfs::is_pointer(data) {
+                return Some((*name, data));
+            }
+        }
+    }
+    None
+}
+
+/// 没有自定义图标时按项目名生成一个确定性的字母图标。
+/// 项目页面与 `/git/<项目>/icon.svg` 都用它，避免回退到站点默认蓝块图标。
+pub fn project_icon_svg(slug: &str) -> String {
+    let mut hash: u32 = 2_166_136_261;
+    for byte in slug.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(16_777_619);
+    }
+    const PALETTE: &[&str] = &[
+        "#7c3aed", "#db2777", "#dc2626", "#ea580c", "#ca8a04", "#16a34a",
+        "#0891b2", "#4f46e5", "#0d9488", "#be123c", "#4338ca", "#b45309",
+    ];
+    let color = PALETTE[(hash as usize) % PALETTE.len()];
+    let escaped = match slug.chars().next().unwrap_or('?') {
+        '&' => "&amp;".to_string(),
+        '<' => "&lt;".to_string(),
+        '>' => "&gt;".to_string(),
+        '"' => "&quot;".to_string(),
+        '\'' => "&apos;".to_string(),
+        other => other.to_string(),
+    };
+    format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 64 64\">\
+<rect width=\"64\" height=\"64\" rx=\"14\" fill=\"{color}\"/>\
+<text x=\"32\" y=\"45\" text-anchor=\"middle\" font-family=\"system-ui, sans-serif\" font-size=\"34\" font-weight=\"700\" fill=\"#ffffff\">{escaped}</text>\
+</svg>\n"
+    )
+}
+
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct Project {
     pub id: Uuid,
@@ -294,12 +352,15 @@ pub async fn create_project(
     Ok(project)
 }
 
-pub async fn list_projects(pool: &PgPool) -> Result<Vec<Project>> {
-    Ok(sqlx::query_as::<_, Project>(
-        "SELECT * FROM projects WHERE archived_at IS NULL ORDER BY updated_at DESC",
-    )
-    .fetch_all(pool)
-    .await?)
+/// include_archived 为 true 时把已归档项目一并返回(管理台用于删除/取消归档);
+/// 静态构建与 MCP 默认只看未归档项目。
+pub async fn list_projects(pool: &PgPool, include_archived: bool) -> Result<Vec<Project>> {
+    let sql = if include_archived {
+        "SELECT * FROM projects ORDER BY archived_at IS NOT NULL, updated_at DESC"
+    } else {
+        "SELECT * FROM projects WHERE archived_at IS NULL ORDER BY updated_at DESC"
+    };
+    Ok(sqlx::query_as::<_, Project>(sql).fetch_all(pool).await?)
 }
 
 pub async fn get_project(pool: &PgPool, id: Uuid) -> Result<Option<Project>> {
@@ -335,6 +396,31 @@ pub async fn archive_project(pool: &PgPool, id: Uuid) -> Result<()> {
         .bind(id)
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+/// 取消归档,让项目重新出现在列表、Git 通道与站点构建中。
+pub async fn unarchive_project(pool: &PgPool, id: Uuid) -> Result<()> {
+    sqlx::query("UPDATE projects SET archived_at = NULL, updated_at = now() WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// 永久删除项目。projects 的所有关联表(对象、提交、refs、分支、PR、讨论、
+/// LFS 索引等)都带 ON DELETE CASCADE,一个事务即可清空数据库侧数据。
+/// 磁盘上的 LFS 文件由 API 层按 <LFS_ROOT>/<id>/ 整个目录移除。
+pub async fn delete_project(pool: &PgPool, id: Uuid) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    let removed = sqlx::query("DELETE FROM projects WHERE id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    if removed.rows_affected() == 0 {
+        bail!("项目不存在");
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -1088,7 +1174,7 @@ pub struct ProjectSnapshot {
 }
 
 pub async fn snapshots(pool: &PgPool) -> Result<Vec<ProjectSnapshot>> {
-    let projects = list_projects(pool).await?;
+    let projects = list_projects(pool, false).await?;
     let mut conn = pool.acquire().await?;
     let mut snapshots = Vec::new();
     for project in projects {

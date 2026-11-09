@@ -19,6 +19,8 @@ struct IndexTemplate {
     posts: Vec<PostLink>,
     tree: String,
     styles: Vec<String>,
+    /// 项目页专属图标；为空时 layout 回退站点默认图标。
+    icon: String,
 }
 
 struct PostLink {
@@ -38,6 +40,8 @@ struct PageTemplate {
     pdf_url: String,
     tree: String,
     styles: Vec<String>,
+    /// 项目页专属图标；为空时 layout 回退站点默认图标。
+    icon: String,
 }
 
 /// 一篇已经渲染完成的页面，先留在内存里，等全部成功后再统一落盘。
@@ -364,6 +368,19 @@ fn project_style_base(slug: &str) -> Option<&str> {
     Some(slug.rsplit_once('/').map(|(base, _)| base).unwrap_or(slug))
 }
 
+/// 项目页面使用所属项目的图标；普通内容页返回空串，由 layout 回退站点图标。
+/// 每个项目在构建时都会生成一个图标（自定义文件或按项目名生成的字母图标），
+/// 因此项目页不会再显示为站点默认蓝块。
+fn project_icon_href(slug: &str, icons: &HashMap<String, String>) -> String {
+    let mut parts = slug.splitn(3, '/');
+    let namespace = parts.next().unwrap_or_default();
+    let project = parts.next().unwrap_or_default();
+    if namespace != crate::project::PROJECT_NAMESPACE || project.is_empty() {
+        return String::new();
+    }
+    icons.get(project).cloned().unwrap_or_default()
+}
+
 
 
 const STATIC_FILES: &[(&str, &[u8])] = &[
@@ -532,6 +549,8 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
     let mut project_assets = Vec::new();
     let mut project_typst: HashMap<String, (HashMap<String, Vec<u8>>, String)> = HashMap::new();
     let mut project_links = Vec::new();
+    /// 项目 slug -> 图标 URL（/项目/<slug>/icon.svg）。
+    let mut project_icons: HashMap<String, String> = HashMap::new();
     let mut seen_slugs: HashSet<String> = contents.iter().map(|item| item.slug.clone()).collect();
 
     for snapshot in &snapshots {
@@ -540,7 +559,27 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
             .iter()
             .map(|(path, data)| (path.clone(), data.clone()))
             .collect();
+        // 项目图标：优先用仓库根目录的自定义 SVG，否则按项目名生成字母图标。
+        // 输出成固定的 icon.svg，供项目页面 <link rel="icon"> 使用。
+        let icon_href = format!(
+            "/{}",
+            project_asset_slug(&snapshot.project.slug, crate::project::PROJECT_ICON_ASSET)
+        );
+        let icon_data = match crate::project::project_icon_source(&snapshot.files) {
+            Some((_, data)) => data.clone(),
+            None => crate::project::project_icon_svg(&snapshot.project.slug).into_bytes(),
+        };
+        project_assets.push((
+            project_asset_slug(&snapshot.project.slug, crate::project::PROJECT_ICON_ASSET),
+            icon_data,
+        ));
+        project_icons.insert(snapshot.project.slug.clone(), icon_href);
+
         for (path, data) in &snapshot.files {
+            // 图标源文件只作为资源输出，不再编译成 .html 页面。
+            if crate::project::PROJECT_ICON_FILES.contains(&path.as_str()) {
+                continue;
+            }
             if crate::git::lfs::is_pointer(data) {
                 tracing::warn!(
                     project = %snapshot.project.slug,
@@ -682,6 +721,7 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
         } else {
             String::new()
         };
+        let icon = project_icon_href(&content.slug, &project_icons);
         let page = PageTemplate {
             site: settings.clone(),
             admin_url: cfg.admin_origin.clone(),
@@ -691,6 +731,7 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
             pdf_url,
             tree: tree_html.clone(),
             styles,
+            icon,
         };
         let html = match page.render() {
             Ok(value) => value,
@@ -721,6 +762,7 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
             posts: project_links,
             tree: tree_html.clone(),
             styles: Vec::new(),
+            icon: String::new(),
         }
         .render()?;
         pages.push(BuiltPage {
@@ -756,6 +798,7 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
                 posts: links,
                 tree: tree_html.clone(),
                 styles: Vec::new(),
+                icon: String::new(),
             }
             .render()?,
         )
@@ -913,6 +956,7 @@ pub async fn run_one(
         pdf_url,
         tree: tree_html,
         styles,
+        icon: String::new(),
     }
     .render()?;
 
@@ -1039,6 +1083,7 @@ mod tests {
             }],
             tree: tree.clone(),
             styles: Vec::new(),
+            icon: String::new(),
         };
         let html = index.render().unwrap();
         assert!(html.contains("第一篇"));
@@ -1053,6 +1098,7 @@ mod tests {
             pdf_url: "/demo.pdf".into(),
             tree,
             styles: Vec::new(),
+            icon: String::new(),
         };
         let html = page.render().unwrap();
         assert!(html.contains("<p>正文</p>"));

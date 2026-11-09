@@ -14,6 +14,7 @@ import {
   PullRequest,
 } from "../api";
 import { CodeEditor } from "../components/CodeEditor";
+import { ProjectWorkflowsPanel } from "./WorkflowsView";
 
 function formatForPath(path: string): ContentFormat {
   const extension = path.split(".").pop()?.toLowerCase();
@@ -110,8 +111,9 @@ function DiffList({ files }: { files: PrDetail["files"] }) {
   );
 }
 
-export function ProjectsView() {
+export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
   const [projects, setProjects] = useState<Project[]>([]);
+  const [showArchived, setShowArchived] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
@@ -133,7 +135,7 @@ export function ProjectsView() {
   const [newSlug, setNewSlug] = useState("");
   const [newDescription, setNewDescription] = useState("");
 
-  const [middleTab, setMiddleTab] = useState<"files" | "discussions">("files");
+  const [middleTab, setMiddleTab] = useState<"files" | "discussions" | "workflows">("files");
   const [rightTab, setRightTab] = useState<"history" | "prs">("history");
 
   const [commits, setCommits] = useState<CommitSummary[]>([]);
@@ -161,11 +163,12 @@ export function ProjectsView() {
 
   useEffect(() => {
     void refreshProjects();
-  }, []);
+    // refreshProjects 每次渲染重建,showArchived 变化时重新拉取列表
+  }, [showArchived]);
 
   async function refreshProjects() {
     try {
-      const result = await api.projects();
+      const result = await api.projects(showArchived);
       setProjects(result.items);
     } catch (e) {
       setError((e as Error).message);
@@ -218,10 +221,11 @@ export function ProjectsView() {
     }
   }
 
-  function switchMiddleTab(next: "files" | "discussions") {
+  function switchMiddleTab(next: "files" | "discussions" | "workflows") {
     setMiddleTab(next);
     setError("");
     setNotice("");
+    // 工作流面板按 projectId 自行加载，这里只负责切换。
     if (!selected || next !== "discussions") return;
     void loadDiscussions(selected).catch((e) => setError((e as Error).message));
   }
@@ -691,6 +695,37 @@ export function ProjectsView() {
     }
   }
 
+  async function unarchiveProject() {
+    if (!selected) return;
+    try {
+      const result = await api.updateProject(selected.id, { archived: false });
+      setSelected(result.item);
+      setNotice("已取消归档，项目重新出现在站点中");
+      await refreshProjects();
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
+  async function deleteProject() {
+    if (!selected) return;
+    const slug = selected.slug;
+    const typed = window.prompt(
+      `永久删除项目「${slug}」？全部提交、文件、PR 与 LFS 对象都会被删除，且不可恢复。\n请输入项目名 ${slug} 确认：`,
+    );
+    if (typed !== slug) return;
+    try {
+      await api.deleteProject(selected.id);
+      setSelected(null);
+      setItems([]);
+      setFile(null);
+      setNotice(`项目「${slug}」已删除`);
+      await refreshProjects();
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
   const crumbs = dir ? dir.split("/") : [];
 
   return (
@@ -720,9 +755,20 @@ export function ProjectsView() {
             <button type="button" onClick={() => void editProject()}>
               编辑信息
             </button>
-            <button type="button" className="danger-text" onClick={() => void archiveProject()}>
-              归档
-            </button>
+            {selected.archived_at ? (
+              <>
+                <button type="button" onClick={() => void unarchiveProject()}>
+                  取消归档
+                </button>
+                <button type="button" className="danger-text" onClick={() => void deleteProject()}>
+                  删除
+                </button>
+              </>
+            ) : (
+              <button type="button" className="danger-text" onClick={() => void archiveProject()}>
+                归档
+              </button>
+            )}
           </div>
         </div>
       )}
@@ -736,6 +782,14 @@ export function ProjectsView() {
             </div>
             <span className="project-count">{projects.length}</span>
           </div>
+          <label className="project-archive-toggle">
+            <input
+              type="checkbox"
+              checked={showArchived}
+              onChange={(e) => setShowArchived(e.target.checked)}
+            />
+            显示已归档项目
+          </label>
           <button
             type="button"
             className="project-new-button"
@@ -785,6 +839,7 @@ export function ProjectsView() {
                     <strong>{project.slug}</strong>
                     {project.description && <small>{project.description}</small>}
                   </span>
+                  {project.archived_at && <span className="pill pill-archived">已归档</span>}
                   <span className="project-chevron" aria-hidden="true">›</span>
                 </button>
               </li>
@@ -821,6 +876,15 @@ export function ProjectsView() {
                 >
                   讨论
                 </button>
+                {isAdmin && (
+                  <button
+                    type="button"
+                    className={middleTab === "workflows" ? "active" : ""}
+                    onClick={() => switchMiddleTab("workflows")}
+                  >
+                    工作流
+                  </button>
+                )}
               </div>
               {middleTab === "files" && (
                 <div className="project-files-panel">
@@ -1075,6 +1139,13 @@ export function ProjectsView() {
                   </div>
                 </div>
                 </div>
+              )}
+              {middleTab === "workflows" && isAdmin && selected && (
+                <ProjectWorkflowsPanel
+                  key={selected.id}
+                  projectId={selected.id}
+                  projectSlug={selected.slug}
+                />
               )}
             </div>
             <div className="project-git">
