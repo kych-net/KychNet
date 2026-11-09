@@ -2969,7 +2969,13 @@ async fn git_http_post(
                 {
                     git_plain(StatusCode::BAD_REQUEST, &error.to_string())
                 }
-                Err(error) => git_plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+                // 协商进入 packfile 阶段后客户端只认 pkt-line；回 HTTP 500 的话
+                // git 只能报「expected packfile to be sent after 'ready'」这种
+                // 谜语。改走 ERR pkt-line，客户端原样显示真实原因。
+                Err(error) => git_binary(
+                    "application/x-git-upload-pack-result",
+                    git_error_pkt(&error.to_string()),
+                ),
             }
         }
         "git-receive-pack" => git_receive(&state, &project, &headers, &session, &body).await,
@@ -3011,6 +3017,21 @@ async fn git_http_put(
     }
 }
 
+/// 把服务端错误包装成 pkt-line `ERR ...`。v0/v2 客户端都会以
+/// `remote: <msg>` 原样展示，而不是把 HTTP 500 报成协议级谜语。
+/// 消息限长，避免异常链把 pkt 撑爆。
+fn git_error_pkt(message: &str) -> Vec<u8> {
+    let one_line = message.lines().collect::<Vec<_>>().join("; ");
+    let truncated = if one_line.len() > 512 {
+        format!("{}…", &one_line[..512])
+    } else {
+        one_line
+    };
+    let mut out = crate::git::proto::pkt_str(&format!("ERR {truncated}\n"));
+    out.extend(crate::git::proto::flush());
+    out
+}
+
 async fn git_receive(
     state: &AppState,
     project: &crate::project::Project,
@@ -3032,7 +3053,14 @@ async fn git_receive(
         {
             return git_plain(StatusCode::BAD_REQUEST, &error.to_string())
         }
-        Err(error) => return git_plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+        // push 阶段同理：客户端已在等 receive-pack result，回 500 只会变成
+        // 「fatal: the remote end hung up」之类谜语；ERR pkt-line 可见。
+        Err(error) => {
+            return git_binary(
+                "application/x-git-receive-pack-result",
+                git_error_pkt(&format!("推送被服务端拒绝：{error}")),
+            )
+        }
     };
     // 事件已在 receive_pack 的事务里入队，分发器负责触发内置 site.build；
     // push 响应不等构建，构建失败也不影响已提交的 refs（修掉原来的静默丢更新）。
