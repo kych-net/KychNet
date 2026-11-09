@@ -94,7 +94,7 @@ impl ContentFormat {
         }
     }
 
-    /// 源文件扩展名；三种格式最终都输出 `.html`。
+    /// 源文件扩展名。页面类格式最终输出 `.html`，CSS / SVG 作为静态资源原样输出。
     pub fn extension(self) -> &'static str {
         match self {
             Self::Markdown => ".md",
