@@ -7,8 +7,8 @@
 //!   写操作仍走 service/project 层的路径校验，并在写入后触发构建；
 //! - **鉴权**：标准 MCP OAuth 2.1，`src/oauth.rs` 提供发现、动态注册、授权码 + PKCE；
 //!   access token 存 SHA-256 哈希，短过期，refresh token 轮换；
-//! - **限流**：复用 `rate::RateLimiter`，按客户端 IP 独立计数，
-//!   防止 AI 批量拉取打爆数据库连接池；
+//! - **限流**：按客户端 IP 计数，额度记录落在 Postgres（`mcp_rate_limits`），
+//!   多实例部署时共享同一份计数，防止 AI 批量拉取打爆数据库连接池；
 //! - **不复用主应用的层**：会话（Cookie）、CORS、Origin 白名单都是给浏览器
 //!   和管理端设计的，MCP 客户端不是浏览器，merge 放在主应用 layer 之后；
 //!   鉴权由 MCP 自己完成。
@@ -38,17 +38,19 @@ use uuid::Uuid;
 
 use crate::models::{ContentFormat, SiteSettings, User};
 use crate::project;
-use crate::rate::RateLimiter;
 use crate::service;
 
-/// MCP 请求按 IP 的限流额度：每分钟 120 次。
+/// MCP 请求按 IP 的限流额度：每分钟 120 次，窗口 60 秒。
 ///
 /// MCP 客户端一次会话只发少量 JSON-RPC 请求，但 AI 循环里可能高频调工具；
 /// 120/min 对单人使用足够宽松，又能在 token 泄露时兜住批量拉取。
-const MCP_REQUESTS_PER_MINUTE: u32 = 120;
+const MCP_REQUESTS_PER_MINUTE: i32 = 120;
+const MCP_WINDOW_SECS: f64 = 60.0;
+/// 限流查询不能拖垮正常请求：超时或出错时放行，不让限流器本身变成单点。
+const MCP_LIMIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// MCP 工具层。`Clone` 是必需的：Streamable HTTP 的 service 工厂
-/// 会在（无状态模式下）每次请求时克隆一份 handler。
+/// 会为每个会话克隆一份 handler。
 #[derive(Clone)]
 pub struct KychMcp {
     pool: PgPool,
@@ -121,10 +123,19 @@ impl KychMcp {
     }
 
     async fn find_project(&self, slug: &str) -> Result<project::Project, McpError> {
-        project::find_project_by_slug(&self.pool, slug)
+        let p = project::find_project_by_slug(&self.pool, slug)
             .await
-            .map_err(internal_error)?
-            .ok_or_else(|| McpError::invalid_params(format!("项目不存在: {slug}"), None))
+            .map_err(tool_error)?
+            .ok_or_else(|| McpError::invalid_params(format!("项目不存在: {slug}"), None))?;
+        // Git/HTTP 通道的 `git_project` 已拦下归档项目，这里补齐 MCP 侧：
+        // 否则即使 `list_projects` 不再列出，直接指定 slug 仍可读写。
+        if p.archived_at.is_some() {
+            return Err(McpError::invalid_params(
+                format!("项目已归档，不能读写: {slug}"),
+                None,
+            ));
+        }
+        Ok(p)
     }
 
     /// 把用户输入的页面路径归一化成数据库里的输出路径。
@@ -150,7 +161,7 @@ impl KychMcp {
         require_scope(&parts, "content:read")?;
         let pages = service::list_published(&self.pool)
             .await
-            .map_err(internal_error)?;
+            .map_err(tool_error)?;
         let items: Vec<_> = pages
             .iter()
             .map(|page| {
@@ -181,7 +192,7 @@ impl KychMcp {
         .bind(&normalized)
         .fetch_optional(&self.pool)
         .await
-        .map_err(internal_error)?
+        .map_err(tool_error)?
         .ok_or_else(|| {
             McpError::invalid_params(format!("页面不存在或未发布: {slug}"), None)
         })?;
@@ -225,7 +236,7 @@ impl KychMcp {
         .bind(&pattern)
         .fetch_all(&self.pool)
         .await
-        .map_err(internal_error)?;
+        .map_err(tool_error)?;
 
         let items: Vec<_> = rows
             .iter()
@@ -251,13 +262,13 @@ impl KychMcp {
         require_scope(&parts, "content:read")?;
         let settings: SiteSettings = service::get_settings(&self.pool)
             .await
-            .map_err(internal_error)?;
+            .map_err(tool_error)?;
         let (published, total) = sqlx::query_as::<_, (i64, i64)>(
             "SELECT COUNT(*) FILTER (WHERE published), COUNT(*) FROM contents",
         )
         .fetch_one(&self.pool)
         .await
-        .map_err(internal_error)?;
+        .map_err(tool_error)?;
 
         Ok(text_result(
             json!({
@@ -299,7 +310,7 @@ impl KychMcp {
             "",
         )
         .await
-        .map_err(internal_error)?;
+        .map_err(tool_error)?;
         self.run_build(Some(&slug)).await?;
         Ok(text_result(json!({ "item": item, "built": true }).to_string()))
     }
@@ -321,7 +332,7 @@ impl KychMcp {
                 .bind(&slug)
                 .fetch_optional(&self.pool)
                 .await
-                .map_err(internal_error)?;
+                .map_err(tool_error)?;
         let Some((id, slug)) = row else {
             return Err(McpError::invalid_params(format!("页面不存在: {}", params.slug), None));
         };
@@ -329,7 +340,7 @@ impl KychMcp {
             .bind(id)
             .execute(&self.pool)
             .await
-            .map_err(internal_error)?;
+            .map_err(tool_error)?;
         self.run_build(Some(&slug)).await?;
         Ok(text_result(json!({ "deleted": slug }).to_string()))
     }
@@ -342,7 +353,7 @@ impl KychMcp {
         require_scope(&parts, "project:read")?;
         let projects = project::list_projects(&self.pool)
             .await
-            .map_err(internal_error)?;
+            .map_err(tool_error)?;
         Ok(text_result(json!({ "projects": projects }).to_string()))
     }
 
@@ -358,7 +369,7 @@ impl KychMcp {
         let path = params.path.unwrap_or_default();
         let items = project::list_dir(&self.pool, p.id, &branch, &path)
             .await
-            .map_err(internal_error)?;
+            .map_err(tool_error)?;
         Ok(text_result(json!({ "project": p.slug, "branch": branch, "path": path, "items": items }).to_string()))
     }
 
@@ -373,7 +384,7 @@ impl KychMcp {
         let branch = params.branch.unwrap_or_else(|| p.default_branch.clone());
         let item = project::read_file(&self.pool, p.id, &branch, &params.path)
             .await
-            .map_err(internal_error)?
+            .map_err(tool_error)?
             .ok_or_else(|| McpError::invalid_params(format!("文件不存在: {}", params.path), None))?;
         Ok(text_result(json!({ "project": p.slug, "branch": branch, "file": item }).to_string()))
     }
@@ -399,7 +410,7 @@ impl KychMcp {
             params.base_oid.as_deref(),
         )
         .await
-        .map_err(internal_error)?;
+        .map_err(tool_error)?;
         if branch == p.default_branch {
             self.run_build(None).await?;
         }
@@ -425,7 +436,7 @@ impl KychMcp {
             params.message.as_deref(),
         )
         .await
-        .map_err(internal_error)?;
+        .map_err(tool_error)?;
         if branch == p.default_branch {
             self.run_build(None).await?;
         }
@@ -542,9 +553,23 @@ fn text_result(payload: String) -> CallToolResult {
     CallToolResult::success(vec![ContentBlock::text(payload)])
 }
 
-fn internal_error(error: impl std::fmt::Display) -> McpError {
-    tracing::warn!(%error, "MCP 工具执行失败");
-    McpError::internal_error("内部错误", None)
+/// 把工具层的错误映射成 JSON-RPC 错误。
+///
+/// 口径与管理端 `ApiError::into_response` 一致：错误链里带 `sqlx::Error` /
+/// `std::io::Error` 的是底层故障，只记日志并统一回「内部错误」，避免把约束名、
+/// 绝对路径等内部细节回显给模型；其余是项目层的业务校验（非法路径、乐观锁
+/// 冲突、分支不存在……），原文对调用方是可操作的提示，必须透传。
+fn tool_error(error: impl Into<anyhow::Error>) -> McpError {
+    let error = error.into();
+    let internal = error
+        .chain()
+        .any(|cause| cause.is::<sqlx::Error>() || cause.is::<std::io::Error>());
+    if internal {
+        tracing::warn!(%error, "MCP 工具执行失败");
+        McpError::internal_error("内部错误", None)
+    } else {
+        McpError::invalid_params(error.to_string(), None)
+    }
 }
 
 /// 在正文里找第一个命中位置，返回前后各 `context` 个字符的摘要。
@@ -578,14 +603,54 @@ fn excerpt(body: &str, needle: &str, context: usize) -> String {
 #[derive(Clone)]
 struct McpGuard {
     pool: PgPool,
-    limits: RateLimiter,
     trust_proxy_headers: bool,
+}
+
+/// 消耗一次限流额度，超额返回还需等待的时间。
+///
+/// 计数落在 Postgres 而不是进程内存：线上多实例部署时 `rate::RateLimiter`
+/// 每台各自计数，会把 120/min 摊薄成 120×N/min，实测完全不触发。用一条
+/// 原子 UPSERT 让所有实例共享同一份额度。
+///
+/// 查询失败或超时时放行（fail-open）：限流器本就是为保护数据库而存在，
+/// 数据库异常时再拒绝请求只会让故障扩大。
+async fn mcp_limit(pool: &PgPool, key: &str) -> Option<Duration> {
+    let query = sqlx::query_as::<_, (i32, f64)>(
+        "INSERT INTO mcp_rate_limits (client_key, hits, window_until)
+         VALUES ($1, 1, now() + make_interval(secs => $2))
+         ON CONFLICT (client_key) DO UPDATE SET
+           hits = CASE WHEN mcp_rate_limits.window_until <= now()
+                       THEN 1 ELSE mcp_rate_limits.hits + 1 END,
+           window_until = CASE WHEN mcp_rate_limits.window_until <= now()
+                               THEN now() + make_interval(secs => $2)
+                               ELSE mcp_rate_limits.window_until END
+         RETURNING hits,
+           GREATEST(0.0::float8,
+                    EXTRACT(EPOCH FROM (window_until - now()))::float8)",
+    )
+    .bind(key)
+    .bind(MCP_WINDOW_SECS)
+    .fetch_optional(pool);
+
+    let row = match tokio::time::timeout(MCP_LIMIT_TIMEOUT, query).await {
+        Ok(Ok(row)) => row,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "MCP 限流计数失败，放行本次请求");
+            None
+        }
+        Err(_) => {
+            tracing::warn!("MCP 限流计数超时，放行本次请求");
+            None
+        }
+    }?;
+    let (hits, retry_secs) = row;
+    (hits > MCP_REQUESTS_PER_MINUTE).then(|| Duration::from_secs_f64(retry_secs))
 }
 
 /// 从请求头推导限流用的客户端 IP，口径与 `api::client_ip` 一致：
 /// 只有显式声明信任代理头时才读 `X-Forwarded-For`，否则用 TCP 对端地址。
-fn guard_ip(guard: &McpGuard, headers: &HeaderMap, peer: std::net::SocketAddr) -> String {
-    if guard.trust_proxy_headers {
+fn guard_ip(trust_proxy_headers: bool, headers: &HeaderMap, peer: std::net::SocketAddr) -> String {
+    if trust_proxy_headers {
         if let Some(value) = headers
             .get("x-forwarded-for")
             .and_then(|value| value.to_str().ok())
@@ -607,13 +672,9 @@ async fn mcp_guard(
     next: Next,
 ) -> Response {
     let headers = req.headers().clone();
-    let ip = guard_ip(&guard, &headers, peer);
+    let ip = guard_ip(guard.trust_proxy_headers, &headers, peer);
 
-    if let Some(retry_after) =
-        guard
-            .limits
-            .check(&format!("mcp:ip:{ip}"), MCP_REQUESTS_PER_MINUTE, Duration::from_secs(60))
-    {
+    if let Some(retry_after) = mcp_limit(&guard.pool, &format!("mcp:ip:{ip}")).await {
         tracing::warn!(%ip, retry_after = ?retry_after, "MCP 请求超限");
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -681,14 +742,10 @@ fn unauthorized() -> Response {
 ///
 /// 返回的 Router 自带鉴权与限流层，应 merge 到主应用 layer 链之后，
 /// 避免沾上会话、CORS、Origin 白名单这些浏览器侧的层。
-pub fn router(
-    state: KychMcp,
-    pool: PgPool,
-    limits: RateLimiter,
-    trust_proxy_headers: bool,
-) -> Router {
-    // 无状态模式（config 默认即 stateless 的新版本语义按 Default 走）：
-    // 每个请求独立处理，不做会话亲和，单实例足够。
+pub fn router(state: KychMcp, pool: PgPool, trust_proxy_headers: bool) -> Router {
+    // Streamable HTTP 是**有状态会话**：`initialize` 返回 Mcp-Session-Id，
+    // 后续请求必须带回，`DELETE /mcp` 会终止会话。LocalSessionManager 是
+    // 进程内实现，多实例部署需要会话亲和；限流已改成跨实例共享。
     // rmcp 默认只允许 localhost 的 Host 头；线上经 nginx 反代后 Host 是
     // api.kych.net / kych.net，必须显式放行，否则会得到 "Host header is not allowed"。
     let config = StreamableHttpServerConfig::default().with_allowed_hosts([
@@ -705,10 +762,29 @@ pub fn router(
     );
 
     let guard = McpGuard {
-        pool,
-        limits,
+        pool: pool.clone(),
         trust_proxy_headers,
     };
+
+    // 过期计数行定期清理，避免表随历史 IP 无限增长。
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let cleanup_pool = pool;
+        handle.spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(600));
+            ticker.tick().await; // 首轮立即触发，跳过以免启动瞬间扫表
+            loop {
+                ticker.tick().await;
+                if let Err(error) = sqlx::query(
+                    "DELETE FROM mcp_rate_limits WHERE window_until < now() - interval '1 hour'",
+                )
+                .execute(&cleanup_pool)
+                .await
+                {
+                    tracing::warn!(%error, "清理 MCP 限流记录失败");
+                }
+            }
+        });
+    }
 
     Router::new()
         .nest_service("/mcp", service)
@@ -765,5 +841,40 @@ mod tests {
         // 未识别的值按 HTML 兜底（与 models::Content::format 一致）。
         assert_eq!(ContentFormat::parse("markdown"), Some(ContentFormat::Markdown));
         assert_eq!(ContentFormat::parse("nope"), None);
+    }
+
+    #[test]
+    fn tool_error_keeps_business_messages() {
+        // 乐观锁冲突、路径校验这些提示必须原样透给调用方，才能按提示重试。
+        let err = tool_error(anyhow::anyhow!("文件已被其他人修改，请刷新后重试"));
+        assert!(err.message.contains("文件已被其他人修改"));
+        let err = tool_error(anyhow::anyhow!("非法文件路径"));
+        assert!(err.message.contains("非法文件路径"));
+    }
+
+    #[test]
+    fn tool_error_hides_low_level_details() {
+        let err = tool_error(std::io::Error::other("/var/lib/db/secret"));
+        assert_eq!(err.message, "内部错误");
+        // 被 context 包裹的底层错误同样算内部错误，不能泄漏路径。
+        let wrapped = anyhow::Error::new(std::io::Error::other("/etc/passwd"))
+            .context("写入失败");
+        let err = tool_error(wrapped);
+        assert_eq!(err.message, "内部错误");
+    }
+
+    #[test]
+    fn tool_error_hides_sql_errors_even_when_wrapped() {
+        let wrapped = anyhow::Error::new(sqlx::Error::RowNotFound).context("查询项目失败");
+        assert_eq!(tool_error(wrapped).message, "内部错误");
+    }
+
+    #[test]
+    fn guard_ip_only_trusts_forwarded_header_when_configured() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.9, 10.0.0.1".parse().unwrap());
+        let peer: std::net::SocketAddr = "192.0.2.1:1234".parse().unwrap();
+        assert_eq!(guard_ip(true, &headers, peer), "203.0.113.9");
+        assert_eq!(guard_ip(false, &headers, peer), "192.0.2.1");
     }
 }

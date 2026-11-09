@@ -1439,7 +1439,6 @@ pub async fn serve(cfg: Config) -> Result<()> {
     // MCP 路由需要的共享资源先克隆出来：state 在 with_state 时会被 move，
     // 而挂载判断要等 layer 链拼完之后才能做。
     let state_pool_for_mcp = state.pool.clone();
-    let state_limits_for_mcp = state.limits.clone();
     // 工作流模块同样要在 state 被 move 之前取出所需资源。
     let wf_pool = state.pool.clone();
     let wf_build_ctl = state.build_ctl.clone();
@@ -1607,7 +1606,6 @@ pub async fn serve(cfg: Config) -> Result<()> {
     let app = app.merge(crate::mcp::router(
         mcp_state,
         state_pool_for_mcp.clone(),
-        state_limits_for_mcp,
         cfg.trust_proxy_headers,
     ));
 
