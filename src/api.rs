@@ -77,6 +77,10 @@ pub(crate) struct AppState {
     pub(crate) build_queue: crate::workflow::queue::BuildQueue,
     /// Git LFS 二进制对象的落盘根目录。
     pub(crate) lfs_root: PathBuf,
+    /// archive 打包的并发上限。tar.gz 是同步 CPU 密集操作，必须放进
+    /// `spawn_blocking` 并限制同时进行数，否则一次突发的大仓库归档会把
+    /// Tokio worker 与 PG 连接占满，连 TLS 握手都排不上队。
+    pub(crate) archive_slots: Arc<tokio::sync::Semaphore>,
 }
 
 /// 一次构建的执行结果快照。
@@ -1359,6 +1363,13 @@ pub async fn serve(cfg: Config) -> Result<()> {
     let auth = Arc::new(Auth::new(&cfg.rp_id, &cfg.rp_origin)?);
     let build_ctl = Arc::new(BuildCtl::new(cfg.build_out_dir.clone()));
     let build_queue = crate::workflow::queue::BuildQueue::start(build_ctl.clone());
+    // 归档压缩是同步 CPU 操作：并发数按 CPU 核数封顶 4，留足 worker 给
+    // 其它请求。许可覆盖「预检 → 读工作树 → 压缩」整个阶段，避免同一时刻
+    // 有太多请求把 PG 连接池也吃满。
+    let archive_parallel = std::thread::available_parallelism()
+        .map(|n| n.get().min(4))
+        .unwrap_or(2)
+        .max(1);
     let state = AppState {
         pool,
         auth,
@@ -1369,6 +1380,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
         build_ctl: build_ctl.clone(),
         build_queue: build_queue.clone(),
         lfs_root: cfg.lfs_root.clone(),
+        archive_slots: Arc::new(tokio::sync::Semaphore::new(archive_parallel)),
     };
 
     let admin_origin: HeaderValue = cfg
@@ -2658,6 +2670,14 @@ async fn worktree_get(
             }
         }
         "archive" => {
+            // 许可覆盖预检、读工作树与压缩全过程；拿到许可的请求才允许
+            // 占用 PG 连接和阻塞线程池，其余请求在信号量为零时排队。
+            let _permit = match state.archive_slots.clone().acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    return git_plain(StatusCode::SERVICE_UNAVAILABLE, "归档服务不可用")
+                }
+            };
             if let Err(error) = crate::git::worktree::ensure_within_limit(
                 &state.pool,
                 project.id,
@@ -2685,8 +2705,20 @@ async fn worktree_get(
                     // tar 内直接是仓库相对路径，不带 code/ 前缀；打包实现与
                     // runner 快照共用一份，避免主服务出现第二份 USTAR 代码。
                     let entries: Vec<(String, Vec<u8>)> = files.into_iter().collect();
-                    let gz = match crate::workflow::snapshot::write_tar_gz(&entries) {
-                        Ok(value) => value,
+                    // gzip 压缩是同步 CPU 密集操作：放到阻塞线程池，避免
+                    // 大仓库归档把 async worker 卡住导致其它请求排队超时。
+                    let gz = match tokio::task::spawn_blocking(move || {
+                        crate::workflow::snapshot::write_tar_gz(&entries)
+                    })
+                    .await
+                    {
+                        Ok(Ok(value)) => value,
+                        Ok(Err(error)) => {
+                            return git_plain(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                &error.to_string(),
+                            )
+                        }
                         Err(error) => {
                             return git_plain(
                                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -2833,6 +2865,13 @@ async fn git_http_post(
             };
             match body {
                 Ok(data) => git_binary("application/x-git-upload-pack-result", data),
+                Err(error)
+                    if error
+                        .downcast_ref::<crate::git::proto::MalformedRequest>()
+                        .is_some() =>
+                {
+                    git_plain(StatusCode::BAD_REQUEST, &error.to_string())
+                }
                 Err(error) => git_plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
             }
         }
@@ -2888,6 +2927,14 @@ async fn git_receive(
     };
     let outcome = match crate::git::http::receive_pack(&state.pool, project, &user, body).await {
         Ok(outcome) => outcome,
+        // 畸形 pkt-line / 非法 OID 是客户端错误，不应记成 5xx。
+        Err(error)
+            if error
+                .downcast_ref::<crate::git::proto::MalformedRequest>()
+                .is_some() =>
+        {
+            return git_plain(StatusCode::BAD_REQUEST, &error.to_string())
+        }
         Err(error) => return git_plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
     // 事件已在 receive_pack 的事务里入队，分发器负责触发内置 site.build；
