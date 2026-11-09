@@ -1,0 +1,10 @@
+{% extends "oauth/base.html" %}
+{% block title %}授权 KychNet MCP{% endblock %}
+{% block body %}
+<h1>授权 KychNet MCP</h1>
+<p>已登录为 <strong>{{ username }}</strong>。</p>
+<p>客户端 <code>{{ fields.client_id }}</code> 请求以下权限：</p>
+<ul><li>读取站点内容</li><li>写入/删除站点内容</li><li>读取项目 Git 文件</li><li>写入/删除项目 Git 文件</li></ul>
+<form method="post" action="/oauth/approve"><input type="hidden" name="client_id" value="{{ fields.client_id }}"><input type="hidden" name="redirect_uri" value="{{ fields.redirect_uri }}"><input type="hidden" name="state" value="{{ fields.state }}"><input type="hidden" name="scope" value="{{ fields.scope }}"><input type="hidden" name="code_challenge" value="{{ fields.code_challenge }}"><input type="hidden" name="code_challenge_method" value="{{ fields.code_challenge_method }}"><input type="hidden" name="resource" value="{{ fields.resource }}"><input type="hidden" name="csrf" value="{{ csrf }}"><button type="submit">允许并继续</button></form>
+<p class="muted">授权后可随时通过重新登录或撤销 token 停止访问。</p>
+{% endblock %}

@@ -1,0 +1,9 @@
+{% extends "oauth/base.html" %}
+{% block title %}登录 KychNet MCP{% endblock %}
+{% block body %}
+<h1>登录 KychNet MCP</h1>
+<p class="muted">客户端正在请求访问站点。请使用管理员或成员账号登录。</p>
+{% if let Some(message) = error %}<p class="error">{{ message }}</p>{% endif %}
+<form method="post" action="/oauth/login"><input type="hidden" name="client_id" value="{{ fields.client_id }}"><input type="hidden" name="redirect_uri" value="{{ fields.redirect_uri }}"><input type="hidden" name="state" value="{{ fields.state }}"><input type="hidden" name="scope" value="{{ fields.scope }}"><input type="hidden" name="code_challenge" value="{{ fields.code_challenge }}"><input type="hidden" name="code_challenge_method" value="{{ fields.code_challenge_method }}"><input type="hidden" name="resource" value="{{ fields.resource }}"><label>用户名<input name="username" autocomplete="username" required></label><label>动态验证码<input name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" required></label><button type="submit">登录并继续</button></form>
+<p class="muted">使用通行密钥：<a href="https://m.kych.net/?{{ next }}">先在管理端登录，再返回授权</a></p>
+{% endblock %}
