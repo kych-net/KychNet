@@ -80,6 +80,7 @@ export function ContentsView() {
   const [previewError, setPreviewError] = useState("");
   const [previewLoading, setPreviewLoading] = useState(false);
   const [mobileTreeOpen, setMobileTreeOpen] = useState(false);
+  const [mobileHistoryOpen, setMobileHistoryOpen] = useState(false);
 
   useEffect(() => {
     void refresh();
@@ -229,15 +230,33 @@ export function ContentsView() {
 
       <div className="contents-mobile-toggle-row">
         <button
-          className="contents-mobile-toggle"
+          className="contents-mobile-toggle contents-tree-toggle"
           type="button"
-          onClick={() => setMobileTreeOpen((value) => !value)}
+          onClick={() => {
+            setMobileTreeOpen((value) => !value);
+            setMobileHistoryOpen(false);
+          }}
         >
           {mobileTreeOpen ? "编辑器" : "目录"}
         </button>
+        <button
+          className="contents-mobile-toggle contents-history-toggle"
+          type="button"
+          aria-expanded={mobileHistoryOpen}
+          onClick={() => {
+            setMobileHistoryOpen((value) => !value);
+            setMobileTreeOpen(false);
+          }}
+        >
+          {mobileHistoryOpen ? "收起历史" : "版本历史"}
+        </button>
       </div>
 
-      <div className={`contents-layout ${mobileTreeOpen ? "show-tree" : ""}`}>
+      <div
+        className={`contents-layout ${mobileTreeOpen ? "show-tree" : ""} ${
+          mobileHistoryOpen ? "show-history" : ""
+        }`}
+      >
         <aside className="contents-tree">
           <div className="contents-tree-head">
             <div>
@@ -350,35 +369,39 @@ export function ContentsView() {
         </div>
       </form>
 
-      <div className="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>路径</th>
-            <th>格式</th>
-            <th>状态</th>
-            <th />
-          </tr>
-        </thead>
-        <tbody>
-          {items.map((item) => (
-            <tr key={item.id}>
-              <td className="mono small">{editorPath(item)}</td>
-              <td>{item.format}</td>
-              <td>{item.published ? "已发布" : "草稿"}</td>
-              <td>
-                <button onClick={() => edit(item)}>编辑</button>
-                {item.slug === "index.html" ? (
-                  <span className="hint"> 主页不可删除</span>
-                ) : (
-                  <button onClick={() => remove(item.id)}>删除</button>
-                )}
-              </td>
+      {/* 全站清单默认收起：当前文件的 git 历史由右栏（窄屏点「版本历史」）承担。 */}
+      <details className="contents-all">
+        <summary>全部内容（{items.length}）· 编辑与删除</summary>
+        <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>路径</th>
+              <th>格式</th>
+              <th>状态</th>
+              <th />
             </tr>
-          ))}
-        </tbody>
-      </table>
-      </div>
+          </thead>
+          <tbody>
+            {items.map((item) => (
+              <tr key={item.id}>
+                <td className="mono small">{editorPath(item)}</td>
+                <td>{item.format}</td>
+                <td>{item.published ? "已发布" : "草稿"}</td>
+                <td>
+                  <button onClick={() => edit(item)}>编辑</button>
+                  {item.slug === "index.html" ? (
+                    <span className="hint"> 主页不可删除</span>
+                  ) : (
+                    <button onClick={() => remove(item.id)}>删除</button>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        </div>
+      </details>
         </div>
         <aside className="contents-aux">
           <RevisionPanel

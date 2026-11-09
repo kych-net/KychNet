@@ -2487,15 +2487,32 @@ code,
   .contents-aux {
     display: none;
   }
-}
 
-@media (max-width: 980px) {
+  /* 右栏已隐藏：按钮行随之出现，让用户能展开版本历史。 */
   .contents-mobile-toggle-row {
     display: flex;
   }
+  /* 这一档目录仍可见，先隐藏「目录」按钮，只留「版本历史」。 */
+  .contents-tree-toggle {
+    display: none;
+  }
+  /* 与 show-tree 同样的互斥视图：显示历史就隐藏编辑器。 */
+  .contents-layout.show-history .contents-aux {
+    display: block;
+  }
+  .contents-layout.show-history .contents-main {
+    display: none;
+  }
+}
 
+@media (max-width: 980px) {
   .contents-layout {
     grid-template-columns: 1fr;
+  }
+
+  /* 目录被隐藏，「目录」按钮恢复；两个按钮互斥切换三个视图。 */
+  .contents-tree-toggle {
+    display: inline-flex;
   }
 
   .contents-tree {
@@ -2508,7 +2525,8 @@ code,
     display: block;
   }
 
-  .contents-layout.show-tree .contents-main {
+  .contents-layout.show-tree .contents-main,
+  .contents-layout.show-history .contents-main {
     display: none;
   }
 }
@@ -3156,4 +3174,34 @@ code,
   color: var(--muted);
   font-size: 0.85rem;
   cursor: pointer;
+}
+
+/* ---------- 窄屏版本历史：与「目录」同构的互斥视图 ---------- */
+/* 两个按钮共用一行，互斥切换（见 ContentsView 的 setMobile*Open）。 */
+.contents-history-toggle {
+  margin-left: 0.5rem;
+}
+
+/* 展开历史时取消右栏的高度/滚动限制，和目录 tree 取消 sticky/max-height 一致。
+   show-history 只由窄屏按钮触发，宽屏永不激活，因此不需要媒体查询。 */
+.contents-layout.show-history .contents-aux {
+  position: static;
+  min-height: 0;
+}
+.contents-layout.show-history .revision-panel {
+  max-height: none;
+  overflow: visible;
+}
+
+/* 全站内容清单默认收起，保留编辑/删除入口但不占篇幅。 */
+.contents-all {
+  margin-top: 1.1rem;
+}
+.contents-all > summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+.contents-all > .table-wrap {
+  margin-top: 0.6rem;
 }
