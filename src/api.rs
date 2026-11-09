@@ -2573,6 +2573,18 @@ fn worktree_write_path(params: &HashMap<String, String>) -> std::result::Result<
     Ok(value)
 }
 
+/// runner 不得回写工作流定义目录。工作流定义恒从默认分支 head 读取，
+/// 但 runner token 本身对绑定分支的任意路径都有写权限；PR run 绑定的是
+/// 来源分支所以当前无提权，这里作为纵深防御直接封死该目录。
+fn runner_path_forbidden(auth: &WorktreeWriteAuth, project: &crate::project::Project, path: &str) -> bool {
+    if auth.allowed_ref.is_none() {
+        return false; // Git 令牌 / 登录会话不受限
+    }
+    let dir = project.workflow_dir.trim_matches('/');
+    let dir = if dir.is_empty() { ".github/workflows" } else { dir };
+    path == dir || path.starts_with(&format!("{dir}/"))
+}
+
 async fn git_http_get(
     State(state): State<AppState>,
     Path(path): Path<String>,
@@ -3091,6 +3103,9 @@ async fn worktree_put(
         Ok(value) => value,
         Err(response) => return response,
     };
+    if runner_path_forbidden(&auth, project, path) {
+        return git_plain(StatusCode::FORBIDDEN, "runner 不得回写工作流定义目录");
+    }
     let message = params.get("message").map(String::as_str);
     let base_oid = params.get("base_oid").map(String::as_str);
     let result = match crate::project::write_file_bytes(
@@ -3153,6 +3168,9 @@ async fn worktree_delete(
         Ok(value) => value,
         Err(response) => return response,
     };
+    if runner_path_forbidden(&auth, project, path) {
+        return git_plain(StatusCode::FORBIDDEN, "runner 不得回写工作流定义目录");
+    }
     let message = params.get("message").map(String::as_str);
     if let Err(error) = crate::project::delete_file(
         &state.pool,
