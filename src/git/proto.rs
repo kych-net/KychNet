@@ -7,6 +7,16 @@ use std::io::Write;
 
 use super::object::{hash_object, ObjectKind, Oid};
 
+/// 客户端请求解析失败（畸形 pkt-line、非法 OID 等）的标记类型。
+/// HTTP 层据此把错误映射成 400，而不是当成服务端故障返回 500。
+#[derive(Debug, thiserror::Error)]
+#[error("非法的 Git 请求: {0}")]
+pub struct MalformedRequest(pub String);
+
+fn malformed(error: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(MalformedRequest(error.to_string()))
+}
+
 /// 编码一条 pkt-line。长度包含 4 字节长度前缀本身。
 pub fn pkt(data: &[u8]) -> Vec<u8> {
     let mut out = format!("{:04x}", data.len() + 4).into_bytes();
@@ -46,6 +56,10 @@ pub struct V2Request {
 }
 
 pub fn parse_v2_request(data: &[u8]) -> Result<V2Request> {
+    parse_v2_request_inner(data).map_err(malformed)
+}
+
+fn parse_v2_request_inner(data: &[u8]) -> Result<V2Request> {
     let mut command = String::new();
     let mut args = Vec::new();
     let mut in_args = false;
@@ -98,6 +112,10 @@ pub struct UploadRequest {
 }
 
 pub fn parse_upload_request(data: &[u8]) -> Result<UploadRequest> {
+    parse_upload_request_inner(data).map_err(malformed)
+}
+
+fn parse_upload_request_inner(data: &[u8]) -> Result<UploadRequest> {
     let (lines, _) = parse_pkt_lines(data)?;
     let mut request = UploadRequest::default();
     for line in lines {
@@ -133,6 +151,10 @@ pub struct ReceiveRequest {
 }
 
 pub fn parse_receive_request(data: &[u8]) -> Result<ReceiveRequest> {
+    parse_receive_request_inner(data).map_err(malformed)
+}
+
+fn parse_receive_request_inner(data: &[u8]) -> Result<ReceiveRequest> {
     let (lines, mut consumed) = parse_pkt_lines(data)?;
     let mut commands = Vec::new();
     let mut capabilities = Vec::new();
@@ -712,5 +734,27 @@ mod tests {
         assert_eq!(request.deepen, Some(2));
         assert!(request.filter_blob_none);
         assert!(request.done);
+    }
+
+    #[test]
+    fn malformed_requests_are_classified_as_client_errors() {
+        // HTTP 层靠这个标记把畸形包映射成 400，不能退化成 500。
+        let errors = [
+            parse_receive_request(b"not-a-valid-pack")
+                .err()
+                .expect("畸形推送请求应解析失败"),
+            parse_upload_request(b"garbage")
+                .err()
+                .expect("畸形 upload-pack 请求应解析失败"),
+            parse_v2_request(b"bad")
+                .err()
+                .expect("畸形 v2 请求应解析失败"),
+        ];
+        for error in errors {
+            assert!(
+                error.downcast_ref::<MalformedRequest>().is_some(),
+                "未标记: {error}"
+            );
+        }
     }
 }

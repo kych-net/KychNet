@@ -386,10 +386,17 @@ export function ProjectsView() {
 
   async function mergePr() {
     if (!selected || !prDetail) return;
-    const warning = prDetail.overwrites_target
-      ? "\n\n注意：这不是快进合并。服务端会生成双亲 merge commit，并直接使用来源分支的树，" +
-        "目标分支独有的改动会被覆盖。"
-      : "";
+    // 服务端按 merge-base 做三方合并，冲突时直接拒绝；前端先拦下，
+    // 别让用户点一个注定失败、还以为会丢数据的按钮。
+    if (prDetail.conflicts?.length) {
+      setError(
+        `无法合并：以下文件在两侧都有不同改动，请先把 ${prDetail.target_branch} 合并到 ${prDetail.source_branch} 后重试：${prDetail.conflicts.join("、")}`,
+      );
+      return;
+    }
+    const warning = prDetail.is_fast_forward
+      ? ""
+      : "\n\n这不是快进合并：服务端会生成双亲 merge commit，并逐文件三方合并，两侧改动都会保留。";
     if (!window.confirm(`合并 PR #${prDetail.number} 到 ${prDetail.target_branch}？${warning}`)) {
       return;
     }
@@ -398,13 +405,10 @@ export function ProjectsView() {
     setNotice("");
     try {
       const result = await api.mergePr(selected.id, prDetail.number);
-      const suffix = result.overwrote_target
-        ? "（非快进合并，目标分支已被来源分支覆盖）"
-        : "";
       setNotice(
         result.item.target_branch === selected.default_branch
-          ? `已合并到 ${result.item.target_branch}，并触发整站编译${suffix}`
-          : `已合并到 ${result.item.target_branch}${suffix}`,
+          ? `已合并到 ${result.item.target_branch}，并触发整站编译`
+          : `已合并到 ${result.item.target_branch}`,
       );
       await loadPrs(selected);
       await openPr(prDetail.number);
@@ -1369,14 +1373,16 @@ export function ProjectsView() {
                         </div>
                         {prDetail.status === "open" && !prDetail.mergeable && (
                           <p className="hint">
-                            来源分支或目标分支不存在，无法合并。
+                            {prDetail.conflicts?.length
+                              ? `存在冲突，无法合并：${prDetail.conflicts.join("、")}。请先把 ${prDetail.target_branch} 合并到 ${prDetail.source_branch}。`
+                              : "来源分支或目标分支不存在，无法合并。"}
                           </p>
                         )}
                         {prDetail.status === "open" && prDetail.mergeable && (
                           <p className="hint">
                             {prDetail.is_fast_forward
                               ? "可以快进合并，目标分支不会丢失改动。"
-                              : "不是快进合并：会生成双亲 merge commit 并直接使用来源分支的树，目标分支独有的改动会被覆盖。"}
+                              : "不是快进合并：会生成双亲 merge commit，并逐文件三方合并，两侧改动都会保留。"}
                             {prDetail.merge_base
                               ? ` 合并基点 ${prDetail.merge_base.slice(0, 8)}。`
                               : " 两个分支没有共同历史。"}

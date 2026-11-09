@@ -206,8 +206,10 @@ export type PrDetail = PullRequest & {
   mergeable: boolean;
   /** 目标分支是否已经是来源分支的祖先。 */
   is_fast_forward: boolean;
-  /** 非快进合并会用来源分支覆盖目标分支，前端必须明确警示。 */
+  /** 保留兼容旧后端；新后端恒为 false，不再覆盖目标分支。 */
   overwrites_target: boolean;
+  /** 两侧相对合并基点都有不同改动的文件；非空时禁止合并。 */
+  conflicts: string[];
   merge_base: string | null;
   comments: PrComment[];
 };
