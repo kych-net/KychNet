@@ -3205,3 +3205,122 @@ code,
 .contents-all > .table-wrap {
   margin-top: 0.6rem;
 }
+
+/* ---------- 内容页右栏：完整版本控制面板 ---------- */
+.revision-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+}
+
+.revision-count {
+  padding: 0.05rem 0.35rem;
+  color: var(--muted);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 0.68rem;
+  font-weight: 600;
+}
+
+.revision-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.5rem;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+}
+.revision-toolbar-label,
+.revision-toolbar-arrow {
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+.revision-toolbar select {
+  flex: 1 1 4.5rem;
+  min-width: 0;
+  padding: 0.15rem 0.25rem;
+  font-size: 0.72rem;
+}
+.revision-toolbar button {
+  padding: 0.2rem 0.45rem;
+  font-size: 0.72rem;
+}
+
+.revision-quick {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+.revision-quick .hint {
+  font-size: 0.68rem;
+}
+
+.revision-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+}
+.revision-seq {
+  flex: none;
+  font-size: 0.76rem;
+  font-weight: 700;
+}
+.revision-msg {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 0.76rem;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.revision-stat {
+  flex: none;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.68rem;
+}
+.revision-stat .plus { color: #1a7f37; }
+.revision-stat .minus { color: #cf222e; }
+.revision-list li.revision-more {
+  padding: 0.25rem;
+  text-align: center;
+  background: none;
+  border: 0;
+}
+
+.revision-view-head,
+.revision-view-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+}
+.revision-blame {
+  overflow-x: auto;
+}
+.blame-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.7rem;
+}
+.blame-table td {
+  padding: 0.05rem 0.35rem;
+  border-bottom: 1px solid var(--border);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.blame-seq {
+  color: var(--accent, #1f6feb);
+  white-space: nowrap;
+}
+.blame-no {
+  color: var(--muted);
+  text-align: right;
+  white-space: nowrap;
+}

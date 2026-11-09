@@ -81,6 +81,8 @@ export function ContentsView() {
   const [previewLoading, setPreviewLoading] = useState(false);
   const [mobileTreeOpen, setMobileTreeOpen] = useState(false);
   const [mobileHistoryOpen, setMobileHistoryOpen] = useState(false);
+  // 保存/删除会让右栏 git 历史重新拉取（contentId 不变时也需要）。
+  const [historyKey, setHistoryKey] = useState(0);
 
   useEffect(() => {
     void refresh();
@@ -178,6 +180,7 @@ export function ContentsView() {
       setMessage("");
       setNotice(published ? "内容已保存，并已自动编译当前页" : "内容已保存（草稿，暂不生成页面）");
       await refresh();
+      setHistoryKey((value) => value + 1);
     } catch (e) {
       setError((e as Error).message);
     }
@@ -186,7 +189,9 @@ export function ContentsView() {
   async function remove(id: string) {
     try {
       await api.deleteContent(id);
+      if (id === contentId) newContent();
       await refresh();
+      setHistoryKey((value) => value + 1);
     } catch (e) {
       setError((e as Error).message);
     }
@@ -406,6 +411,7 @@ export function ContentsView() {
         <aside className="contents-aux">
           <RevisionPanel
             contentId={contentId}
+            refreshKey={historyKey}
             onReverted={(item) => {
               // 回滚是移动指针：编辑器同步显示回滚后的正文与格式。
               setContentId(item.id);
@@ -414,6 +420,7 @@ export function ContentsView() {
               setBody(item.body);
               setPublished(item.published);
               setNotice(`已回滚到版本 ${item.rev_seq}`);
+              setHistoryKey((value) => value + 1);
               void refresh();
             }}
           />
