@@ -6,10 +6,10 @@ const InvitesView = lazy(() => import("../views/InvitesView").then((module) => (
 const ProfileView = lazy(() => import("../views/ProfileView").then((module) => ({ default: module.ProfileView })));
 const ProjectsView = lazy(() => import("../views/ProjectsView").then((module) => ({ default: module.ProjectsView })));
 const SettingsView = lazy(() => import("../views/SettingsView").then((module) => ({ default: module.SettingsView })));
-const WorkflowsView = lazy(() => import("../views/WorkflowsView").then((module) => ({ default: module.WorkflowsView })));
+const RunnersView = lazy(() => import("../views/RunnersView").then((module) => ({ default: module.RunnersView })));
 const UsersView = lazy(() => import("../views/UsersView").then((module) => ({ default: module.UsersView })));
 
-type View = "contents" | "projects" | "workflows" | "invites" | "users" | "settings" | "profile";
+type View = "contents" | "projects" | "runners" | "invites" | "users" | "settings" | "profile";
 
 type Props = {
   user: User;
@@ -23,12 +23,12 @@ type Props = {
   onLogout: () => void;
 };
 
-const adminViews: View[] = ["workflows", "invites", "users", "settings"];
+const adminViews: View[] = ["runners", "invites", "users", "settings"];
 
 const viewMeta: Record<View, { title: string; subtitle: string }> = {
   contents: { title: "内容", subtitle: "维护页面、样式与发布状态" },
   projects: { title: "项目", subtitle: "站内 Git 仓库、分支与协作" },
-  workflows: { title: "工作流", subtitle: "定义、运行记录与执行器" },
+  runners: { title: "执行器", subtitle: "全站共享的工作流执行器与注册码" },
   invites: { title: "邀请码", subtitle: "控制注册入口与有效期" },
   users: { title: "用户", subtitle: "账号状态与权限" },
   settings: { title: "站点设置", subtitle: "站点信息、导航与发布" },
@@ -96,7 +96,7 @@ export function Shell({
                 className={view === item ? "active" : ""}
                 onClick={() => go(item)}
               >
-                {item === "workflows" ? "工作流" : item === "invites" ? "邀请码" : item === "users" ? "用户" : "站点设置"}
+                {item === "runners" ? "执行器" : item === "invites" ? "邀请码" : item === "users" ? "用户" : "站点设置"}
               </button>
             ))}
         </nav>
@@ -157,8 +157,8 @@ export function Shell({
         </div>
         <Suspense fallback={<p className="hint">加载视图…</p>}>
         {view === "contents" && <ContentsView />}
-        {view === "projects" && <ProjectsView />}
-        {view === "workflows" && user.is_admin && <WorkflowsView />}
+        {view === "projects" && <ProjectsView isAdmin={user.is_admin} />}
+        {view === "runners" && user.is_admin && <RunnersView />}
         {view === "invites" && user.is_admin && <InvitesView />}
         {view === "users" && user.is_admin && <UsersView />}
         {view === "settings" && user.is_admin && <SettingsView />}

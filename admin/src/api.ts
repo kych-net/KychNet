@@ -432,7 +432,10 @@ export const api = {
   buildStatus: () => request<BuildStatus>("/admin/rebuild"),
   rebuild: () => request<BuildStatus>("/admin/rebuild", { method: "POST" }),
 
-  projects: () => request<{ items: Project[] }>("/projects"),
+  projects: (includeArchived = false) =>
+    request<{ items: Project[] }>(
+      `/projects${includeArchived ? "?include_archived=true" : ""}`,
+    ),
   createProject: (payload: { slug: string; description: string }) =>
     request<{ item: Project }>("/projects", {
       method: "POST",
@@ -445,6 +448,8 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify(payload),
     }),
+  deleteProject: (id: string) =>
+    request<void>(`/projects/${id}`, { method: "DELETE" }),
   projectTree: (id: string, ref: string, path: string) =>
     request<{ items: ProjectDirItem[]; branches: string[]; default_branch: string }>(
       `/projects/${id}/tree?ref=${encodeURIComponent(ref)}&path=${encodeURIComponent(path)}`,

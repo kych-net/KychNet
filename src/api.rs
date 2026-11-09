@@ -1491,7 +1491,9 @@ pub async fn serve(cfg: Config) -> Result<()> {
         .route("/api/projects", get(project_list).post(project_create))
         .route(
             "/api/projects/{id}",
-            get(project_detail).patch(project_update),
+            get(project_detail)
+                .patch(project_update)
+                .delete(project_delete),
         )
         .route("/api/projects/{id}/tree", get(project_tree))
         .route(
@@ -1631,6 +1633,12 @@ struct ProjectUpdateBody {
 }
 
 #[derive(Deserialize)]
+struct ProjectListQuery {
+    #[serde(default)]
+    include_archived: bool,
+}
+
+#[derive(Deserialize)]
 struct ProjectTreeQuery {
     #[serde(rename = "ref", default = "main_branch")]
     branch: String,
@@ -1688,10 +1696,11 @@ fn main_branch() -> String {
 async fn project_list(
     State(state): State<AppState>,
     session: Session,
+    Query(query): Query<ProjectListQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     current_user(&state, &session).await?;
     Ok(Json(json!({
-        "items": crate::project::list_projects(&state.pool).await?
+        "items": crate::project::list_projects(&state.pool, query.include_archived).await?
     })))
 }
 
@@ -1742,6 +1751,8 @@ async fn project_update(
     };
     if body.archived == Some(true) {
         crate::project::archive_project(&state.pool, id).await?;
+    } else if body.archived == Some(false) {
+        crate::project::unarchive_project(&state.pool, id).await?;
     }
     let project = crate::project::update_project(
         &state.pool,
@@ -1758,6 +1769,38 @@ async fn project_update(
         ));
     }
     Ok(Json(json!({ "item": project })))
+}
+
+/// 永久删除已归档项目。要求管理员;删除前必须先归档,避免误删活跃仓库。
+/// 数据库侧由 ON DELETE CASCADE 清空,磁盘侧移除 <LFS_ROOT>/<id>/ 整个目录。
+async fn project_delete(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+) -> ApiResult<StatusCode> {
+    current_admin(&state, &session).await?;
+    let Some(project) = crate::project::get_project(&state.pool, id).await? else {
+        api_reject!(StatusCode::NOT_FOUND, "项目不存在");
+    };
+    if project.archived_at.is_none() {
+        api_reject!(StatusCode::BAD_REQUEST, "请先归档项目再删除");
+    }
+    crate::project::delete_project(&state.pool, id).await?;
+    // LFS 磁盘对象按项目 id 分目录存放;删除失败不影响数据库已删除的事实,
+    // 残留文件留待下次 GC 清理,故只记日志不回滚。
+    let lfs_dir = state.lfs_root.join(id.to_string());
+    match tokio::fs::remove_dir_all(&lfs_dir).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!(%error, "删除项目 LFS 目录失败: {}", lfs_dir.display()),
+    }
+    if let Err(error) = state.build_ctl.build_all().await {
+        return Err(ApiError::with_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("项目已删除，但自动编译失败：{error}"),
+        ));
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn project_tree(
@@ -2546,7 +2589,7 @@ async fn git_http_get(
         Err(response) => return response,
     };
 
-    // 文件树通道：`/git/<项目>/{tree,file,archive}`，公开只读。
+    // 文件树通道：`/git/<项目>/{tree,file,archive,icon.svg}`，公开只读。
     // 调用方不需要 git 客户端、不需要 .git，也不必解析 packfile。
     if channel == crate::git::http::GitChannel::Worktree {
         return worktree_get(&state, &project, &action, &params).await;
@@ -2598,18 +2641,62 @@ async fn git_http_get(
     }
 }
 
-/// `/git/<项目>/{tree,file,archive}`（不带 `.git` 后缀）。
+/// `/git/<项目>/{tree,file,archive,icon.svg}`（不带 `.git` 后缀）。
 ///
 /// 与 `git-upload-pack` 保持同等可见性：站内仓库内容本来就能匿名 fetch，
 /// 这里只是把 packfile 换成展开后的文件树，不额外放大暴露面。
 /// 写操作不在这里，走 `git_http_put` / `git_http_delete`：Git 令牌或登录会话
 /// 可写任意分支，runner token 只能写本次 run 绑定的分支。
+///
+/// `/git/<项目>/icon.svg` 是项目级图标：可直接作为仓库头像 URL，
+/// 可带 `?ref=` 指定分支，缺省用默认分支。没有自定义图标时返回按项目名
+/// 生成的字母图标，不会回退到站点默认图标。
+async fn project_icon_response(
+    state: &AppState,
+    project: &crate::project::Project,
+    params: &HashMap<String, String>,
+) -> Response {
+    let generated = || {
+        git_binary(
+            "image/svg+xml",
+            crate::project::project_icon_svg(&project.slug).into_bytes(),
+        )
+    };
+    let ref_name = params
+        .get("ref")
+        .map(String::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&project.default_branch);
+    let commit = match crate::git::worktree::resolve_ref(&state.pool, project.id, ref_name).await {
+        Ok(Some(oid)) => oid,
+        _ => return generated(),
+    };
+    for name in crate::project::PROJECT_ICON_FILES {
+        if let Ok(Some((_, data, _))) = crate::git::worktree::read(
+            &state.pool,
+            project.id,
+            commit,
+            name,
+            &state.lfs_root,
+        )
+        .await
+        {
+            return git_binary("image/svg+xml", data);
+        }
+    }
+    generated()
+}
+
 async fn worktree_get(
     state: &AppState,
     project: &crate::project::Project,
     action: &str,
     params: &HashMap<String, String>,
 ) -> Response {
+    // 图标通道不要求 ref，独立处理。
+    if action == "icon.svg" {
+        return project_icon_response(state, project, params).await;
+    }
     let Some(ref_name) = params
         .get("ref")
         .map(String::as_str)

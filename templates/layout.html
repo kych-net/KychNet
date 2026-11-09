@@ -10,8 +10,12 @@
     {% endif %}
     <meta property="og:site_name" content="{{ site.site_name }}" />
     <link rel="canonical" href="{{ canonical }}" />
+    {% if !icon.is_empty() %}
+    <link rel="icon" href="{{ icon }}" type="image/svg+xml" />
+    {% else %}
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <link rel="alternate icon" href="/favicon.ico" />
+    {% endif %}
     <link rel="stylesheet" href="/fonts/lxgw-wenkai-screen/lxgwwenkaiscreen.css" />
     {% for href in styles %}
     <link rel="stylesheet" href="{{ href }}" />

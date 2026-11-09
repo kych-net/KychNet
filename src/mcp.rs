@@ -351,7 +351,7 @@ impl KychMcp {
         Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
         require_scope(&parts, "project:read")?;
-        let projects = project::list_projects(&self.pool)
+        let projects = project::list_projects(&self.pool, false)
             .await
             .map_err(tool_error)?;
         Ok(text_result(json!({ "projects": projects }).to_string()))
