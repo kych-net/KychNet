@@ -405,9 +405,6 @@ fn write_sitemap(out: &Path, cfg: &Config, pages: &[BuiltPage]) -> Result<()> {
     );
     let mut seen = std::collections::HashSet::new();
     for page in pages {
-        if page.slug.ends_with(".svg") {
-            continue;
-        }
         let loc = format!("{base}{}", content_url(&page.slug));
         if !seen.insert(loc.clone()) {
             continue;
@@ -524,6 +521,9 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
 
     let mut contents = Vec::new();
     let mut styles = Vec::new();
+    /// 原样输出的静态资源（目前是 SVG）：不参与页面渲染、目录树与 sitemap，
+    /// 只按 slug 把字节写回磁盘。
+    let mut raw_assets: Vec<(String, Vec<u8>)> = Vec::new();
     for content in all {
         if content.format() == ContentFormat::Css {
             if service::valid_style_slug(&content.slug) {
@@ -531,9 +531,13 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
             } else {
                 tracing::warn!("跳过非法 CSS slug: {:?}", content.slug);
             }
-        } else if service::valid_content_slug(&content.slug)
-            || service::valid_svg_slug(&content.slug)
-        {
+        } else if content.format() == ContentFormat::Svg {
+            if service::valid_svg_slug(&content.slug) {
+                raw_assets.push((content.slug, content.body.into_bytes()));
+            } else {
+                tracing::warn!("跳过非法 SVG slug: {:?}", content.slug);
+            }
+        } else if service::valid_content_slug(&content.slug) {
             contents.push(content);
         } else {
             // 历史脏数据不该让整站构建永久失败。新增数据已在 save_content 拦住，
@@ -576,10 +580,8 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
         project_icons.insert(snapshot.project.slug.clone(), icon_href);
 
         for (path, data) in &snapshot.files {
-            // 图标源文件只作为资源输出，不再编译成 .html 页面。
-            if crate::project::PROJECT_ICON_FILES.contains(&path.as_str()) {
-                continue;
-            }
+            // 所有 .svg 都按静态资源原样输出（见下方 Svg 分支），
+            // 图标源文件因此也不会被编译成页面，无需单独跳过。
             if crate::git::lfs::is_pointer(data) {
                 tracing::warn!(
                     project = %snapshot.project.slug,
@@ -600,6 +602,14 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
             match ContentFormat::from_extension(extension) {
                 Some(ContentFormat::Css) => {
                     project_styles.push((
+                        project_asset_slug(&snapshot.project.slug, path),
+                        data.clone(),
+                    ));
+                }
+                Some(ContentFormat::Svg) => {
+                    // SVG 是静态资源：保持仓库里的原路径与扩展名原样输出，
+                    // 不转成 Content、不生成 .html 页面、不进目录树与 sitemap。
+                    project_assets.push((
                         project_asset_slug(&snapshot.project.slug, path),
                         data.clone(),
                     ));
@@ -667,16 +677,6 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
     // 先把所有页面渲染到内存。任何一篇 Typst 编译失败都不会触碰磁盘。
     let mut pages = Vec::new();
     for content in &contents {
-        if content.format() == ContentFormat::Svg {
-            pages.push(BuiltPage {
-                slug: content.slug.clone(),
-                title: source_filename(&content.slug, content.format()),
-                date: content.updated_at.format("%Y-%m-%d").to_string(),
-                html: content.body.clone(),
-                pdf: None,
-            });
-            continue;
-        }
         let page = content
             .slug
             .strip_suffix(".html")
@@ -782,7 +782,6 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
     } else {
         let mut links: Vec<PostLink> = pages
             .iter()
-            .filter(|page| !page.slug.ends_with(".svg"))
             .map(|page| PostLink {
                 title: page.title.clone(),
                 href: content_url(&page.slug),
@@ -840,6 +839,9 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
     for (slug, data) in &project_assets {
         write_raw(out, slug, data)?;
     }
+    for (slug, data) in &raw_assets {
+        write_raw(out, slug, data)?;
+    }
     if let Some(index_html) = index_html {
         let index_path = safe_output_path(out, service::HOME_SLUG)?;
         std::fs::write(&index_path, index_html)?;
@@ -882,18 +884,30 @@ pub async fn run_one(
     let all = service::list_published(pool).await?;
     let mut contents = Vec::new();
     let mut styles = Vec::new();
+    let mut raw_assets: Vec<(String, Vec<u8>)> = Vec::new();
     for content in all {
         if content.format() == ContentFormat::Css {
             if service::valid_style_slug(&content.slug) {
                 styles.push(content);
             }
-        } else if service::valid_content_slug(&content.slug)
-            || service::valid_svg_slug(&content.slug)
-        {
+        } else if content.format() == ContentFormat::Svg {
+            if service::valid_svg_slug(&content.slug) {
+                raw_assets.push((content.slug, content.body.into_bytes()));
+            }
+        } else if service::valid_content_slug(&content.slug) {
             contents.push(content);
         }
     }
     styles.sort_by(|a, b| a.slug.cmp(&b.slug));
+
+    if service::valid_svg_slug(only) {
+        if let Some((_, data)) = raw_assets.iter().find(|(slug, _)| slug == only) {
+            write_raw(out, only, data)?;
+        } else {
+            remove_output(out, only)?;
+        }
+        return Ok(());
+    }
 
     if service::valid_style_slug(only) {
         if let Some(style) = styles.iter().find(|style| style.slug == only) {
@@ -924,10 +938,6 @@ pub async fn run_one(
         return Ok(());
     };
 
-    if content.format() == ContentFormat::Svg {
-        write_raw(out, &content.slug, content.body.as_bytes())?;
-        return Ok(());
-    }
     let (styles, body) = parse_page_styles(&content.body)?;
     let page = content
         .slug
@@ -1067,6 +1077,20 @@ mod tests {
 
     fn settings() -> SiteSettings {
         SiteSettings::default()
+    }
+
+    #[test]
+    fn svg_is_a_static_asset_not_a_page() {
+        // SVG 走 project_asset_slug：保持 .svg 原路径与扩展名原样输出。
+        assert_eq!(
+            project_asset_slug("地狱之下", "图标.svg"),
+            "项目/地狱之下/图标.svg"
+        );
+        // 对比：页面类文件才会被 project_page_slug 改写为 .html。
+        assert_eq!(
+            project_page_slug("地狱之下", "说明.md"),
+            "项目/地狱之下/说明.html"
+        );
     }
 
     #[test]
