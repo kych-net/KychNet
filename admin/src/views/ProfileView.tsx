@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { startRegistration } from "@simplewebauthn/browser";
 import { api, avatarUrl, GitToken, isStepUpRequired, User } from "../api";
 import { StepUpDialog } from "../components/StepUpDialog";
+import { SshKeysView } from "./SshKeysView";
 
 type Props = {
   user: User;
@@ -233,6 +234,8 @@ export function ProfileView({ user, avatarVersion, onUserChange, onAvatarChange 
           ))}
         </ul>
       )}
+
+      <SshKeysView />
 
       <StepUpDialog
         open={stepUpOpen}
