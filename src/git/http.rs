@@ -369,9 +369,6 @@ fn shallow_response(boundaries: &[Oid], unshallow: &[Oid]) -> Vec<u8> {
     for oid in unshallow {
         out.extend(proto::pkt_str(&format!("unshallow {}\n", oid.to_hex())));
     }
-    if !boundaries.is_empty() || !unshallow.is_empty() {
-        out.extend(proto::flush());
-    }
     out
 }
 
@@ -415,11 +412,17 @@ pub async fn upload_pack(pool: &PgPool, project: &Project, body: &[u8]) -> Resul
     )
     .await?;
 
+    // `deepen` 请求:必须先回浅边界段并以 flush 收尾,客户端读完这段才进入 ACK/NAK
+    // 协商(git-upload-pack 即此顺序)。若把 ACK/NAK 提前,客户端会报
+    // "expected shallow/unshallow, got NAK",或在协商结束前就收到 pack 而报错。
+    if request.deepen.is_some() {
+        out.extend(shallow_response(&boundaries, &unshallow));
+        out.extend(proto::flush());
+    }
     match common.last() {
         Some(oid) => out.extend(proto::pkt_str(&format!("ACK {}\n", oid.to_hex()))),
         None => out.extend(proto::pkt_str("NAK\n")),
     }
-    out.extend(shallow_response(&boundaries, &unshallow));
     out.extend(proto::build_pack(&objects));
     Ok(out)
 }
