@@ -788,7 +788,9 @@ pub fn router(state: KychMcp, pool: PgPool, trust_proxy_headers: bool) -> Router
 
     Router::new()
         .nest_service("/mcp", service)
-        .layer(middleware::from_fn_with_state(guard, mcp_guard))
+        // route_layer 只包已注册的 /mcp 路由;用 layer 会把 MCP 鉴权
+        // 泄漏到全 app 的未匹配路径,404 会被错误报成 401 + OAuth 挑战。
+        .route_layer(middleware::from_fn_with_state(guard, mcp_guard))
 }
 
 #[cfg(test)]

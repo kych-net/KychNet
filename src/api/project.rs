@@ -127,14 +127,21 @@ pub(crate) async fn project_update(
     Path(id): Path<Uuid>,
     Json(body): Json<ProjectUpdateBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    current_user(&state, &session).await?;
+    let user = current_user(&state, &session).await?;
     let Some(existing) = crate::project::get_project(&state.pool, id).await? else {
         api_reject!(StatusCode::NOT_FOUND, "项目不存在");
     };
-    if body.archived == Some(true) {
-        crate::project::archive_project(&state.pool, id).await?;
-    } else if body.archived == Some(false) {
-        crate::project::unarchive_project(&state.pool, id).await?;
+    if body.archived.is_some() {
+        // 归档会让 git 端点直接 404(冻结仓库)，属低频高影响操作：
+        // 仅管理员或项目创建者可执行，避免任何登录用户冻结他人项目。
+        if !user.is_admin && existing.created_by != Some(user.id) {
+            api_reject!(StatusCode::FORBIDDEN, "仅管理员或项目创建者可以归档/取消归档");
+        }
+        if body.archived == Some(true) {
+            crate::project::archive_project(&state.pool, id).await?;
+        } else if body.archived == Some(false) {
+            crate::project::unarchive_project(&state.pool, id).await?;
+        }
     }
     let project = crate::project::update_project(
         &state.pool,

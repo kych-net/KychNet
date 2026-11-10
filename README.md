@@ -72,7 +72,7 @@
 | 内容渲染 | pulldown-cmark / typst / ftml / CSS |
 | 数据库 | PostgreSQL + SQLx |
 | 认证 | webauthn-rs(Passkey) + totp-rs(TOTP) |
-| 会话 | tower-sessions + Postgres store(schema `tower_sessions`,表 `session`) + HttpOnly/Secure/SameSite=Strict Cookie,登录后轮换会话 ID,有效期 8 小时 |
+| 会话 | tower-sessions + Postgres store(schema `tower_sessions`,表 `session`) + HttpOnly/Secure/SameSite=Strict Cookie,登录后轮换会话 ID,有效期 8 小时(进程重启不掉线,超时不活动才失效) |
 | 命令行 | clap |
 | 管理前端 | React + TypeScript + Vite |
 | 数据与表单 | 原生 fetch + React state |
@@ -91,17 +91,22 @@
 │   ├── models.rs        # 领域模型(用户/邀请码/内容/站点设置)
 │   ├── service.rs       # 数据库访问层,API 与 CLI 共用
 │   ├── auth.rs          # Passkey / TOTP / 认证流程
+│   ├── oauth.rs         # MCP OAuth 授权服务器
+│   ├── history.rs       # 版本历史:快照、差异与回放
 │   ├── render.rs        # markdown / html / typst 渲染
 │   ├── svg.rs           # 上传头像的 SVG 校验
 │   ├── rate.rs          # 登录/注册接口的有界内存限流
-│   ├── api.rs           # Axum 路由、会话、CORS、Origin 校验
+│   ├── api/             # Axum 路由与处理器(mod/content/project/auth/git)
 │   ├── build.rs         # 静态站生成
 │   ├── mcp.rs           # MCP Streamable HTTP 只读服务器
 │   ├── project.rs       # 项目管理
 │   ├── collab.rs        # 分支/PR/讨论协作
+│   ├── workflow/        # 工作流执行(runner 派发、事件出箱)
+│   ├── cli_cn.rs        # 中文输出格式化(CLI)
 │   └── git/             # PostgreSQL Git、LFS、smart HTTP
+├── plugins/             # 6 个内置 MCP 服务器插件
 ├── templates/           # Askama 模板(layout / index / page)
-├── migrations/          # SQLx 迁移(当前 0001–0011)
+├── migrations/          # SQLx 迁移(当前 0001–0017)
 └── admin/               # 管理前端(独立 Vite 工程)
 ```
 
@@ -190,7 +195,7 @@ export PATH=/usr/local/bin:$PATH            # 通常已默认包含
 - 注册改为「凭证通过才落库」:`/api/auth/register` 只读校验邀请码并把用户资料暂存在认证流程里,`/api/auth/register/finish` 校验 Passkey 成功后才在一个事务内扣邀请码、建用户、存凭证.浏览器取消仪式不再消耗邀请名额,也不会留下没有凭证的孤立用户;撞用户名由唯一约束兜底.
 - 修改凭证需要 step-up:`totp/setup`、`passkey/setup`、`passkey/setup/finish` 要求会话在最近一次真实认证的 5 分钟内;过期后管理端会弹窗要求输入 TOTP 或使用通行密钥重新确认,验证成功后自动重试原操作.只拿到旧 cookie 或只读到 `/api/me` 的攻击者无法把受害者的二次验证换绑到自己设备上.`totp/confirm` 不要求 step-up(pending 密钥只能由已 step-up 的 setup 产生),但每账号限 5 次/15 分钟.
 - 管理员启停账号有护栏:不能禁用自己的账号,也不能禁用最后一个可用管理员(同一事务内锁行判断,并发互关时后提交者失败).`kych-net user` CLI 不受此限制,保留为应急入口.
-- 请求体上限显式声明:全局 2 MiB,头像 257 KB,不再依赖框架默认值.
+- 请求体上限显式声明:全局 2 MiB,头像 257 KB,git 传输 256 MiB,不再依赖框架默认值.
 
 ## MCP 服务器
 
@@ -385,7 +390,10 @@ access token 一小时内自然过期；refresh token 最长 30 天。数据库�
 - 项目管理在管理端「项目」页,数据落在 PostgreSQL 的 Git 表和 `LFS_ROOT` 文件目录;
 - 仓库地址:`https://kych.net/git/<项目 slug>.git`;
 - Git smart HTTP 和 LFS 都通过 `kych.net` 的 nginx `/git/` 反代;
-- 匿名可以 clone 公开仓库,写操作使用 Git token;
+- 匿名可以 clone 公开仓库,写操作可用 Git token 或登录会话;
+- git smart HTTP 协议版本 v2(/git/ls-refs 等 v2 组接口,serve、info/refs 与导出为 v1 回退);runner 对内容仓库的写走登录会话,规则与匿名读、LFS 内容、代码归档只读一致;
+- 归档为管理员或项目创建者专属操作,普通登录用户不能归档他人项目;
+- 已知限制:协议 v0 浅克隆(`--depth`)修复待 PR 发布,命令行 git 与 v2 客户端不受影响;
 - 迁移 `0009_projects` / `0010_lfs` 创建项目、对象、refs、commits、PR、讨论与 LFS 索引;
 - `kych-net gc --project <slug>` 清理不可达对象。
 
