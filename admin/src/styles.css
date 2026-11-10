@@ -3452,3 +3452,47 @@ code,
   padding: 0.25rem 0.55rem;
   font-size: 0.74rem;
 }
+
+/* project clone links */
+.project-clone-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.25rem 0.45rem;
+  min-width: 0;
+  margin-top: 0.2rem;
+}
+
+.project-clone-row code {
+  overflow: hidden;
+  max-width: min(28rem, 48vw);
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.66rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.clone-label {
+  flex: 0 0 auto;
+  padding: 0.1rem 0.3rem;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 1px solid color-mix(in srgb, var(--accent) 18%, transparent);
+  border-radius: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.58rem;
+  font-weight: 800;
+}
+
+.clone-label-ssh {
+  color: var(--notice-text);
+  background: var(--notice-bg);
+  border-color: var(--notice-border);
+}
+
+@media (max-width: 980px) {
+  .project-clone-row code {
+    max-width: 100%;
+  }
+}

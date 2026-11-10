@@ -7,6 +7,7 @@ import {
   Discussion,
   DiscussionDetail,
   gitUrl,
+  sshGitUrl,
   PrDetail,
   Project,
   ProjectDirItem,
@@ -672,13 +673,14 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
     }
   }
 
-  async function copyGitUrl() {
+  async function copyCloneUrl(kind: "https" | "ssh") {
     if (!selected) return;
+    const url = kind === "https" ? gitUrl(selected.slug) : sshGitUrl(selected.slug);
     try {
-      await navigator.clipboard.writeText(gitUrl(selected.slug));
-      setNotice("仓库地址已复制");
+      await navigator.clipboard.writeText(url);
+      setNotice(`${kind.toUpperCase()} 仓库地址已复制`);
     } catch {
-      setError("无法访问剪贴板，请手动复制仓库地址");
+      setError(`无法访问剪贴板，请手动复制 ${kind.toUpperCase()} 地址`);
     }
   }
 
@@ -741,16 +743,23 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
               <h3>{selected.slug}</h3>
               <span className="pill pill-branch">{selected.default_branch}</span>
               <code className="project-topbar-path">/项目/{selected.slug}/</code>
-              <span className="project-topbar-dot">·</span>
-              <code className="project-topbar-url">{gitUrl(selected.slug)}</code>
             </div>
             {selected.description && (
               <p className="project-topbar-desc">{selected.description}</p>
             )}
+            <div className="project-clone-row">
+              <span className="clone-label">HTTPS</span>
+              <code title={gitUrl(selected.slug)}>{gitUrl(selected.slug)}</code>
+              <span className="clone-label clone-label-ssh">SSH</span>
+              <code title={sshGitUrl(selected.slug)}>{sshGitUrl(selected.slug)}</code>
+            </div>
           </div>
           <div className="project-head-actions">
-            <button type="button" onClick={copyGitUrl}>
-              复制地址
+            <button type="button" onClick={() => void copyCloneUrl("https")}>
+              复制 HTTPS
+            </button>
+            <button type="button" onClick={() => void copyCloneUrl("ssh")}>
+              复制 SSH
             </button>
             <button type="button" onClick={() => void editProject()}>
               编辑信息
