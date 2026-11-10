@@ -3,6 +3,8 @@ pub mod http;
 pub mod lfs;
 pub mod object;
 pub mod proto;
+pub mod ssh;
+pub mod ssh_key;
 pub mod store;
 pub mod token;
 pub mod tree;

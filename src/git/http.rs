@@ -42,11 +42,14 @@ fn advertise_line(oid: Oid, name: &str, caps: Option<&str>) -> Vec<u8> {
     }
 }
 
-/// 生成 smart HTTP 的引用广告。
+/// 生成引用广告（不带 `# service=` 前缀）。
 ///
 /// 分支与标签都会广告；`HEAD` 通过 `symref` 能力指向默认分支，
 /// 这样客户端不需要再猜远端默认分支名。
-pub async fn advertise(pool: &PgPool, project: &Project, service: &str) -> Result<Vec<u8>> {
+///
+/// SSH 传输（`ssh.rs`）也复用这段广告：SSH 协议没有 `# service=` 行，
+/// 那是 smart HTTP 独有的前缀，所以拆成两层。
+pub async fn advertise_refs(pool: &PgPool, project: &Project, service: &str) -> Result<Vec<u8>> {
     let mut conn = pool.acquire().await?;
     let refs = store::list_refs(&mut conn, project.id).await?;
 
@@ -57,9 +60,6 @@ pub async fn advertise(pool: &PgPool, project: &Project, service: &str) -> Resul
     };
 
     let mut out = Vec::new();
-    out.extend(proto::pkt_str(&format!("# service={service}\n")));
-    out.extend(proto::flush());
-
     if refs.is_empty() {
         out.extend(proto::pkt_str(&format!(
             "{} capabilities^{{}}\0{caps}\n",
@@ -93,11 +93,27 @@ pub async fn advertise(pool: &PgPool, project: &Project, service: &str) -> Resul
     Ok(out)
 }
 
+/// smart HTTP 的引用广告：引用广告 + `# service=` 前缀。
+pub async fn advertise(pool: &PgPool, project: &Project, service: &str) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    out.extend(proto::pkt_str(&format!("# service={service}\n")));
+    out.extend(proto::flush());
+    out.extend(advertise_refs(pool, project, service).await?);
+    Ok(out)
+}
+
 /// protocol v2 的能力广告（只有 upload-pack 支持 v2）。
 pub fn advertise_v2(service: &str) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend(proto::pkt_str(&format!("# service={service}\n")));
     out.extend(proto::flush());
+    out.extend(v2_capabilities());
+    out
+}
+
+/// protocol v2 的能力段（不带 `# service=` 前缀），SSH 传输复用。
+pub fn v2_capabilities() -> Vec<u8> {
+    let mut out = Vec::new();
     out.extend(proto::pkt_str("version 2\n"));
     out.extend(proto::pkt_str("agent=kych-net/0.3\n"));
     out.extend(proto::pkt_str("ls-refs=unborn\n"));
@@ -161,7 +177,9 @@ async fn resolve_commit(
 /// 计算浅克隆边界。
 ///
 /// 返回 `(新的 shallow 边界, 需要 unshallow 的旧边界, 遍历时不再展开父提交的集合)`。
-async fn compute_shallow(
+/// SSH 传输的会话式 upload-pack 在「带 deepen 但还没 done」的协商轮里
+/// 也要先回浅边界段，所以这里必须对内开放。
+pub(crate) async fn compute_shallow(
     conn: &mut PgConnection,
     project_id: Uuid,
     wants: &[Oid],
@@ -300,8 +318,8 @@ async fn collect_objects(
 /// 计算客户端已有对象集合。
 ///
 /// 返回 `(可确认的公共提交, 排除集合)`；遍历超出上限时返回 None，
-/// 调用方退化为全量传输，避免发出错误的历史。
-async fn have_reachable(
+/// 调用方退化为全量传输，避免发出错误的历史。SSH 传输按轮复用。
+pub(crate) async fn have_reachable(
     conn: &mut PgConnection,
     project_id: Uuid,
     haves: &[Oid],
@@ -361,7 +379,7 @@ async fn have_reachable(
     Ok(Some((common, exclude)))
 }
 
-fn shallow_response(boundaries: &[Oid], unshallow: &[Oid]) -> Vec<u8> {
+pub(crate) fn shallow_response(boundaries: &[Oid], unshallow: &[Oid]) -> Vec<u8> {
     let mut out = Vec::new();
     for oid in boundaries {
         out.extend(proto::pkt_str(&format!("shallow {}\n", oid.to_hex())));
@@ -389,6 +407,19 @@ fn sideband_pack(data: &[u8]) -> Vec<u8> {
 /// v0 upload-pack。
 pub async fn upload_pack(pool: &PgPool, project: &Project, body: &[u8]) -> Result<Vec<u8>> {
     let request = proto::parse_upload_request(body)?;
+    upload_pack_request(pool, project, &request).await
+}
+
+/// 已解析请求版本的上传处理。
+///
+/// SSH 的会话式 upload-pack 需要把多轮 want/have/done 累积成**一个**请求
+/// 再处理（客户端发 `done` 时不会重复 wants，HTTP 的无状态 RPC 不存在
+/// 这个问题），所以把「解析」和「处理」拆开，两边共用同一套遍历逻辑。
+pub(crate) async fn upload_pack_request(
+    pool: &PgPool,
+    project: &Project,
+    request: &proto::UploadRequest,
+) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     if request.wants.is_empty() {
         out.extend(proto::pkt_str("NAK\n"));
@@ -565,13 +596,38 @@ async fn v2_fetch(
     )
     .await?;
 
+    // packfile 段：ready 与 done 两条路径共用（v2 规范要求 ready 之后
+    // 必须紧跟 delim 并在同一响应里带上 shallow-info / packfile 段，
+    // 与真实 upload-pack 的 process_haves_and_send_acks 一致）。
+    let mut pack_sections = |out: &mut Vec<u8>| {
+        if !boundaries.is_empty() || !unshallow.is_empty() {
+            out.extend(proto::pkt_str("shallow-info\n"));
+            for oid in &boundaries {
+                out.extend(proto::pkt_str(&format!("shallow {}\n", oid.to_hex())));
+            }
+            for oid in &unshallow {
+                out.extend(proto::pkt_str(&format!("unshallow {}\n", oid.to_hex())));
+            }
+            out.extend(proto::delim());
+        }
+        out.extend(proto::pkt_str("packfile\n"));
+        out.extend(sideband_pack(&proto::build_pack(&objects)));
+    };
+
     if !request.done {
         out.extend(proto::pkt_str("acknowledgments\n"));
         if common_known {
             for oid in common.iter().filter(|oid| !oid.is_zero()) {
                 out.extend(proto::pkt_str(&format!("ACK {}\n", oid.to_hex())));
             }
-            out.extend(proto::pkt_str("ready\n"));
+            // 只有客户端已有的对象能覆盖全部 wants（ok_to_give_up）时才能
+            // 发 ready；ready 后跟 delim + packfile，本轮响应直接收尾。
+            if request.wants.iter().all(|oid| exclude.contains(oid)) {
+                out.extend(proto::pkt_str("ready\n"));
+                out.extend(proto::delim());
+                pack_sections(&mut out);
+                return Ok(out);
+            }
         } else {
             out.extend(proto::pkt_str("NAK\n"));
         }
@@ -580,18 +636,7 @@ async fn v2_fetch(
     }
 
     // done 之后不再回 acknowledgments；客户端已经在等 packfile 段。
-    if !boundaries.is_empty() || !unshallow.is_empty() {
-        out.extend(proto::pkt_str("shallow-info\n"));
-        for oid in &boundaries {
-            out.extend(proto::pkt_str(&format!("shallow {}\n", oid.to_hex())));
-        }
-        for oid in &unshallow {
-            out.extend(proto::pkt_str(&format!("unshallow {}\n", oid.to_hex())));
-        }
-        out.extend(proto::delim());
-    }
-    out.extend(proto::pkt_str("packfile\n"));
-    out.extend(sideband_pack(&proto::build_pack(&objects)));
+    pack_sections(&mut out);
     Ok(out)
 }
 
