@@ -382,6 +382,19 @@ pub async fn serve(cfg: Config) -> Result<()> {
         tracing::warn!(%error, "OAuth 过期数据清理失败");
     }
 
+    // Git over SSH：显式配置 SSH_BIND 才启动，独立端口监听，
+    // 与系统 sshd（登录用）互不相干，也不需要系统账号。
+    if let Some(bind) = cfg.ssh_bind.clone() {
+        let ssh_pool = pool.clone();
+        let host_key = cfg.ssh_host_key.clone();
+        tokio::spawn(async move {
+            let ssh_cfg = crate::git::ssh::SshConfig { bind, host_key };
+            if let Err(error) = crate::git::ssh::serve(ssh_cfg, ssh_pool).await {
+                tracing::error!(%error, "Git SSH 服务启动失败");
+            }
+        });
+    }
+
     let auth = Arc::new(Auth::new(&cfg.rp_id, &cfg.rp_origin)?);
     let build_ctl = Arc::new(BuildCtl::new(cfg.build_out_dir.clone()));
     let build_queue = crate::workflow::queue::BuildQueue::start(build_ctl.clone());
@@ -578,6 +591,11 @@ pub async fn serve(cfg: Config) -> Result<()> {
             get(git_token_list).post(git_token_create),
         )
         .route("/api/git-tokens/{id}", delete(git_token_revoke))
+        .route(
+            "/api/ssh-keys",
+            get(ssh_key_list).post(ssh_key_create),
+        )
+        .route("/api/ssh-keys/{id}", delete(ssh_key_revoke))
         .route("/api/runners", get(runner_list).post(runner_create))
         .route("/api/runners/{id}", patch(runner_update))
         // /git/ 下有两类通道：<slug>.git/... 是 Git smart HTTP（匿名 clone，

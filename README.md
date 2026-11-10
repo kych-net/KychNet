@@ -397,6 +397,25 @@ access token 一小时内自然过期；refresh token 最长 30 天。数据库�
 - 迁移 `0009_projects` / `0010_lfs` 创建项目、对象、refs、commits、PR、讨论与 LFS 索引;
 - `kych-net gc --project <slug>` 清理不可达对象。
 
+### Git over SSH
+
+后端可另起一个内建 SSH 服务端（russh 实现），复用 smart HTTP 同一套协议层与 PostgreSQL 对象存储，磁盘上不产生裸仓库，也不需要系统账号：
+
+```bash
+# .env / 环境变量：显式配置才启动；未设置时行为与升级前完全一致
+SSH_BIND=0.0.0.0:2222        # 监听地址，与系统 sshd（登录 22 端口）互不相干
+SSH_HOST_KEY=ssh_host_ed25519_key   # 主机私钥路径，首次启动自动生成（0600）
+```
+
+使用流程：
+
+1. 管理端（或 `POST /api/ssh-keys`）登记 OpenSSH 公钥，公钥指纹唯一，可被多个账号同时持有校验；
+2. `git clone ssh://git@kych.net:2222/<项目 slug>.git`，URL 里的用户名随意（认证只认公钥指纹）；
+3. 推拉权限与 HTTP 侧一致：登录用户可读写，禁用账号一律拒绝。
+
+实现要点：认证只认公钥、密码登录一律拒绝；协议版本由客户端 `GIT_PROTOCOL=version=2` env 请求协商（等价 sshd 的 AcceptEnv）；v0 fetch 为有状态会话（多轮 want/have/done 累积后走 `upload_pack_request`），v0 push 纯删除时立即回 report（不读 pack、不等 EOF），其余读到客户端关写端再整体解析；会话错误以 pkt-line `ERR` 送达客户端。
+
+
 ## 开发
 
 ```bash
