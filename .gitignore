@@ -31,3 +31,6 @@ admin/dist/
 # Local env
 .env
 .env.local
+
+# 内容仓库克隆(独立 git 仓库,平台按 URL 拉取,不入本仓库)
+/地狱之下
