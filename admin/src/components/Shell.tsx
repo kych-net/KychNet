@@ -8,6 +8,7 @@ const ProjectsView = lazy(() => import("../views/ProjectsView").then((module) =>
 const SettingsView = lazy(() => import("../views/SettingsView").then((module) => ({ default: module.SettingsView })));
 const RunnersView = lazy(() => import("../views/RunnersView").then((module) => ({ default: module.RunnersView })));
 const UsersView = lazy(() => import("../views/UsersView").then((module) => ({ default: module.UsersView })));
+const SshKeysView = lazy(() => import("../views/SshKeysView").then((module) => ({ default: module.SshKeysView })));
 
 type View = "contents" | "projects" | "runners" | "invites" | "users" | "settings" | "profile";
 

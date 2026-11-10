@@ -3332,3 +3332,123 @@ code,
   text-align: right;
   white-space: nowrap;
 }
+
+/* ---------- SSH keys ---------- */
+.ssh-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1.1rem;
+}
+
+.ssh-header h2 {
+  margin: 0 0 0.25rem;
+}
+
+.ssh-header .hint {
+  max-width: 54rem;
+  margin: 0;
+}
+
+.ssh-count {
+  flex: 0 0 auto;
+  min-width: 1.8rem;
+  padding: 0.2rem 0.55rem;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent);
+  border-radius: 999px;
+  font-size: 0.76rem;
+  font-weight: 800;
+  text-align: center;
+}
+
+.ssh-add {
+  padding: 1rem;
+  margin-bottom: 1.2rem;
+  background: var(--panel-soft);
+  border: 1px solid var(--border);
+  border-radius: 13px;
+}
+
+.ssh-add textarea {
+  min-height: 6rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.78rem;
+}
+
+.ssh-add .hint {
+  margin: -0.2rem 0 0.75rem;
+  font-size: 0.78rem;
+}
+
+.ssh-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+}
+
+.ssh-card {
+  padding: 0.9rem 1rem;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: var(--shadow-soft);
+}
+
+.ssh-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.8rem;
+  margin-bottom: 0.55rem;
+}
+
+.ssh-card-head > div {
+  display: flex;
+  flex-direction: column;
+  gap: 0.18rem;
+  min-width: 0;
+}
+
+.ssh-card-head strong {
+  font-size: 0.9rem;
+}
+
+.ssh-card-head .mono {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 0.68rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ssh-public-key {
+  display: block;
+  overflow: auto;
+  max-height: 4.5rem;
+  padding: 0.5rem 0.6rem;
+  color: var(--muted);
+  background: var(--panel-soft);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  font-size: 0.7rem;
+  overflow-wrap: anywhere;
+}
+
+.ssh-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 1rem;
+  margin-top: 0.5rem;
+  color: var(--muted);
+  font-size: 0.7rem;
+}
+
+.ssh-card-head button {
+  flex: 0 0 auto;
+  min-height: 1.9rem;
+  padding: 0.25rem 0.55rem;
+  font-size: 0.74rem;
+}

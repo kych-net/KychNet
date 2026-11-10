@@ -153,6 +153,16 @@ export type GitToken = {
   last_used_at: string | null;
 };
 
+export type GitSshKey = {
+  id: string;
+  name: string;
+  fingerprint: string;
+  public_key: string;
+  created_at: string;
+  last_used_at: string | null;
+};
+
+
 export type PrStatus = "open" | "merged" | "closed";
 
 export type PullRequest = {
@@ -573,6 +583,14 @@ export const api = {
     }),
   revokeGitToken: (id: string) =>
     request<void>(`/git-tokens/${id}`, { method: "DELETE" }),
+  sshKeys: () => request<{ items: GitSshKey[] }>("/ssh-keys"),
+  createSshKey: (name: string, publicKey: string) =>
+    request<{ item: GitSshKey }>("/ssh-keys", {
+      method: "POST",
+      body: JSON.stringify({ name, public_key: publicKey }),
+    }),
+  revokeSshKey: (id: string) =>
+    request<void>(`/ssh-keys/${id}`, { method: "DELETE" }),
   projectWorkflows: (id: string) =>
     request<{ workflow_dir: string; default_branch: string; items: WorkflowItem[] }>(
       `/projects/${id}/workflows`,
