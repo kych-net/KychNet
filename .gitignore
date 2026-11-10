@@ -31,3 +31,6 @@ admin/dist/
 # Local env
 .env
 .env.local
+
+# 内容仓库本地克隆,不属于本仓库
+/地狱之下
