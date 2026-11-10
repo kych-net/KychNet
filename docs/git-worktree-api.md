@@ -158,9 +158,9 @@ runner 宿主进程在 act 成功后据此 PUT / DELETE。容器 `--network=none
 | --- | --- |
 | `src/git/http.rs` | `GitChannel` 与 `split_git_path()`：按 `.git` 后缀分流两类通道 |
 | `src/git/worktree.rs` | `resolve_ref` / `list` / `read` / `collect` / `total_bytes`，复用 `git::tree` 与 `git::lfs` |
-| `src/api.rs::git_write_user` | Git 令牌 + 登录会话的双通道写认证（smart HTTP 用） |
-| `src/api.rs::worktree_write_auth` | 文件树写认证：在上一项之后追加 runner token，`allowed_ref` 限定分支 |
-| `src/api.rs::worktree_get` / `worktree_put` / `worktree_delete` | 读写 handler |
+| `src/api/git.rs::git_write_user` | Git 令牌 + 登录会话的双通道写认证（smart HTTP 用） |
+| `src/api/git.rs::worktree_write_auth` | 文件树写认证：在上一项之后追加 runner token，`allowed_ref` 限定分支 |
+| `src/api/git.rs::worktree_get` / `worktree_put` / `worktree_delete` | 读写 handler |
 | `src/workflow/runner_api.rs::runner_write_scope` | runner token → in_progress run 的绑定分支；claim 下发 `git_base` / `write_ref` |
 | `src/workflow/mod.rs` | `PROTOCOL_VERSION = 2` |
 | `src/project.rs::write_file_bytes` | 字节写入：文本直存 blob，二进制走 LFS，生成 commit |
