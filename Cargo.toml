@@ -25,6 +25,13 @@ ftml = "1"
 hex = "0.4"
 openssl = { version = "0.10", optional = true }
 pulldown-cmark = "0.12"
+# Git over SSH：内建 SSH 服务端。russh 0.65 锁定 ssh-key 0.7.0-rc.11，
+# 这里必须用同一版本，否则会出现两份不兼容的 PublicKey 类型。
+# crypto 后端用 ring（纯 Rust 构建），避免 aws-lc-rs 的 CMake 依赖。
+russh = { version = "0.65", default-features = false, features = ["flate2", "ring", "rsa"] }
+ssh-key = "=0.7.0-rc.11"
+# 仅供 SSH 主机密钥生成使用；russh 0.65 依赖 rand 0.10，与项目本身的 rand 0.8 并存。
+russh-rand = { package = "rand", version = "0.10", features = ["thread_rng"] }
 # MCP（Model Context Protocol）官方 Rust SDK：/mcp 只读内容接口
 rmcp = { version = "3.9", features = ["transport-streamable-http-server"] }
 schemars = "1"
