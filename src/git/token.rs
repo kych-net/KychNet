@@ -49,6 +49,39 @@ pub async fn create(pool: &PgPool, user_id: Uuid, name: &str) -> Result<(GitToke
     Ok((item, token))
 }
 
+/// 签发一个限时令牌（SSH 侧的 `git-lfs-authenticate` 用）。
+///
+/// LFS 对象走 HTTP basic 传输，上传需要 `git_write_user()` 认可的令牌，
+/// 但 SSH 用户手上只有公钥。这里为已通过公钥认证的用户临时发一个
+/// Bearer 令牌，明文只在创建时返回一次，库里仍只存 SHA-256。
+/// 同一用户同名令牌只保留一个，避免每次 LFS 会话都堆积新行。
+pub async fn create_ephemeral(
+    pool: &PgPool,
+    user_id: Uuid,
+    name: &str,
+    ttl_secs: i64,
+) -> Result<String> {
+    let token = new_token();
+    let expires_at = chrono::Utc::now() + chrono::Duration::seconds(ttl_secs);
+    sqlx::query("DELETE FROM git_tokens WHERE user_id = $1 AND name = $2")
+        .bind(user_id)
+        .bind(name)
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO git_tokens (id, user_id, name, token_hash, expires_at)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(user_id)
+    .bind(name)
+    .bind(&hash(&token)[..])
+    .bind(expires_at)
+    .execute(pool)
+    .await?;
+    Ok(token)
+}
+
 pub async fn list(pool: &PgPool, user_id: Uuid) -> Result<Vec<GitToken>> {
     Ok(sqlx::query_as::<_, GitToken>(
         "SELECT id, name, created_at, expires_at, last_used_at
