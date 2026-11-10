@@ -193,13 +193,12 @@ impl russh::server::Handler for GitHandler {
             }
         };
         let Some((service, slug)) = parse_exec(command) else {
-            session
-                .data(
-                    channel,
-                    format!(
-                        "kych-net git: 只支持 git-upload-pack / git-receive-pack，收到: {command}\r\n"
-                    ),
-                )?;
+            session.data(
+                channel,
+                error_pkt(&format!(
+                    "kych-net git: 只支持 git-upload-pack / git-receive-pack，收到: {command}"
+                )),
+            )?;
             session.close(channel)?;
             return Ok(());
         };
@@ -221,7 +220,7 @@ impl russh::server::Handler for GitHandler {
             Ok(project) => project,
             Err(error) => {
                 tracing::info!(slug = %slug, %error, "SSH git 请求被拒绝");
-                session.data(channel, format!("{error}\r\n"))?;
+                session.data(channel, error_pkt(&error.to_string()))?;
                 session.close(channel)?;
                 return Ok(());
             }
