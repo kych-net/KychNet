@@ -21,6 +21,9 @@ pub struct Config {
     pub ssh_bind: Option<String>,
     /// SSH 主机私钥文件路径，首次启动自动生成。
     pub ssh_host_key: PathBuf,
+    /// Git HTTP 服务的对外根地址。SSH 侧没有 Host 头可用，
+    /// 拼 LFS 的 batch 端点时需要显式配置；换域名或自托管时覆盖。
+    pub git_http_base: String,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -58,6 +61,7 @@ impl Config {
             // SSH 不设默认值：不显式开启就不监听，行为与升级前完全一致。
             ssh_bind: std::env::var("SSH_BIND").ok().filter(|value| !value.trim().is_empty()),
             ssh_host_key: PathBuf::from(env_or("SSH_HOST_KEY", "ssh_host_ed25519_key")),
+            git_http_base: env_or("GIT_HTTP_BASE_URL", "https://kych.net"),
         })
     }
 }

@@ -387,8 +387,13 @@ pub async fn serve(cfg: Config) -> Result<()> {
     if let Some(bind) = cfg.ssh_bind.clone() {
         let ssh_pool = pool.clone();
         let host_key = cfg.ssh_host_key.clone();
+        let git_http_base = cfg.git_http_base.clone();
         tokio::spawn(async move {
-            let ssh_cfg = crate::git::ssh::SshConfig { bind, host_key };
+            let ssh_cfg = crate::git::ssh::SshConfig {
+                bind,
+                host_key,
+                git_http_base,
+            };
             if let Err(error) = crate::git::ssh::serve(ssh_cfg, ssh_pool).await {
                 tracing::error!(%error, "Git SSH 服务启动失败");
             }
