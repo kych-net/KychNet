@@ -379,6 +379,45 @@ async fn read_pkt_lines<R: AsyncRead + Unpin>(
     }
 }
 
+/// 从 `upload_pack_request` 的响应里剥掉开头的协商/浅边界控制行，
+/// 只留下 packfile。
+///
+/// SSH 的 v0 fetch 是有状态会话，ACK/NAK（以及 deepen 时的 shallow 段）
+/// 已在 `session_upload_pack_v0` 的协商轮发给客户端；`upload_pack_request`
+/// 却是按无状态 HTTP RPC 设计的，会把这些控制行连同 pack 一起返回。
+/// 若在 done 轮原样再发一遍，客户端会多读一行，把 `0008` 当作 PACK 头。
+///
+/// packfile 以字面量 `PACK` 开头，不是 pkt-line，循环会在那里停下。
+fn packfile_only(out: &[u8]) -> &[u8] {
+    let mut pos = 0;
+    while pos + 4 <= out.len() {
+        let Some(length) = std::str::from_utf8(&out[pos..pos + 4])
+            .ok()
+            .and_then(|text| usize::from_str_radix(text, 16).ok())
+        else {
+            break;
+        };
+        if length == 0 {
+            pos += 4; // flush-pkt
+            continue;
+        }
+        if length < 4 || pos + length > out.len() {
+            break;
+        }
+        let payload = &out[pos + 4..pos + length];
+        let is_control = payload.starts_with(b"ACK ")
+            || payload.starts_with(b"NAK")
+            || payload.starts_with(b"shallow ")
+            || payload.starts_with(b"unshallow ")
+            || payload.starts_with(b"ERR ");
+        if !is_control {
+            break;
+        }
+        pos += length;
+    }
+    &out[pos..]
+}
+
 /// v0 fetch 会话：广告 → 多轮 want/have 协商 → done 后发 pack。
 async fn session_upload_pack_v0<S>(
     pool: &PgPool,
@@ -418,8 +457,19 @@ where
         acc.filter_blob_none |= request.filter_blob_none;
 
         if request.done {
+            // 关键：把 done 传下去。upload_pack_request 按 request.done 决定
+            // 是回协商响应还是生成 packfile；漏掉这一行会让它一直走 !done
+            // 分支，SSH v0 克隆根本收不到 pack（客户端只看到 EOF）。
+            acc.done = true;
             let out = crate::git::http::upload_pack_request(pool, project, &acc).await?;
-            stream.write_all(&out).await?;
+            // upload_pack_request 是给无状态 HTTP RPC 用的，返回
+            // 「ACK/NAK + packfile」。SSH 是有状态会话：协商轮已经把 ACK/NAK
+            // 发给客户端，libgit2 的 wait_while_ack() 读到第一个 NAK 就结束
+            // 协商并开始读 pack 流。若这里再发一次控制行，客户端会把 `0008`
+            // 当成 PACK 头，报 "Incomplete pack header"（Working Copy 等
+            // libgit2 客户端）；macOS 命令行 git 走 v2 路径，所以不受影响。
+            // 本轮只发 packfile 段，与上面已发过的协商响应拼成完整序列。
+            stream.write_all(packfile_only(&out)).await?;
             stream.flush().await?;
             return Ok(());
         }
@@ -437,6 +487,10 @@ where
         }
 
         // 协商轮：只回 ACK/NAK，绝不提前发 pack。
+        // 广告里声明了 multi_ack_detailed，就必须按该扩展的序列回应：
+        // `ACK … common` … `ACK … ready` + `NAK`，与 http::upload_pack_request
+        // 的 !done 分支一致。旧实现只回一条裸 `ACK <oid>`，libgit2 的
+        // store_common() 会一直等下一条 pkt，增量 fetch 会卡住。
         let ack = if acc.haves.is_empty() {
             proto::pkt_str("NAK\n")
         } else {
@@ -444,11 +498,17 @@ where
             match crate::git::http::have_reachable(&mut conn, project.id, &acc.haves, &acc.shallow)
                 .await?
             {
-                Some((common, _)) => match common.last() {
-                    Some(oid) => proto::pkt_str(&format!("ACK {}\n", oid.to_hex())),
-                    None => proto::pkt_str("NAK\n"),
-                },
-                None => proto::pkt_str("NAK\n"),
+                Some((common, _)) if !common.is_empty() => {
+                    let mut out = Vec::new();
+                    for oid in &common {
+                        out.extend(proto::pkt_str(&format!("ACK {} common\n", oid.to_hex())));
+                    }
+                    let last = common.last().expect("common 非空");
+                    out.extend(proto::pkt_str(&format!("ACK {} ready\n", last.to_hex())));
+                    out.extend(proto::pkt_str("NAK\n"));
+                    out
+                }
+                _ => proto::pkt_str("NAK\n"),
             }
         };
         stream.write_all(&ack).await?;
@@ -558,5 +618,33 @@ mod tests {
             parse_exec("git-upload-pack '/docs/site.git'"),
             Some((Service::Upload, "docs/site".into()))
         );
+    }
+
+    #[test]
+    fn packfile_only_strips_final_nak() {
+        // libgit2 首次 clone 会把 wants + flush + done 一次发完：协商轮的
+        // NAK 已被 wait_while_ack() 消费，done 轮若再带一个 NAK，客户端
+        // 就会把 `0008` 当成 PACK 头，报 "Incomplete pack header"。
+        let mut response = proto::pkt_str("NAK\n");
+        response.extend(b"PACK\x00\x00\x00\x02rest");
+        assert_eq!(
+            packfile_only(&response),
+            &b"PACK\x00\x00\x00\x02rest"[..]
+        );
+    }
+
+    #[test]
+    fn packfile_only_strips_shallow_section() {
+        let mut response = proto::pkt_str("shallow 8d523ed47d6dba3062ef9728b49adc41f3d6ac49\n");
+        response.extend(proto::flush());
+        response.extend(proto::pkt_str("NAK\n"));
+        response.extend(b"PACKdata");
+        assert_eq!(packfile_only(&response), &b"PACKdata"[..]);
+    }
+
+    #[test]
+    fn packfile_only_keeps_bare_pack() {
+        let response = b"PACK\x00\x00\x00\x02rest".to_vec();
+        assert_eq!(packfile_only(&response), response.as_slice());
     }
 }
