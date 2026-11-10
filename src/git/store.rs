@@ -57,6 +57,37 @@ pub async fn require_object(
         .ok_or_else(|| anyhow::anyhow!("Git 对象不存在: {oid}"))
 }
 
+/// 批量取对象：fetch 热路径按批拉取，替代每个对象一次 `SELECT` 的逐行查询。
+/// 返回按数据库顺序的结果，缺失的 oid 不返回，由调用方决定容忍或报错。
+pub async fn get_objects(
+    conn: &mut PgConnection,
+    project_id: Uuid,
+    oids: &[Oid],
+) -> Result<Vec<(Oid, Object)>> {
+    if oids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let keys: Vec<Vec<u8>> = oids.iter().map(|oid| oid.as_bytes().to_vec()).collect();
+    let rows = sqlx::query(
+        "SELECT oid, kind, data FROM git_objects WHERE project_id = $1 AND oid = ANY($2::bytea[])",
+    )
+    .bind(project_id)
+    .bind(keys)
+    .fetch_all(conn)
+    .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let raw: Vec<u8> = row.try_get("oid")?;
+        let oid = Oid::from_slice(&raw)?;
+        let kind: i16 = row.try_get("kind")?;
+        let data: Vec<u8> = row.try_get("data")?;
+        let kind = ObjectKind::from_i16(kind)
+            .ok_or_else(|| anyhow::anyhow!("未知的 Git 对象类型: {kind}"))?;
+        out.push((oid, Object { kind, data }));
+    }
+    Ok(out)
+}
+
 pub async fn get_ref(
     conn: &mut PgConnection,
     project_id: Uuid,
