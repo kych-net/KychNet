@@ -364,6 +364,9 @@ td button {
   border: 1px solid var(--error-border);
   border-radius: 6px;
   padding: 0.5rem 0.75rem;
+  position: sticky;
+  top: 0.5rem;
+  z-index: 20;
 }
 
 .notice {
@@ -372,6 +375,9 @@ td button {
   border: 1px solid var(--notice-border);
   border-radius: 6px;
   padding: 0.5rem 0.75rem;
+  position: sticky;
+  top: 0.5rem;
+  z-index: 20;
 }
 
 .hint {
@@ -1363,6 +1369,9 @@ tbody tr:hover {
   padding: 0.7rem 0.9rem;
   border-radius: 10px;
   border: 1px solid transparent;
+  position: sticky;
+  top: 0.5rem;
+  z-index: 20;
 }
 
 .error {
