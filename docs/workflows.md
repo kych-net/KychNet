@@ -9,6 +9,13 @@
 > [`kych-net/KychRunner`](https://github.com/kych-net/KychRunner)（MIT）、可选安装 / 可临时禁用；
 > 工作流语法对齐 GitHub Actions（默认 `.<site_name>/工作流/`）。
 
+> **协议变更(v5 之后)**：KychRunner 协议 `PROTOCOL_VERSION` 已升到 **2**
+> （见 git-worktree-api.md），runner **不再默认走 snapshot 端点**，改为直接读写
+> `/git/*` 组接口（worktree_get / begin_write / write_stream / commit_write），
+> 服务端为 snapshot、diff、事件 notify 保留 **v1 回退**。上文「唯一的快照来源」
+> 与下文流程图描述的是 **v1 回退路径**；v2 主路径的环节与回写规则以
+> git-worktree-api.md 为准，挂接记录见 workflow-integration.md。
+
 ## 0. 决策摘要
 
 | 项 | 定案 |
@@ -26,6 +33,9 @@
 完整契约见 KychRunner 仓库的 `docs/protocol.md`；本仓实现见 `src/workflow/runner_api.rs` 与 `src/workflow/snapshot.rs`。
 
 ## 1. 两层架构
+
+> 下图为 **v1 回退路径**（快照 tar.gz 走 `/api/runner/jobs/{id}/snapshot`）；
+> v2 主路径 runner 直读写 `/git/*` 组接口，环节划分见 git-worktree-api.md。
 
 ```mermaid
 flowchart TB
