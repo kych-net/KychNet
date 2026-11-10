@@ -10,7 +10,7 @@ const RunnersView = lazy(() => import("../views/RunnersView").then((module) => (
 const UsersView = lazy(() => import("../views/UsersView").then((module) => ({ default: module.UsersView })));
 const SshKeysView = lazy(() => import("../views/SshKeysView").then((module) => ({ default: module.SshKeysView })));
 
-type View = "contents" | "projects" | "runners" | "invites" | "users" | "settings" | "profile";
+type View = "contents" | "projects" | "ssh" | "runners" | "invites" | "users" | "settings" | "profile";
 
 type Props = {
   user: User;
@@ -29,6 +29,7 @@ const adminViews: View[] = ["runners", "invites", "users", "settings"];
 const viewMeta: Record<View, { title: string; subtitle: string }> = {
   contents: { title: "内容", subtitle: "维护页面、样式与发布状态" },
   projects: { title: "项目", subtitle: "站内 Git 仓库、分支与协作" },
+  ssh: { title: "SSH 公钥", subtitle: "登记用于 Git over SSH 的公钥" },
   runners: { title: "执行器", subtitle: "全站共享的工作流执行器与注册码" },
   invites: { title: "邀请码", subtitle: "控制注册入口与有效期" },
   users: { title: "用户", subtitle: "账号状态与权限" },
@@ -89,6 +90,9 @@ export function Shell({
           </button>
           <button className={view === "projects" ? "active" : ""} onClick={() => go("projects")}>
             项目
+          </button>
+          <button className={view === "ssh" ? "active" : ""} onClick={() => go("ssh")}>
+            SSH 公钥
           </button>
           {user.is_admin &&
             adminViews.map((item) => (
@@ -159,6 +163,7 @@ export function Shell({
         <Suspense fallback={<p className="hint">加载视图…</p>}>
         {view === "contents" && <ContentsView />}
         {view === "projects" && <ProjectsView isAdmin={user.is_admin} />}
+        {view === "ssh" && <SshKeysView />}
         {view === "runners" && user.is_admin && <RunnersView />}
         {view === "invites" && user.is_admin && <InvitesView />}
         {view === "users" && user.is_admin && <UsersView />}
