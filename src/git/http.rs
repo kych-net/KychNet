@@ -25,7 +25,7 @@ pub struct ReceiveOutcome {
 
 fn upload_caps(project: &Project) -> String {
     format!(
-        "agent=kych-net/0.3 ofs-delta shallow filter \
+        "agent=kych-net/0.3 ofs-delta shallow deepen-relative filter multi_ack_detailed \
          allow-tip-sha1-in-want allow-reachable-sha1-in-want \
          symref=HEAD:refs/heads/{}",
         project.default_branch
@@ -145,19 +145,6 @@ async fn peel_tag_once(
     Ok(current)
 }
 
-/// 把引用目标解析成提交；标签会先剥开，不是提交时返回 None。
-async fn resolve_commit(
-    conn: &mut PgConnection,
-    project_id: Uuid,
-    oid: Oid,
-) -> Result<Option<Oid>> {
-    let peeled = peel_tag_once(conn, project_id, oid).await?;
-    let Some(object) = store::get_object(conn, project_id, peeled).await? else {
-        return Ok(None);
-    };
-    Ok((object.kind == ObjectKind::Commit).then_some(peeled))
-}
-
 /// 计算浅克隆边界。
 ///
 /// 返回 `(新的 shallow 边界, 需要 unshallow 的旧边界, 遍历时不再展开父提交的集合)`。
@@ -179,15 +166,25 @@ async fn compute_shallow(
 
     // 相对加深从客户端现有边界继续往下走；绝对深度则直接从 want 重新计算。
     let relative = request.deepen_relative && !request.shallow.is_empty();
-    let mut queue: Vec<(Oid, u32)> = Vec::new();
+    let mut current: Vec<(Oid, u32)> = Vec::new();
     if relative {
         for oid in &request.shallow {
-            queue.push((*oid, 0));
+            current.push((*oid, 0));
         }
     } else {
+        let rows = store::get_objects(conn, project_id, wants).await?;
+        let mut by_oid: HashMap<Oid, Object> = rows.into_iter().collect();
         for want in wants {
-            if let Some(commit) = resolve_commit(conn, project_id, *want).await? {
-                queue.push((commit, 0));
+            let Some(mut object) = by_oid.remove(want) else {
+                continue;
+            };
+            let mut oid = *want;
+            if object.kind == ObjectKind::Tag {
+                oid = peel_tag_once(conn, project_id, *want).await?;
+                object = store::require_object(conn, project_id, oid).await?;
+            }
+            if object.kind == ObjectKind::Commit {
+                current.push((oid, 0));
             }
         }
     }
@@ -195,31 +192,45 @@ async fn compute_shallow(
     let mut boundaries = Vec::new();
     let mut stop = HashSet::new();
     let mut seen = HashSet::new();
-    while let Some((oid, level)) = queue.pop() {
-        if !seen.insert(oid) {
-            continue;
+    // 按深度分层遍历,同一层的提交合并成一次查询,避免逐提交访问数据库。
+    while !current.is_empty() {
+        let mut next: Vec<(Oid, u32)> = Vec::new();
+        let mut pending: Vec<(Oid, u32)> = Vec::new();
+        for (oid, level) in current.drain(..) {
+            if !seen.insert(oid) {
+                continue;
+            }
+            if seen.len() > MAX_COMMIT_WALK {
+                bail!("提交历史过深，无法计算浅克隆边界");
+            }
+            // 绝对深度以 want 为第 1 层；相对加深从旧边界再往下数 depth 层。
+            let at_boundary = if relative {
+                level >= depth
+            } else {
+                level + 1 >= depth
+            };
+            if at_boundary {
+                stop.insert(oid);
+                boundaries.push(oid);
+                continue;
+            }
+            pending.push((oid, level));
         }
-        if seen.len() > MAX_COMMIT_WALK {
-            bail!("提交历史过深，无法计算浅克隆边界");
+        let oids: Vec<Oid> = pending.iter().map(|(oid, _)| *oid).collect();
+        let rows = store::get_objects(conn, project_id, &oids).await?;
+        let mut found: HashMap<Oid, Object> = rows.into_iter().collect();
+        for (oid, level) in pending {
+            let Some(object) = found.remove(&oid) else {
+                bail!("Git 对象不存在: {oid}");
+            };
+            if object.kind != ObjectKind::Commit {
+                continue;
+            }
+            for parent in super::object::commit_parents(&object.data)? {
+                next.push((parent, level + 1));
+            }
         }
-        // 绝对深度以 want 为第 1 层；相对加深从旧边界再往下数 depth 层。
-        let at_boundary = if relative {
-            level >= depth
-        } else {
-            level + 1 >= depth
-        };
-        if at_boundary {
-            stop.insert(oid);
-            boundaries.push(oid);
-            continue;
-        }
-        let object = store::require_object(conn, project_id, oid).await?;
-        if object.kind != ObjectKind::Commit {
-            continue;
-        }
-        for parent in super::object::commit_parents(&object.data)? {
-            queue.push((parent, level + 1));
-        }
+        current = next;
     }
     boundaries.sort();
     boundaries.dedup();
@@ -240,7 +251,10 @@ async fn compute_shallow(
 ///
 /// - `exclude`：客户端已经拥有的对象，不发送也不继续遍历；
 /// - `shallow`：这些提交不再向父提交展开；
-/// - `filter_blob_none`：省略非直接 want 的 blob。
+/// - `filter_blob_none`：省略非直接 want 的 blob；
+/// - `deepen`：本轮是加深请求。此时 `exclude` 中的提交是客户端已有的
+///   通道（含旧浅边界），必须沿提交父链继续穿过它们才能走到新浅边界，
+///   否则 unshallow 之后客户端向上遍历会因缺父对象而失败。
 async fn collect_objects(
     conn: &mut PgConnection,
     project_id: Uuid,
@@ -248,51 +262,76 @@ async fn collect_objects(
     exclude: &HashSet<Oid>,
     shallow: &HashSet<Oid>,
     filter_blob_none: bool,
+    deepen: bool,
 ) -> Result<Vec<(ObjectKind, Vec<u8>)>> {
     let direct: HashSet<Oid> = wants.iter().copied().collect();
     let mut seen = HashSet::new();
     let mut objects = Vec::new();
     let mut stack: Vec<Oid> = wants.to_vec();
-    while let Some(oid) = stack.pop() {
-        if exclude.contains(&oid) {
-            continue;
+    // 按批拉取:每批 oid 一次 `ANY($2)` 查询,把原先每对象一行的
+    // 逐行 SELECT 收敛为常数次往返,对象数再多也不会线性放大延迟。
+    const BATCH: usize = 512;
+    while !stack.is_empty() {
+        let take = stack.len().min(BATCH);
+        let candidates: Vec<Oid> = stack.drain(stack.len() - take..).collect();
+        let mut fetch: Vec<Oid> = Vec::with_capacity(candidates.len());
+        for oid in candidates {
+            if exclude.contains(&oid) && !deepen {
+                // 客户端已有的对象:不发送也不再拉取。
+                continue;
+            }
+            if seen.insert(oid) {
+                if seen.len() > MAX_OBJECT_WALK {
+                    bail!("需要传输的对象过多，请缩小拉取范围");
+                }
+                fetch.push(oid);
+            }
         }
-        if !seen.insert(oid) {
-            continue;
-        }
-        if seen.len() > MAX_OBJECT_WALK {
-            bail!("需要传输的对象过多，请缩小拉取范围");
-        }
-        let Some(object) = store::get_object(conn, project_id, oid).await? else {
-            bail!("请求的对象不存在: {oid}");
-        };
-        match object.kind {
-            ObjectKind::Commit => {
-                stack.push(commit_tree(&object.data)?);
-                if !shallow.contains(&oid) {
+        let rows = store::get_objects(conn, project_id, &fetch).await?;
+        let mut found: HashMap<Oid, Object> = rows.into_iter().collect();
+        for oid in fetch {
+            let Some(object) = found.remove(&oid) else {
+                if exclude.contains(&oid) {
+                    continue;
+                }
+                bail!("请求的对象不存在: {oid}");
+            };
+            if exclude.contains(&oid) {
+                // 加深请求:已有对象本身不发送,只沿提交链向下走到新浅边界,
+                // 否则 unshallow 之后客户端向上遍历会因缺父对象而失败。
+                if object.kind == ObjectKind::Commit && !shallow.contains(&oid) {
                     stack.extend(super::object::commit_parents(&object.data)?);
                 }
+                continue;
             }
-            ObjectKind::Tree => {
-                let tree = Tree::parse(&object.data)?;
-                for entry in tree.entries.values() {
-                    match entry {
-                        TreeEntry::Blob(oid) | TreeEntry::Dir(oid) => stack.push(*oid),
+            match object.kind {
+                ObjectKind::Commit => {
+                    stack.push(commit_tree(&object.data)?);
+                    if !shallow.contains(&oid) {
+                        stack.extend(super::object::commit_parents(&object.data)?);
+                    }
+                }
+                ObjectKind::Tree => {
+                    let tree = Tree::parse(&object.data)?;
+                    for entry in tree.entries.values() {
+                        match entry {
+                            TreeEntry::Blob(oid) | TreeEntry::Dir(oid) => stack.push(*oid),
+                        }
+                    }
+                }
+                ObjectKind::Tag => {
+                    if let Some(target) = tag_target(&object.data)? {
+                        stack.push(target);
+                    }
+                }
+                ObjectKind::Blob => {
+                    if filter_blob_none && !direct.contains(&oid) {
+                        continue;
                     }
                 }
             }
-            ObjectKind::Tag => {
-                if let Some(target) = tag_target(&object.data)? {
-                    stack.push(target);
-                }
-            }
-            ObjectKind::Blob => {
-                if filter_blob_none && !direct.contains(&oid) {
-                    continue;
-                }
-            }
+            objects.push((object.kind, object.data));
         }
-        objects.push((object.kind, object.data));
     }
     Ok(objects)
 }
@@ -311,12 +350,24 @@ async fn have_reachable(
     let mut common = Vec::new();
     let mut exclude = HashSet::new();
     let mut stack: Vec<Oid> = Vec::new();
+    // have 逐个 resolve_commit 会每个 have 查 2~3 次库;这里先批量取回,
+    // 只有标签才单独逐层剥开。
+    let rows = store::get_objects(conn, project_id, haves).await?;
+    let mut by_oid: HashMap<Oid, Object> = rows.into_iter().collect();
     for have in haves {
         // 即使 have 是标签对象，也从排除集合里剔掉，避免重复发送。
         exclude.insert(*have);
-        if let Some(commit) = resolve_commit(conn, project_id, *have).await? {
-            common.push(commit);
-            stack.push(commit);
+        let Some(mut object) = by_oid.remove(have) else {
+            continue;
+        };
+        let mut oid = *have;
+        if object.kind == ObjectKind::Tag {
+            oid = peel_tag_once(conn, project_id, *have).await?;
+            object = store::require_object(conn, project_id, oid).await?;
+        }
+        if object.kind == ObjectKind::Commit {
+            common.push(oid);
+            stack.push(oid);
         }
     }
     if common.is_empty() {
@@ -324,39 +375,51 @@ async fn have_reachable(
     }
 
     let mut seen = HashSet::new();
-    while let Some(oid) = stack.pop() {
-        if !seen.insert(oid) {
-            continue;
-        }
-        if seen.len() > MAX_OBJECT_WALK {
-            return Ok(None);
-        }
-        let Some(object) = store::get_object(conn, project_id, oid).await? else {
-            continue;
-        };
-        match object.kind {
-            ObjectKind::Commit => {
-                stack.push(commit_tree(&object.data)?);
-                if !client_shallow.contains(&oid) {
-                    stack.extend(super::object::commit_parents(&object.data)?);
+    // 与 collect_objects 同样按批拉取:增量 fetch 每次都会 walk 客户端
+    // 已有的全部 tree/blob,逐行查询会让延迟随仓库对象数线性放大。
+    const BATCH: usize = 512;
+    while !stack.is_empty() {
+        let take = stack.len().min(BATCH);
+        let candidates: Vec<Oid> = stack.drain(stack.len() - take..).collect();
+        let mut fetch: Vec<Oid> = Vec::with_capacity(candidates.len());
+        for oid in candidates {
+            if seen.insert(oid) {
+                if seen.len() > MAX_OBJECT_WALK {
+                    return Ok(None);
                 }
+                fetch.push(oid);
             }
-            ObjectKind::Tree => {
-                let tree = Tree::parse(&object.data)?;
-                for entry in tree.entries.values() {
-                    match entry {
-                        TreeEntry::Blob(oid) | TreeEntry::Dir(oid) => stack.push(*oid),
+        }
+        let rows = store::get_objects(conn, project_id, &fetch).await?;
+        let mut found: HashMap<Oid, Object> = rows.into_iter().collect();
+        for oid in fetch {
+            let Some(object) = found.remove(&oid) else {
+                continue;
+            };
+            match object.kind {
+                ObjectKind::Commit => {
+                    stack.push(commit_tree(&object.data)?);
+                    if !client_shallow.contains(&oid) {
+                        stack.extend(super::object::commit_parents(&object.data)?);
                     }
                 }
-            }
-            ObjectKind::Tag => {
-                if let Some(target) = tag_target(&object.data)? {
-                    stack.push(target);
+                ObjectKind::Tree => {
+                    let tree = Tree::parse(&object.data)?;
+                    for entry in tree.entries.values() {
+                        match entry {
+                            TreeEntry::Blob(oid) | TreeEntry::Dir(oid) => stack.push(*oid),
+                        }
+                    }
                 }
+                ObjectKind::Tag => {
+                    if let Some(target) = tag_target(&object.data)? {
+                        stack.push(target);
+                    }
+                }
+                ObjectKind::Blob => {}
             }
-            ObjectKind::Blob => {}
+            exclude.insert(oid);
         }
-        exclude.insert(oid);
     }
     Ok(Some((common, exclude)))
 }
@@ -402,15 +465,6 @@ pub async fn upload_pack(pool: &PgPool, project: &Project, body: &[u8]) -> Resul
         };
     let (boundaries, unshallow, shallow) =
         compute_shallow(&mut conn, project.id, &request.wants, &request).await?;
-    let objects = collect_objects(
-        &mut conn,
-        project.id,
-        &request.wants,
-        &exclude,
-        &shallow,
-        request.filter_blob_none,
-    )
-    .await?;
 
     // `deepen` 请求:必须先回浅边界段并以 flush 收尾,客户端读完这段才进入 ACK/NAK
     // 协商(git-upload-pack 即此顺序)。若把 ACK/NAK 提前,客户端会报
@@ -419,6 +473,44 @@ pub async fn upload_pack(pool: &PgPool, project: &Project, body: &[u8]) -> Resul
         out.extend(shallow_response(&boundaries, &unshallow));
         out.extend(proto::flush());
     }
+
+    // 协商轮(请求里没有 `done`)按官方 multi_ack_detailed 序列响应:
+    //   只有 want 段      → 空响应;
+    //   have 段无公共提交 → NAK(等客户端补发 haves);
+    //   have 段有公共提交 → `ACK … common` … `ACK … ready` + `NAK`。
+    // `ready`+`NAK` 会让客户端补发 `done` 轮,packfile 只在 `done` 轮发送。
+    // 这里绝不能像官方单请求 EOF 形态那样把 final ACK+pack 一并塞进本段:
+    // 分轮(stateless)下客户端不消费这些字节,它们会滞留并与 `done` 轮的
+    // 响应错位,导致 unpack 读到混杂的两个 pack 而挂死/报
+    // "bad line length character: PACK"。
+    if !request.done {
+        if request.haves.is_empty() {
+            return Ok(out);
+        }
+        if common.is_empty() {
+            out.extend(proto::pkt_str("NAK\n"));
+            return Ok(out);
+        }
+        for oid in &common {
+            out.extend(proto::pkt_str(&format!("ACK {} common\n", oid.to_hex())));
+        }
+        let last = common.last().expect("common 非空");
+        out.extend(proto::pkt_str(&format!("ACK {} ready\n", last.to_hex())));
+        out.extend(proto::pkt_str("NAK\n"));
+        return Ok(out);
+    }
+
+    // `done` 轮:ACK/NAK 后紧跟 packfile。
+    let objects = collect_objects(
+        &mut conn,
+        project.id,
+        &request.wants,
+        &exclude,
+        &shallow,
+        request.filter_blob_none,
+        request.deepen.is_some(),
+    )
+    .await?;
     match common.last() {
         Some(oid) => out.extend(proto::pkt_str(&format!("ACK {}\n", oid.to_hex()))),
         None => out.extend(proto::pkt_str("NAK\n")),
@@ -562,6 +654,7 @@ async fn v2_fetch(
         &exclude,
         &shallow,
         request.filter_blob_none,
+        request.deepen.is_some(),
     )
     .await?;
 
