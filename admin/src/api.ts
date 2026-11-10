@@ -282,6 +282,19 @@ export function gitUrl(slug: string): string {
   return `${API_BASE}/git/${slug}.git`;
 }
 
+/** Git over SSH 地址；端口固定 2222，host 跟随 API 基址。 */
+export function sshGitUrl(slug: string): string {
+  let host = "kych.net";
+  if (API_BASE) {
+    try {
+      host = new URL(API_BASE).host;
+    } catch {
+      // 配置异常时保留默认站名，至少地址可读。
+    }
+  }
+  return `ssh://git@${host}:2222/${slug}.git`;
+}
+
 export class ApiError extends Error {
   status: number;
 
