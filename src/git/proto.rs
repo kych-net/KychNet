@@ -116,26 +116,57 @@ pub fn parse_upload_request(data: &[u8]) -> Result<UploadRequest> {
 }
 
 fn parse_upload_request_inner(data: &[u8]) -> Result<UploadRequest> {
-    let (lines, _) = parse_pkt_lines(data)?;
     let mut request = UploadRequest::default();
-    for line in lines {
-        let text = String::from_utf8_lossy(&line);
-        let text = text.trim_end_matches('\n');
-        if let Some(rest) = text.strip_prefix("want ") {
-            let hex = rest.split(' ').next().unwrap_or_default();
-            request.wants.push(Oid::from_hex(hex)?);
-        } else if let Some(rest) = text.strip_prefix("have ") {
-            request.haves.push(Oid::from_hex(rest.split(' ').next().unwrap_or_default())?);
-        } else if let Some(rest) = text.strip_prefix("shallow ") {
-            request.shallow.push(Oid::from_hex(rest.split(' ').next().unwrap_or_default())?);
-        } else if let Some(rest) = text.strip_prefix("deepen ") {
-            request.deepen = rest.trim().parse().ok();
-        } else if text == "deepen-relative" {
-            request.deepen_relative = true;
-        } else if text == "done" {
-            request.done = true;
-        } else if text.starts_with("filter blob:none") {
-            request.filter_blob_none = true;
+    // upload 请求由多个 flush 分隔的段组成：want 段、可选的 have 段、
+    // 以及最后的 `done` 段。`done` 在首个 flush 之后，所以这里不能
+    // 像 parse_pkt_lines 那样遇到 flush 就停止，否则协商轮会被误判成
+    // done 轮（或反过来），导致 packfile 发早/发丢。
+    let mut pos = 0usize;
+    while pos < data.len() {
+        if pos + 4 > data.len() {
+            bail!("pkt-line 数据被截断");
+        }
+        let header = std::str::from_utf8(&data[pos..pos + 4])
+            .map_err(|_| anyhow::anyhow!("pkt-line 长度不是 ASCII"))?;
+        let length = usize::from_str_radix(header, 16)
+            .map_err(|_| anyhow::anyhow!("pkt-line 长度非法: {header}"))?;
+        match length {
+            0 => pos += 4,
+            1 | 2 => pos += 4,
+            3 => bail!("非法的 pkt-line 长度"),
+            _ => {
+                if length < 4 || pos + length > data.len() {
+                    bail!("pkt-line 长度超出数据范围");
+                }
+                let text = String::from_utf8_lossy(&data[pos + 4..pos + length]);
+                let text = text.trim_end_matches('\n');
+                if let Some(rest) = text.strip_prefix("want ") {
+                    let hex = rest.split(' ').next().unwrap_or_default();
+                    request.wants.push(Oid::from_hex(hex)?);
+                    // git 把 deepen-relative 内联在首个 want 行的能力列表里,
+                    // 不一定发独立的 `deepen-relative` 行。
+                    if rest.split(' ').any(|token| token == "deepen-relative") {
+                        request.deepen_relative = true;
+                    }
+                } else if let Some(rest) = text.strip_prefix("have ") {
+                    request
+                        .haves
+                        .push(Oid::from_hex(rest.split(' ').next().unwrap_or_default())?);
+                } else if let Some(rest) = text.strip_prefix("shallow ") {
+                    request
+                        .shallow
+                        .push(Oid::from_hex(rest.split(' ').next().unwrap_or_default())?);
+                } else if let Some(rest) = text.strip_prefix("deepen ") {
+                    request.deepen = rest.trim().parse().ok();
+                } else if text == "deepen-relative" {
+                    request.deepen_relative = true;
+                } else if text == "done" {
+                    request.done = true;
+                } else if text.starts_with("filter blob:none") {
+                    request.filter_blob_none = true;
+                }
+                pos += length;
+            }
         }
     }
     Ok(request)
@@ -734,6 +765,24 @@ mod tests {
         assert_eq!(request.deepen, Some(2));
         assert!(request.filter_blob_none);
         assert!(request.done);
+    }
+
+    #[test]
+    fn parses_deepen_relative_from_want_capabilities() {
+        // git 只把 deepen-relative 内联在 want 行的能力列表,不发独立行。
+        let want = "3".repeat(40);
+        let shallow = "5".repeat(40);
+        let mut data = pkt_str(&format!(
+            "want {want} multi_ack_detailed deepen-relative ofs-delta agent=git/2.43.0\n"
+        ));
+        data.extend(pkt_str(&format!("shallow {shallow}\n")));
+        data.extend(pkt_str("deepen 5\n"));
+        data.extend(flush());
+
+        let request = parse_upload_request(&data).unwrap();
+        assert!(request.deepen_relative);
+        assert_eq!(request.deepen, Some(5));
+        assert_eq!(request.shallow.len(), 1);
     }
 
     #[test]
