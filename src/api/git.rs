@@ -6,6 +6,12 @@ pub(crate) struct GitTokenBody {
     name: String,
 }
 
+#[derive(Deserialize)]
+pub(crate) struct SshKeyBody {
+    name: String,
+    public_key: String,
+}
+
 pub(crate) async fn git_token_list(
     State(state): State<AppState>,
     session: Session,
@@ -33,6 +39,41 @@ pub(crate) async fn git_token_revoke(
 ) -> ApiResult<StatusCode> {
     let user = current_user(&state, &session).await?;
     crate::git::token::revoke(&state.pool, user.id, id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// SSH 公钥管理与 Git 令牌一致：本人登录会话即可增删查。
+pub(crate) async fn ssh_key_list(
+    State(state): State<AppState>,
+    session: Session,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = current_user(&state, &session).await?;
+    Ok(Json(json!({
+        "items": crate::git::ssh_key::list(&state.pool, user.id).await?
+    })))
+}
+
+pub(crate) async fn ssh_key_create(
+    State(state): State<AppState>,
+    session: Session,
+    Json(body): Json<SshKeyBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = current_user(&state, &session).await?;
+    let item = crate::git::ssh_key::create(&state.pool, user.id, &body.name, &body.public_key)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({ "item": item })))
+}
+
+pub(crate) async fn ssh_key_revoke(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+) -> ApiResult<StatusCode> {
+    let user = current_user(&state, &session).await?;
+    crate::git::ssh_key::revoke(&state.pool, user.id, id)
+        .await
+        .map_err(ApiError::from)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
