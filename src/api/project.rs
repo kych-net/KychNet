@@ -6,6 +6,9 @@ pub(crate) struct ProjectCreateBody {
     slug: String,
     #[serde(default)]
     description: String,
+    /// 可选：站内模板项目 slug。给了就浅克隆模板默认分支的最新快照。
+    #[serde(default)]
+    template: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -103,11 +106,17 @@ pub(crate) async fn project_create(
     Json(body): Json<ProjectCreateBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let user = current_user(&state, &session).await?;
+    let template = body
+        .template
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     let project = crate::project::create_project(
         &state.pool,
         &user,
         &body.slug,
         &body.description,
+        template,
     )
     .await?;
     if let Err(error) = state.build_ctl.build_all().await {
@@ -116,7 +125,7 @@ pub(crate) async fn project_create(
             format!("项目已创建，但自动编译失败：{error}"),
         ));
     }
-    Ok(Json(json!({ "item": project })))
+    Ok(Json(json!({ "item": project, "template": template })))
 }
 
 /// 导入是「服务端替你访问外部网络 + 写库」的重操作：按用户和 IP 双向限量，

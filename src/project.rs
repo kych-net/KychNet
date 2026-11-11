@@ -312,17 +312,91 @@ async fn commit_files(
     Ok(commit)
 }
 
+/// 模板快照允许复制的对象数与总字节上限。模板是站内项目，正常规模远小于
+/// 这个量级；上限只用来兜住异常大仓库，避免一次创建把事务拖到超时。
+const TEMPLATE_MAX_OBJECTS: usize = 20_000;
+const TEMPLATE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// 把源项目某棵 tree 下的全部对象复制到目标项目，返回复制的对象数。
+///
+/// 只走 tree/blob，不碰 commit：模板的提交历史属于模板自己，新项目只拿
+/// 最新文件快照（浅克隆 depth=1 的语义）。
+async fn copy_tree_snapshot(
+    conn: &mut PgConnection,
+    source: Uuid,
+    target: Uuid,
+    root: Oid,
+) -> Result<usize> {
+    let mut stack = vec![root];
+    let mut seen = HashSet::new();
+    let mut objects = 0usize;
+    let mut bytes = 0usize;
+    while let Some(oid) = stack.pop() {
+        if !seen.insert(oid) {
+            continue;
+        }
+        let object = store::require_object(conn, source, oid).await?;
+        objects += 1;
+        bytes += object.data.len();
+        if objects > TEMPLATE_MAX_OBJECTS || bytes > TEMPLATE_MAX_BYTES {
+            bail!("模板项目内容过大，无法作为模板");
+        }
+        match object.kind {
+            crate::git::object::ObjectKind::Tree => {
+                let tree = crate::git::object::Tree::parse(&object.data)?;
+                for entry in tree.entries.values() {
+                    match entry {
+                        crate::git::object::TreeEntry::Dir(child)
+                        | crate::git::object::TreeEntry::Blob(child) => stack.push(*child),
+                    }
+                }
+            }
+            crate::git::object::ObjectKind::Blob => ensure_text(&object.data)?,
+            _ => bail!("模板快照里出现了非 tree/blob 对象"),
+        }
+        store::put_object(conn, target, &object).await?;
+    }
+    Ok(objects)
+}
+
+/// 创建项目。`template` 为站内模板项目 slug 时，新项目直接拿到模板默认
+/// 分支的最新文件快照，并生成一条无父提交 —— 相当于对模板做了一次浅克隆：
+/// 文件齐全、历史只有一条，不会引用模板里的提交对象。
 pub async fn create_project(
     pool: &PgPool,
     user: &User,
     slug: &str,
     description: &str,
+    template: Option<&str>,
 ) -> Result<Project> {
     if !valid_project_slug(slug) {
         bail!("项目名只能包含非特殊 UTF-8 字符，不能含 / \\ ? # % 或空白");
     }
 
     let mut tx = pool.begin().await?;
+
+    // 模板必须在同一个事务里读：否则校验完到复制之间模板可能被删掉。
+    let template = match template.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(name) => {
+            let source = sqlx::query_as::<_, Project>("SELECT * FROM projects WHERE slug = $1")
+                .bind(name)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("模板项目不存在: {name}"))?;
+            if source.archived_at.is_some() {
+                bail!("模板项目「{}」已归档，不能作为模板", source.slug);
+            }
+            let tip = store::resolve_branch(&mut *tx, source.id, &source.default_branch)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("模板项目「{}」还没有任何提交，没有内容可复制", source.slug)
+                })?;
+            let root = tree::read_commit_tree(&mut *tx, source.id, tip).await?;
+            Some((source, root))
+        }
+        None => None,
+    };
+
     let pattern = format!("{PROJECT_NAMESPACE}/{slug}/%");
     let occupied: Option<(String,)> =
         sqlx::query_as("SELECT slug FROM contents WHERE slug LIKE $1 LIMIT 1")
@@ -334,14 +408,15 @@ pub async fn create_project(
     }
 
     let project = sqlx::query_as::<_, Project>(
-        "INSERT INTO projects (id, slug, description, created_by)
-         VALUES ($1, $2, $3, $4)
+        "INSERT INTO projects (id, slug, description, created_by, default_branch)
+         VALUES ($1, $2, $3, $4, COALESCE($5, 'main'))
          RETURNING *",
     )
     .bind(Uuid::new_v4())
     .bind(slug)
     .bind(description.trim())
     .bind(user.id)
+    .bind(template.as_ref().map(|(source, _)| &source.default_branch))
     .fetch_one(&mut *tx)
     .await
     .map_err(|error| match &error {
@@ -351,27 +426,45 @@ pub async fn create_project(
         _ => error.into(),
     })?;
 
-    let mut files = BTreeMap::new();
-    let index = format!("# {slug}\n\n{}\n", description.trim());
-    files.insert("index.md".to_string(), index.into_bytes());
-    let tree_oid = tree::build_from_files(&mut tx, project.id, &files).await?;
-    commit_files(
-        &mut tx,
-        project.id,
-        user,
-        &project.default_branch,
-        None,
-        tree_oid,
-        "初始化项目",
-        "index.md",
-        "add",
-        None,
-        files.get("index.md").map(|body| crate::git::object::hash_object(
-            crate::git::object::ObjectKind::Blob,
-            body,
-        )),
-    )
-    .await?;
+    match template {
+        Some((source, root)) => {
+            copy_tree_snapshot(&mut *tx, source.id, project.id, root).await?;
+            // 提交信息里带上模板名，方便回溯来源；parent 留空即浅克隆。
+            commit_snapshot(
+                &mut tx,
+                project.id,
+                user,
+                &project.default_branch,
+                None,
+                root,
+                &format!("从模板「{}」创建", source.slug),
+            )
+            .await?;
+        }
+        None => {
+            let mut files = BTreeMap::new();
+            let index = format!("# {slug}\n\n{}\n", description.trim());
+            files.insert("index.md".to_string(), index.into_bytes());
+            let tree_oid = tree::build_from_files(&mut tx, project.id, &files).await?;
+            commit_files(
+                &mut tx,
+                project.id,
+                user,
+                &project.default_branch,
+                None,
+                tree_oid,
+                "初始化项目",
+                "index.md",
+                "add",
+                None,
+                files.get("index.md").map(|body| crate::git::object::hash_object(
+                    crate::git::object::ObjectKind::Blob,
+                    body,
+                )),
+            )
+            .await?;
+        }
+    }
 
     tx.commit().await?;
     Ok(project)
@@ -1494,4 +1587,3 @@ mod tests {
         .is_err());
     }
 }
-
