@@ -189,8 +189,11 @@ fn parent_dir(path: &str) -> &str {
     }
 }
 
+/// 项目主页：只有根目录下的 `index.html` 不允许删除或改名。
+/// 其它源文件（`index.md` / `index.typ` / `index.wj` …）以及子目录里的
+/// `index.html` 都只是普通文件，可以正常删除、改名。
 fn is_root_index(path: &str) -> bool {
-    !path.contains('/') && output_stem(path) == "index"
+    path == "index.html"
 }
 
 /// 同一目录下 `a.md` 与 `a.html` 会输出到同一个页面，必须提前拒绝。
@@ -656,7 +659,7 @@ pub async fn commit_changes(
         }
         if change.delete {
             if is_root_index(&change.path) {
-                bail!("项目主页 index 不能删除，只能编辑");
+                bail!("项目主页 index.html 不能删除，只能编辑");
             }
         } else {
             let content = change
@@ -779,7 +782,7 @@ pub async fn delete_file(
         bail!("非法文件路径");
     }
     if is_root_index(path) {
-        bail!("项目主页 index 不能删除，只能编辑");
+        bail!("项目主页 index.html 不能删除，只能编辑");
     }
 
     let mut tx = pool.begin().await?;
@@ -835,7 +838,7 @@ pub async fn move_file(
         bail!("源路径与目标路径相同");
     }
     if is_root_index(from) {
-        bail!("项目主页 index 不能改名");
+        bail!("项目主页 index.html 不能改名");
     }
 
     let mut tx = pool.begin().await?;
@@ -1254,5 +1257,19 @@ mod tests {
         assert!(!valid_branch(".hidden"));
         assert!(!valid_branch("feature/.hidden"));
         assert!(!valid_branch("feature/main.lock"));
+    }
+
+    #[test]
+    fn only_root_index_html_is_protected() {
+        assert!(is_root_index("index.html"));
+        // 其它源文件与子目录下的同名文件都可以正常删除、改名。
+        assert!(!is_root_index("index.md"));
+        assert!(!is_root_index("index.typ"));
+        assert!(!is_root_index("index.wj"));
+        assert!(!is_root_index("index.css"));
+        assert!(!is_root_index("index.svg"));
+        assert!(!is_root_index("index"));
+        assert!(!is_root_index("docs/index.html"));
+        assert!(!is_root_index("Index.html"));
     }
 }
