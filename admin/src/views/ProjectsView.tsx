@@ -1143,7 +1143,22 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
                         format={formatForPath(draftPath)}
                         onChange={(value) => {
                           setContent(value);
-                          setDrafts((current) => ({ ...current, [draftPath]: value }));
+                          setDrafts((current) => {
+                            // 内容改回磁盘上的原样时把草稿删掉，
+                            // 否则「敲一个字再删掉」会一直挂在待提交列表里。
+                            // file 为 null 表示这是新建的还没落盘的文件，
+                            // 没有「原样」可比，保持留痕。
+                            const original = file?.content;
+                            if (original !== undefined && value === original) {
+                              if (!Object.prototype.hasOwnProperty.call(current, draftPath)) {
+                                return current;
+                              }
+                              const rest = { ...current };
+                              delete rest[draftPath];
+                              return rest;
+                            }
+                            return { ...current, [draftPath]: value };
+                          });
                         }}
                       />
                       <div className="row align editor-actions">
