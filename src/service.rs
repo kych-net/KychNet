@@ -94,6 +94,51 @@ pub fn valid_style_slug(slug: &str) -> bool {
         && segments.iter().all(|segment| valid_segment(segment))
 }
 
+/// 网站根目录（`slug` 不含 `/`）只允许 `index.html` 一个主页文件。
+///
+/// 页面类路径归一化后都会变成 `index.html`，但 SVG 这类原始资源可以带着自己
+/// 的扩展名落到根目录（例如 `index.svg`），从而把别的 index 带进网站根目录。
+/// 其它目录（`xef/index.md`、`media/index.svg` …）一律不限制。
+pub fn is_foreign_root_index(slug: &str) -> bool {
+    if slug.contains('/') || slug == HOME_SLUG {
+        return false;
+    }
+    let lower = slug.to_ascii_lowercase();
+    lower == "index" || lower.starts_with("index.")
+}
+
+fn ensure_root_index_html_only(slug: &str) -> Result<()> {
+    if is_foreign_root_index(slug) {
+        bail!("网站根目录只能有 index.html，不能创建 {slug}；请放到子目录下");
+    }
+    Ok(())
+}
+
+/// 升级时的一次性清理：删掉网站根目录里非 `index.html` 的 index 内容记录。
+///
+/// 早期版本允许把 `index.md` / `index.typ` / `index.svg` 直接存成独立内容，
+/// 它们会和网站主页争夺根目录。归一化规则上线后不会再产生这类记录，但存量
+/// 数据需要清掉。`content_revisions` 有 `ON DELETE CASCADE`，版本历史会一并
+/// 删除。幂等：没有匹配记录时不产生任何写入，返回空列表；子目录不受影响。
+pub async fn cleanup_legacy_root_indexes(pool: &PgPool) -> Result<Vec<String>> {
+    let candidates: Vec<(Uuid, String)> =
+        sqlx::query_as("SELECT id, slug FROM contents WHERE slug NOT LIKE '%/%'")
+            .fetch_all(pool)
+            .await?;
+    let mut removed = Vec::new();
+    for (id, slug) in candidates {
+        if !is_foreign_root_index(&slug) {
+            continue;
+        }
+        sqlx::query("DELETE FROM contents WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await?;
+        removed.push(slug);
+    }
+    Ok(removed)
+}
+
 /// 把用户输入的路径归一化成数据库里的输出路径，并从扩展名推断格式。
 ///
 /// 规则：
@@ -102,6 +147,7 @@ pub fn valid_style_slug(slug: &str) -> bool {
 /// - 允许 `/eoe/index.md`、`/eoe/index.typ`，但最终都存成 `.html`；
 /// - 同一路径只能存在一条记录，因此 `.html/.md/.typ` 天然互斥；
 /// - 扩展名和请求格式不一致时直接报错，避免静默改格式；
+/// - 网站根目录只允许 `index.html`，其它格式的 index 一律拒绝；其它目录不限制；
 /// - `/api` 与 `/api/...` 保留，拒绝写入。
 pub fn normalize_content_path(
     input: &str,
@@ -154,6 +200,7 @@ pub fn normalize_content_path(
         if !valid_svg_slug(&slug) {
             bail!("SVG 路径只能包含 Unicode 字母/数字、-、_ 和 /，且不能使用保留路径");
         }
+        ensure_root_index_html_only(&slug)?;
         return Ok((slug, ContentFormat::Svg));
     }
 
@@ -175,6 +222,7 @@ pub fn normalize_content_path(
         if !valid_style_slug(&slug) {
             bail!("CSS 路径只能包含 Unicode 字母/数字、-、_ 和 /");
         }
+        ensure_root_index_html_only(&slug)?;
         return Ok((slug, ContentFormat::Css));
     }
 
@@ -211,6 +259,7 @@ pub fn normalize_content_path(
         if !valid_svg_slug(&slug) {
             bail!("SVG 路径只能包含 Unicode 字母/数字、-、_ 和 /，且不能使用保留路径");
         }
+        ensure_root_index_html_only(&slug)?;
         return Ok((slug, ContentFormat::Svg));
     }
     let last_display = last.clone();
@@ -239,6 +288,7 @@ pub fn normalize_content_path(
     } else {
         inferred.unwrap_or(requested)
     };
+    ensure_root_index_html_only(&slug)?;
     Ok((slug, format))
 }
 
@@ -910,4 +960,68 @@ mod tests {
         assert!(!super::valid_svg_slug("api/logo.svg"));
     }
 
+    #[test]
+    fn website_root_only_allows_index_html() {
+        // 网站根目录：其它格式的 index 一律拒绝，包括大小写变体。
+        for path in ["/index.svg", "index.svg", "/INDEX.SVG"] {
+            assert!(
+                normalize_content_path(path, ContentFormat::Svg).is_err(),
+                "{path} 不应写入网站根目录"
+            );
+        }
+        // 主页仍可用任意格式编辑：源文件显示 index.md，记录本身是 index.html。
+        assert_eq!(
+            normalize_content_path("/index.md", ContentFormat::Markdown).unwrap(),
+            (HOME_SLUG.to_string(), ContentFormat::Markdown)
+        );
+        assert_eq!(
+            normalize_content_path("/index.typ", ContentFormat::Typst).unwrap(),
+            (HOME_SLUG.to_string(), ContentFormat::Typst)
+        );
+        assert_eq!(
+            normalize_content_path("/index.html", ContentFormat::Html).unwrap(),
+            (HOME_SLUG.to_string(), ContentFormat::Html)
+        );
+        // 其它目录一律不限制。
+        for path in ["/media/index.svg", "/xef/index.md", "/docs/INDEX.SVG"] {
+            let format = if path.to_ascii_lowercase().ends_with(".svg") {
+                ContentFormat::Svg
+            } else {
+                ContentFormat::Markdown
+            };
+            assert!(
+                normalize_content_path(path, format).is_ok(),
+                "{path} 不应受根目录规则影响"
+            );
+        }
+    }
+
+    #[test]
+    fn detects_legacy_root_index_slugs() {
+        for slug in [
+            "index.md",
+            "index.typ",
+            "index.wj",
+            "index.svg",
+            "index",
+            "INDEX.MD",
+            "Index.svg",
+        ] {
+            assert!(super::is_foreign_root_index(slug), "{slug} 应被自动清理");
+        }
+        assert!(!super::is_foreign_root_index("index.html"));
+        // 其它目录、以及只是名字里带 index 的普通文件都不动。
+        for slug in [
+            "xef/index.md",
+            "media/index.svg",
+            "项目/xef/index.typ",
+            "index2.md",
+            "reindex.svg",
+        ] {
+            assert!(
+                !super::is_foreign_root_index(slug),
+                "{slug} 不应被自动清理"
+            );
+        }
+    }
 }

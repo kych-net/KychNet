@@ -403,6 +403,29 @@ pub async fn serve(cfg: Config) -> Result<()> {
     let auth = Arc::new(Auth::new(&cfg.rp_id, &cfg.rp_origin)?);
     let build_ctl = Arc::new(BuildCtl::new(cfg.build_out_dir.clone()));
     let build_queue = crate::workflow::queue::BuildQueue::start(build_ctl.clone());
+
+    // 升级时的一次性清理：早期版本可能把 index.md / index.typ / index.svg
+    // 存成网站根目录的独立内容，和主页 index.html 争夺根目录。规则收紧后
+    // 自动删掉这些记录（版本历史随外键级联删除），并触发全量构建清掉产物。
+    // 幂等：没有匹配记录时什么都不做，重复启动不会重复删。
+    match service::cleanup_legacy_root_indexes(&pool).await {
+        Ok(removed) if !removed.is_empty() => {
+            tracing::info!(?removed, "已清理网站根目录遗留的非 index.html 内容");
+            for slug in &removed {
+                // slug 已确认不含 `/`，只是输出目录下的一个文件名。
+                let path = cfg.build_out_dir.join(slug);
+                if path.is_file() {
+                    if let Err(error) = std::fs::remove_file(&path) {
+                        tracing::warn!(%error, "清理根目录遗留产物失败");
+                    }
+                }
+            }
+            build_queue.enqueue();
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "清理网站根目录遗留内容失败"),
+    }
+
     // 归档压缩是同步 CPU 操作：并发数按 CPU 核数封顶 4，留足 worker 给
     // 其它请求。许可覆盖「预检 → 读工作树 → 压缩」整个阶段，避免同一时刻
     // 有太多请求把 PG 连接池也吃满。
