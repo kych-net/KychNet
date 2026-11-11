@@ -1131,6 +1131,46 @@ mod tests {
     }
 
     #[test]
+    fn beian_footer_only_renders_when_configured() {
+        let tree = "<ul class=\"dir-tree\"></ul>".to_string();
+        let mut site = settings();
+        let index = IndexTemplate {
+            site: site.clone(),
+            admin_url: "https://eo.kych.net/管理/".into(),
+            canonical: "https://eo.kych.net/".into(),
+            posts: Vec::new(),
+            tree: tree.clone(),
+            styles: Vec::new(),
+            icon: String::new(),
+        };
+        let plain = index.render().unwrap();
+        assert!(
+            !plain.contains("<footer"),
+            "未配置备案号时不应输出 footer 标签"
+        );
+
+        site.icp_beian = "京ICP备12345678号-1".into();
+        site.police_beian = "京公网安备 11010802012345号".into();
+        let page = PageTemplate {
+            site,
+            admin_url: "https://eo.kych.net/管理/".into(),
+            canonical: "https://eo.kych.net/demo/".into(),
+            filename: "index.md".into(),
+            content: "<p>正文</p>".into(),
+            pdf_url: String::new(),
+            tree,
+            styles: Vec::new(),
+            icon: String::new(),
+        };
+        let html = page.render().unwrap();
+        assert!(html.contains("京ICP备12345678号-1"));
+        assert!(html.contains("京公网安备 11010802012345号"));
+        assert!(html.contains("https://beian.miit.gov.cn/"));
+        assert!(html.contains("recordcode=11010802012345"));
+        assert!(html.contains("noopener noreferrer"));
+    }
+
+    #[test]
     fn encodes_unicode_segments_for_url() {
         assert_eq!(content_url("你好.html"), "/%E4%BD%A0%E5%A5%BD.html");
         assert_eq!(content_url("café.html"), "/caf%C3%A9.html");

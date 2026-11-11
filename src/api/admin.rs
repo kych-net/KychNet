@@ -115,6 +115,14 @@ pub(crate) async fn put_settings(
     if !safe_url(&site.logo_url) || site.nav.iter().any(|link| !safe_url(&link.href)) {
         api_bail!("站点图标与导航链接不能是脚本或数据协议");
     }
+    if site.icp_beian.chars().count() > 64 || site.police_beian.chars().count() > 64 {
+        api_bail!("备案号最多 64 个字符");
+    }
+    if site.police_beian_code.chars().count() > 32
+        || !site.police_beian_code.chars().all(|c| c.is_ascii_digit())
+    {
+        api_bail!("公安备案编号只能填写数字");
+    }
     service::save_settings(&state.pool, &site).await?;
     Ok(Json(json!({ "site": site })))
 }

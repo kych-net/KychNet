@@ -152,7 +152,32 @@
       .wj-code-copy:hover { color: var(--text); }
       .wj-code-copy .wj-sprite { width: 1rem; height: 1rem; }
       .wj-code-copy.copied { color: #16a34a; }
-      footer { display: none; }
+      .site-footer {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: center;
+        align-items: center;
+        gap: 0.4rem 1.25rem;
+        max-width: 46rem;
+        margin: 0 auto;
+        padding: 1.25rem 1.5rem 2rem;
+        border-top: 1px solid var(--border);
+        color: var(--muted);
+        font-size: 0.85rem;
+        text-align: center;
+      }
+      .site-footer a {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.3rem;
+        color: var(--muted);
+        text-decoration: none;
+      }
+      .site-footer a:hover { color: var(--text); text-decoration: underline; }
+      .site-footer .beian-badge { width: 1rem; height: 1.15rem; flex: none; }
+      @media print {
+        .site-footer { display: none; }
+      }
 
       @media (max-width: 640px) {
         .topbar {
@@ -247,6 +272,22 @@
     <main>
       {% block content %}{% endblock %}
     </main>
+    {% if site.has_beian() %}
+    <footer class="site-footer">
+      {% if !site.icp_beian.trim().is_empty() %}
+      <a href="https://beian.miit.gov.cn/" target="_blank" rel="noopener noreferrer">{{ site.icp_beian }}</a>
+      {% endif %}
+      {% if !site.police_beian.trim().is_empty() %}
+      <a href="{{ site.police_beian_href() }}" target="_blank" rel="noopener noreferrer">
+        <svg class="beian-badge" viewBox="0 0 16 18" aria-hidden="true" focusable="false">
+          <path d="M8 1 1.5 3.2v5.3c0 3.9 2.7 6.7 6.5 8.5 3.8-1.8 6.5-4.6 6.5-8.5V3.2L8 1Z" fill="none" stroke="currentColor" stroke-width="1.2"/>
+          <path d="m8 4.6 1 2.1 2.3.3-1.7 1.6.4 2.3L8 10l-2 1.1.4-2.3L4.7 7l2.3-.3 1-2.1Z" fill="currentColor"/>
+        </svg>
+        {{ site.police_beian }}
+      </a>
+      {% endif %}
+    </footer>
+    {% endif %}
     <script>
       (function () {
         var root = document.documentElement;
