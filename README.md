@@ -442,7 +442,7 @@ cd admin && pnpm install && cp .env.example .env && pnpm dev
 2. 管理端保存内容后会自动编译当前页(改路径时同时删除旧产物);「站点设置 → 整站重建」或 `kych-net build --out dist` 重建全站.Typst 页面同时产出 `.pdf`.构建会先渲染到内存,全部成功后才清理旧的 `.html/.pdf` 并写入新路径(不再统一放 `posts/`),中途失败不会破坏现有站点.
 3. 内容站产物 `dist/` 与管理端产物由源站 nginx 直接托管:前者在 `eo.kych.net/`,后者在 `eo.kych.net/管理/`(见 [deploy/README.md](deploy/README.md)).EdgeOne 只做加速回源,不再依赖 Pages.
 4. 服务器 nginx 把 `/api/`、`/git/`、`/mcp` 等后端路径反代到 `127.0.0.1:8080`;回源时 `SNI` 固定为 `kych.net`、`Host` 为 `eo.kych.net`,所以复用主域证书.
-5. 项目 Git 对象存 PostgreSQL,LFS 文件存 `LFS_ROOT`;systemd 需要该目录的写权限.
+5. 项目 Git 对象存 PostgreSQL,LFS 文件存 `LFS_ROOT`;systemd 需要该目录的写权限.对象内容按 zlib 压缩后入库(不足 256 字节或压不动的存原样),`size` 列记原始长度;历史对象用 `kych-net db compress` 补齐压缩,可重复执行.
 
 ## 约定
 
