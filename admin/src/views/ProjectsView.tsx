@@ -61,12 +61,11 @@ function firstLine(value: string): string {
 }
 
 /**
- * 与后端 project.rs::is_root_index 保持一致：根目录下的 index.* 是项目主页。
- * 服务端明确拒绝删除或改名主页，前端必须在标记待提交时就拦住，否则用户
- * 点「提交」只会收到一个看不见的错误，表现为「点了没反应」。
+ * 与后端 project.rs::is_root_index 保持一致：只有根目录 index.html 是项目主页。
+ * 其它 index.* 源文件与子目录里的 index.html 都可以正常删除、改名。
  */
 function isProjectIndex(path: string): boolean {
-  return !path.includes("/") && path.replace(/\.[^./]+$/, "") === "index";
+  return path === "index.html";
 }
 
 /** PR 与提交详情共用的行级差异展示。 */
