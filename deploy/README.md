@@ -8,7 +8,7 @@ eo.kych.net/管理/   → /opt/kych-admin      管理端 SPA（GitHub Actions �
 接口               → https://kych.net      主域 API，不进本机代理
 ```
 
-旧入口 `c.kych.net`、`m.kych.net` 一律 301 到新地址。
+旧入口 `c.kych.net`、`m.kych.net` 已停用（DNS 与源站配置均已删除）。
 
 ## 为什么 eo.kych.net 不需要单独签证书
 
@@ -145,7 +145,6 @@ rsync -az --delete admin/dist/ deploy-admin@49.232.71.240:/opt/kych-admin/ \
 | `GET /管理/assets/<hash>.js` | `200`，`public, max-age=2592000, immutable` |
 | `GET /管理` | `301` → `/管理/` |
 | `GET /管理/任意深链接` | `200`，回退到管理端 index.html |
-| `c.kych.net` / `m.kych.net` | `301` → eo 对应路径 |
 | `http://` 任意已知域名 | `301` → `https://` |
 | `http://` 未知 Host | `444` 直接断开 |
 
