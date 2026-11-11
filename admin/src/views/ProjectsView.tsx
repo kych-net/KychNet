@@ -60,6 +60,15 @@ function firstLine(value: string): string {
   return value.split("\n")[0] || "(无提交信息)";
 }
 
+/**
+ * 与后端 project.rs::is_root_index 保持一致：根目录下的 index.* 是项目主页。
+ * 服务端明确拒绝删除或改名主页，前端必须在标记待提交时就拦住，否则用户
+ * 点「提交」只会收到一个看不见的错误，表现为「点了没反应」。
+ */
+function isProjectIndex(path: string): boolean {
+  return !path.includes("/") && path.replace(/\.[^./]+$/, "") === "index";
+}
+
 /** PR 与提交详情共用的行级差异展示。 */
 function DiffList({ files }: { files: PrDetail["files"] }) {
   if (files.length === 0) {
@@ -129,6 +138,9 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
   const [draftPath, setDraftPath] = useState("");
   const [content, setContent] = useState("");
   const [commitMessage, setCommitMessage] = useState("");
+  // 提交面板内的就地反馈：全局 error/notice 在 section 顶部，滚到工作区时看不见。
+  const [commitError, setCommitError] = useState("");
+  const [commitNotice, setCommitNotice] = useState("");
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [deletions, setDeletions] = useState<string[]>([]);
 
@@ -196,6 +208,8 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
     setDeletions([]);
     setError("");
     setNotice("");
+    setCommitError("");
+    setCommitNotice("");
     setMiddleTab("files");
     setRightTab("history");
     setCommits([]);
@@ -572,6 +586,8 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
     setDrafts({});
     setDeletions([]);
     setCommitMessage("");
+    setCommitError("");
+    setCommitNotice("");
   }
 
   async function commitProject() {
@@ -582,9 +598,18 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
       ...staged.map(([path, value]) => ({ path, content: value })),
     ];
     if (changes.length === 0) return;
+    // 服务端会拒绝删除/改名根目录 index；与其发出注定失败的请求，不如就地说明。
+    const blocked = deletions.find(isProjectIndex);
+    if (blocked) {
+      setCommitError(`「${blocked}」是项目主页，不能删除或移走，只能编辑内容；请先清空待提交更改。`);
+      setCommitNotice("");
+      return;
+    }
     setBusy(true);
     setError("");
     setNotice("");
+    setCommitError("");
+    setCommitNotice("");
     try {
       const result = await api.commitProjectChanges(selected.id, {
         ref: branch,
@@ -597,14 +622,20 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
       setFile(null);
       setDraftPath("");
       setContent("");
-      setNotice(
+      setCommitNotice(
         `已提交 ${result.item.commit.slice(0, 7)}，共 ${result.item.paths.length} 个文件`,
       );
-      await loadTree(selected, branch, dir);
-      await loadCommits(selected, branch);
+      // 提交已经成功，后续刷新失败只写顶部全局错误，不覆盖面板里的成功提示。
+      await loadTree(selected, branch, dir).catch((e) =>
+        setError((e as Error).message),
+      );
+      await loadCommits(selected, branch).catch((e) =>
+        setError((e as Error).message),
+      );
       await refreshProjects();
     } catch (e) {
-      setError((e as Error).message);
+      // 错误必须显示在工作区面板内，全局 error 在页面顶部，用户看不到。
+      setCommitError((e as Error).message || "提交失败，请重试");
     } finally {
       setBusy(false);
     }
@@ -612,6 +643,11 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
 
   function removeFile() {
     if (!file) return;
+    if (isProjectIndex(file.path)) {
+      setCommitError(`「${file.path}」是项目主页，不能删除，只能编辑内容。`);
+      setCommitNotice("");
+      return;
+    }
     if (!window.confirm(`将 ${file.path} 标记为删除？提交项目时生效。`)) return;
     setDeletions((current) => Array.from(new Set([...current, file.path])));
     setDrafts((current) => {
@@ -622,11 +658,17 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
     setFile(null);
     setDraftPath("");
     setContent("");
-    setNotice("文件已标记删除，等待项目提交");
+    setCommitError("");
+    setCommitNotice("文件已标记删除，等待项目提交");
   }
 
   function renameFile() {
     if (!file) return;
+    if (isProjectIndex(file.path)) {
+      setCommitError(`「${file.path}」是项目主页，不能改名或移走，只能编辑内容。`);
+      setCommitNotice("");
+      return;
+    }
     const target = window.prompt("新路径", file.path);
     if (!target || target === file.path) return;
     setDrafts((current) => ({ ...current, [target]: content }));
@@ -634,7 +676,8 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
     setFile(null);
     setDraftPath(target);
     setContent(content);
-    setNotice("重命名已加入待提交，提交项目时生效");
+    setCommitError("");
+    setCommitNotice("重命名已加入待提交，提交项目时生效");
   }
 
   async function createProject(event: React.FormEvent) {
@@ -1204,8 +1247,20 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
                   onClick={() => void commitProject()}
                   disabled={busy || pendingCount === 0}
                 >
-                  提交 {pendingCount > 0 ? `${pendingCount} 个文件` : "项目更改"}
+                  {busy
+                    ? "提交中…"
+                    : `提交 ${pendingCount > 0 ? `${pendingCount} 个文件` : "项目更改"}`}
                 </button>
+                {commitError && (
+                  <p className="project-commit-feedback error" role="alert">
+                    {commitError}
+                  </p>
+                )}
+                {commitNotice && (
+                  <p className="project-commit-feedback notice" role="status">
+                    {commitNotice}
+                  </p>
+                )}
               </div>
               <div className="project-tabs">
                 <button
