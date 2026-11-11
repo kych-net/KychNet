@@ -459,8 +459,8 @@ export const api = {
     request<{ items: Project[] }>(
       `/projects${includeArchived ? "?include_archived=true" : ""}`,
     ),
-  createProject: (payload: { slug: string; description: string }) =>
-    request<{ item: Project }>("/projects", {
+  createProject: (payload: { slug: string; description: string; template?: string }) =>
+    request<{ item: Project; template: string | null }>("/projects", {
       method: "POST",
       body: JSON.stringify(payload),
     }),

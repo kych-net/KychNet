@@ -145,6 +145,8 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
   const [creating, setCreating] = useState(false);
   const [newSlug, setNewSlug] = useState("");
   const [newDescription, setNewDescription] = useState("");
+  // 站内模板项目 slug；空串表示空白项目。
+  const [templateSlug, setTemplateSlug] = useState("");
 
   // 从外部 Git 仓库导入（克隆）项目。
   const [importing, setImporting] = useState(false);
@@ -674,11 +676,17 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
       const result = await api.createProject({
         slug: newSlug,
         description: newDescription,
+        template: templateSlug || undefined,
       });
       setCreating(false);
       setNewSlug("");
       setNewDescription("");
-      setNotice(`项目「${result.item.slug}」已创建`);
+      setTemplateSlug("");
+      setNotice(
+        result.template
+          ? `项目「${result.item.slug}」已从模板「${result.template}」浅克隆创建`
+          : `项目「${result.item.slug}」已创建`,
+      );
       await refreshProjects();
       await selectProject(result.item);
     } catch (e) {
@@ -949,10 +957,33 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
                   rows={3}
                 />
               </label>
+              <label>
+                模板（可选）
+                <select
+                  value={templateSlug}
+                  onChange={(e) => setTemplateSlug(e.target.value)}
+                >
+                  <option value="">空白项目</option>
+                  {projects
+                    .filter((project) => !project.archived_at)
+                    .map((project) => (
+                      <option key={project.id} value={project.slug}>
+                        {project.slug}
+                        {project.description ? ` — ${project.description}` : ""}
+                      </option>
+                    ))}
+                </select>
+              </label>
               <p className="hint">
                 项目会出现在 <code>/项目/{newSlug || "<项目名>"}/</code>，仓库地址为 <code>/git/</code>。
                 源码请使用 UTF-8 文本，二进制文件请通过 Git LFS 推送。
               </p>
+              {templateSlug && (
+                <p className="hint">
+                  将以浅克隆方式复制模板「{templateSlug}」默认分支的最新文件快照，
+                  不带模板的提交历史；新项目的第一次提交记录为「从模板创建」。
+                </p>
+              )}
               <button type="submit" disabled={busy}>
                 创建
               </button>
