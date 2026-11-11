@@ -71,6 +71,8 @@ pub(crate) struct AppState {
     pub(crate) pool: PgPool,
     pub(crate) auth: Arc<Auth>,
     pub(crate) site_url: String,
+    /// 管理端可点击地址（含 /管理/ 子路径）；与 admin_origin 分开，后者只能给 CORS 用。
+    pub(crate) admin_url: String,
     pub(crate) limits: RateLimiter,
     pub(crate) trust_proxy_headers: bool,
     /// 预览 Markdown / Wikidot 时需要的字体与资源根目录。
@@ -437,6 +439,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
         pool,
         auth,
         site_url: cfg.site_url.clone(),
+        admin_url: cfg.admin_url.clone(),
         limits: RateLimiter::default(),
         trust_proxy_headers: cfg.trust_proxy_headers,
         content_root: cfg.content_root.clone(),
@@ -470,7 +473,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
     // SameSite=Strict、Secure=true，但有效期是两周且不显式配置的话，
     // 升级依赖就会悄悄变松。
     //
-    // SameSite 选 Strict 不影响管理端调 API：`m.kych.net` 与 `kych.net`
+    // SameSite 选 Strict 不影响管理端调 API：`eo.kych.net` 与 `kych.net`
     // 同属 kych.net，属于同站请求，Strict 照样带 Cookie；它只挡住跨站的导航与请求。
     //
     // 会话改放 Postgres（schema `tower_sessions`、表 `session`，由 store 自己建）：

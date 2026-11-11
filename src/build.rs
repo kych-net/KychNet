@@ -724,7 +724,7 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
         let icon = project_icon_href(&content.slug, &project_icons);
         let page = PageTemplate {
             site: settings.clone(),
-            admin_url: cfg.admin_origin.clone(),
+            admin_url: cfg.admin_url.clone(),
             canonical: format!("{}{}", cfg.site_url.trim_end_matches('/'), content_url(&content.slug)),
             filename,
             content: rendered.html,
@@ -757,7 +757,7 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
         } else {
         let html = IndexTemplate {
             site: settings.clone(),
-            admin_url: cfg.admin_origin.clone(),
+            admin_url: cfg.admin_url.clone(),
             canonical: format!("{}{}", cfg.site_url.trim_end_matches('/'), content_url(&index_slug)),
             posts: project_links,
             tree: tree_html.clone(),
@@ -792,7 +792,7 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
         Some(
             IndexTemplate {
                 site: settings.clone(),
-                admin_url: cfg.admin_origin.clone(),
+                admin_url: cfg.admin_url.clone(),
                 canonical: cfg.site_url.clone(),
                 posts: links,
                 tree: tree_html.clone(),
@@ -959,7 +959,7 @@ pub async fn run_one(
     };
     let html = PageTemplate {
         site: settings.clone(),
-        admin_url: cfg.admin_origin.clone(),
+        admin_url: cfg.admin_url.clone(),
         canonical: format!("{}{}", cfg.site_url.trim_end_matches('/'), content_url(&content.slug)),
         filename,
         content: rendered.html,
@@ -1098,8 +1098,8 @@ mod tests {
         let tree = "<ul class=\"dir-tree\"></ul>".to_string();
         let index = IndexTemplate {
             site: settings(),
-            admin_url: "https://m.kych.net".into(),
-            canonical: "https://c.kych.net/".into(),
+            admin_url: "https://eo.kych.net/管理/".into(),
+            canonical: "https://eo.kych.net/".into(),
             posts: vec![PostLink {
                 title: "第一篇".into(),
                 href: "/hello.html".into(),
@@ -1115,8 +1115,8 @@ mod tests {
 
         let page = PageTemplate {
             site: settings(),
-            admin_url: "https://m.kych.net".into(),
-            canonical: "https://c.kych.net/demo/".into(),
+            admin_url: "https://eo.kych.net/管理/".into(),
+            canonical: "https://eo.kych.net/demo/".into(),
             filename: "index.md".into(),
             content: "<p>正文</p>".into(),
             pdf_url: "/demo.pdf".into(),

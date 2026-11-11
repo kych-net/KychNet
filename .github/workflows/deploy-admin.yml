@@ -1,0 +1,112 @@
+name: deploy-admin
+
+# 管理端（m.kych.net）静态站发布：push 到 main 且改动 admin/ 时构建并同步到源站。
+# 源站由 nginx 直接托管，CDN（EdgeOne/腾讯云 CDN）回源到这里。
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'admin/**'
+      # workflow 自身也要算进触发路径，否则改这个文件不会重新发布。
+      - '.github/workflows/deploy-admin.yml'
+  pull_request:
+    paths:
+      - 'admin/**'
+  workflow_dispatch:
+
+# 同一分支的发布串行执行，避免两次 push 的 rsync 交错覆盖。
+concurrency:
+  group: deploy-admin-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 仓库里只有 pnpm-lock.yaml，没有 package-lock.json：
+      # 这里必须用 pnpm，`npm ci` 会因为找不到 lock 文件直接失败。
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: admin/pnpm-lock.yaml
+
+      - name: 安装依赖
+        working-directory: admin
+        run: pnpm install --frozen-lockfile
+
+      # 生产构建必须显式给出 API origin。
+      # admin/src/api.ts 读的是 VITE_API_BASE_URL，留空时会退化成同源 /api，
+      # 而 m.kych.net 上只有静态文件、没有后端，接口会全部 404。
+      - name: 构建
+        working-directory: admin
+        env:
+          VITE_API_BASE_URL: https://kych.net
+        run: pnpm build
+
+      - name: 检查产物完整性
+        working-directory: admin
+        run: |
+          test -f dist/index.html || { echo "缺少 dist/index.html"; exit 1; }
+          test -d dist/assets  || { echo "缺少 dist/assets"; exit 1; }
+          grep -q 'https://kych.net' dist/assets/*.js || { echo "产物未注入 API origin"; exit 1; }
+          echo "产物文件数: $(find dist -type f | wc -l)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: admin-dist
+          path: admin/dist
+          retention-days: 7
+
+  deploy:
+    needs: build
+    # 只在 main 分支的 push 和手动触发时发布；PR 只构建做校验。
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      # 用与 build 相同的产物，不重复构建，避免两次构建 hash 不一致。
+      - uses: actions/download-artifact@v4
+        with:
+          name: admin-dist
+          path: dist
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: admin/pnpm-lock.yaml
+
+      # appleboy/rsync-action 并不存在（会直接 404 让流水线挂掉），
+      # 社区实际在用的是 burnett01/rsync-deployments。
+      - name: 同步到源站
+        uses: burnett01/rsync-deployments@7.0.1
+        with:
+          # --delete 清掉上一版带 hash 的旧 chunk；index.html 是 no-cache，
+          # 用户刷新即拿到新版本，不会有长期指针。
+          switches: -avzr --delete --delete-delay
+          path: dist/
+          remote_path: ${{ secrets.DEPLOY_PATH }}
+          remote_host: ${{ secrets.DEPLOY_HOST }}
+          remote_user: ${{ secrets.DEPLOY_USER }}
+          remote_key: ${{ secrets.DEPLOY_SSH_KEY }}
+
+      - name: 校验线上版本
+        run: |
+          sleep 2
+          curl -sS --max-time 20 "https://eo.kych.net/管理/" | grep -oE 'index-[A-Za-z0-9_-]+\.js' > /tmp/live.txt || true
+          grep -oE 'index-[A-Za-z0-9_-]+\.js' dist/index.html > /tmp/built.txt || true
+          echo "构建产物: $(cat /tmp/built.txt)"
+          echo "线上引用: $(cat /tmp/live.txt)"

@@ -19,8 +19,8 @@
 | --- | --- |
 | `kych.net` | 公网 API:`/api/*`、`/git/*`、`/mcp`;裸域其余路径 301 到内容站 |
 | `api.kych.net` | **仅 EdgeOne 回源 Host / 静态源站**,不是给客户端使用的 API 地址 |
-| `c.kych.net` | 内容站公开入口,EdgeOne 加速回源 |
-| `m.kych.net` | 管理端,EdgeOne Pages |
+| `eo.kych.net` | 统一前端入口:`/` 内容站、`/管理/` 管理端,EdgeOne 加速回源 `49.232.71.240` |
+| `c.kych.net`、`m.kych.net` | 旧入口,迁移后 301 到 `eo.kych.net` |
 | `origin.kych.net`、`src.kych.net` | 静态源站/实验入口,不作为 API 地址 |
 
 管理端的 `VITE_API_BASE_URL` 必须是 `https://kych.net`,不能写 `api.kych.net`.

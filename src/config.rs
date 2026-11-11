@@ -6,7 +6,11 @@ pub struct Config {
     pub bind: String,
     pub database_url: String,
     pub site_url: String,
+    /// 管理端的 origin，必须是纯 scheme://host[:port]：CORS 与写接口的
+    /// Origin 白名单都拿它做等值比较。
     pub admin_origin: String,
+    /// 管理端的可点击地址（含 `/管理/` 子路径），用于页面里「管理端」之类的链接。
+    pub admin_url: String,
     pub rp_id: String,
     pub rp_origin: String,
     pub content_root: PathBuf,
@@ -42,18 +46,27 @@ fn env_flag(key: &str) -> bool {
 impl Config {
     pub fn from_env() -> Result<Self> {
         dotenvy::dotenv().ok();
+        // 内容站与管理端同域：内容站在 `/`，管理端在 `/管理/`（nginx alias）。
+        // ADMIN_ORIGIN 会被 CORS 与写接口的 Origin 校验直接比较，必须是纯
+        // origin（带路径会永远匹配不上），所以页面里可点击的管理端地址另用
+        // ADMIN_URL，默认由 ADMIN_ORIGIN 拼出。
+        let site_url = env_or("SITE_URL", "https://eo.kych.net");
+        let admin_origin = env_or("ADMIN_ORIGIN", "https://eo.kych.net");
+        let admin_url = env_or(
+            "ADMIN_URL",
+            &format!("{}/管理/", admin_origin.trim_end_matches('/')),
+        );
         Ok(Self {
             bind: env_or("BIND", "127.0.0.1:8080"),
             database_url: std::env::var("DATABASE_URL").context("DATABASE_URL 未设置")?,
-            // 内容站、管理端、API 是三个独立子域：内容站走 CDN 缓存的静态产物，
-            // 管理端是 EdgeOne Pages 上的独立静态站，API 才是有源站的后端。
-            site_url: env_or("SITE_URL", "https://c.kych.net"),
-            admin_origin: env_or("ADMIN_ORIGIN", "https://m.kych.net"),
+            site_url,
+            admin_origin,
+            admin_url,
             // WebAuthn 的 RP ID 取可注册域本身（kych.net），而不是子域。
-            // RP ID 是凭据的绑定域：写成 m.kych.net 的话，日后管理端再换子域
+            // RP ID 是凭据的绑定域：写成子域的话，日后管理端再换域
             // 就会让已注册的通行密钥全部失效。
             rp_id: env_or("WEBAUTHN_RP_ID", "kych.net"),
-            rp_origin: env_or("WEBAUTHN_ORIGIN", "https://m.kych.net"),
+            rp_origin: env_or("WEBAUTHN_ORIGIN", "https://eo.kych.net"),
             content_root: PathBuf::from(env_or("CONTENT_ROOT", "content")),
             build_out_dir: PathBuf::from(env_or("BUILD_OUT_DIR", "dist")),
             trust_proxy_headers: env_flag("TRUST_PROXY_HEADERS"),

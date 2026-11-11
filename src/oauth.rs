@@ -84,6 +84,8 @@ struct LoginView<'a> {
     fields: &'a OAuthFields,
     error: Option<&'a str>,
     next: String,
+    /// 管理端可点击地址（含 /管理/ 子路径），用于「先去管理端登录」这一条。
+    admin_url: &'a str,
 }
 
 #[derive(askama::Template)]
@@ -114,7 +116,7 @@ fn authorize_query(f: &OAuthFields) -> String {
     format!("/oauth/authorize?{}", q.finish())
 }
 
-fn login_page(f: &OAuthFields, error: Option<&str>) -> Html<String> {
+fn login_page(f: &OAuthFields, error: Option<&str>, admin_url: &str) -> Html<String> {
     let next = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("next", &authorize_query(f))
         .finish();
@@ -123,6 +125,7 @@ fn login_page(f: &OAuthFields, error: Option<&str>) -> Html<String> {
             fields: f,
             error,
             next,
+            admin_url,
         }
         .render()
         .unwrap_or_else(|_| "登录页渲染失败".to_string()),
@@ -141,8 +144,8 @@ fn consent_page(f: &OAuthFields, csrf: &str, username: &str) -> Html<String> {
     )
 }
 
-fn login_error_page(f: &OAuthFields, message: &str) -> Html<String> {
-    login_page(f, Some(message))
+fn login_error_page(f: &OAuthFields, message: &str, admin_url: &str) -> Html<String> {
+    login_page(f, Some(message), admin_url)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -298,7 +301,7 @@ pub async fn authorize(
         .into_response();
     }
     match session_user(&state, &session).await {
-        None => login_page(&fields, None).into_response(),
+        None => login_page(&fields, None, &state.admin_url).into_response(),
         Some(user) => {
             let csrf = random_token(24);
             if session.insert("oauth_csrf", csrf.clone()).await.is_err() {
@@ -345,14 +348,14 @@ pub async fn login(
         .ok()
         .flatten()
     else {
-        return login_error_page(&fields, "用户名或验证码错误").into_response();
+        return login_error_page(&fields, "用户名或验证码错误", &state.admin_url).into_response();
     };
     if user.disabled {
-        return login_error_page(&fields, "账号已禁用").into_response();
+        return login_error_page(&fields, "账号已禁用", &state.admin_url).into_response();
     }
     match auth::totp_verify(&state.pool, &user, form.code.trim()).await {
         Ok(true) => {}
-        _ => return login_error_page(&fields, "用户名或验证码错误").into_response(),
+        _ => return login_error_page(&fields, "用户名或验证码错误", &state.admin_url).into_response(),
     }
     if let Err(error) = establish_session(&session, user.id).await {
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("建立会话失败: {error}")).into_response();
