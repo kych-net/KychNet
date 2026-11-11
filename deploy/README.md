@@ -66,6 +66,50 @@ DNSPod 已指向 EO。三项缺一，管理端登录会立刻失败（`ADMIN_ORI
 
 重建内容站必须在 `/opt/kych-net` 目录下执行，配置靠 `dotenvy` 读当前目录的 `.env`。
 
+## 环境变量（后端）
+
+| 变量 | 值 | 说明 |
+| --- | --- | --- |
+| `SITE_URL` | `https://eo.kych.net` | 内容站的对外地址，决定 canonical 与「前往内容端」链接 |
+| `ADMIN_ORIGIN` | `https://eo.kych.net` | 管理端的 **origin**。CORS 与写接口的 Origin 白名单拿它做等值比较，**必须纯 scheme://host，不能带路径** |
+| `ADMIN_URL` | `https://eo.kych.net/管理/`（可省略） | 页面里「管理端」按钮的地址，允许带子路径；缺省由 `ADMIN_ORIGIN` 拼出 `/管理/` |
+| `WEBAUTHN_ORIGIN` | `https://eo.kych.net` | WebAuthn 校验的 origin |
+| `WEBAUTHN_RP_ID` | `kych.net` | 通行密钥的绑定域，不要写成子域 |
+
+`ADMIN_ORIGIN` 与 `ADMIN_URL` 分开是必要的：前者参与等值比较，一旦带上 `/管理/`
+就再也匹配不上浏览器发来的 `Origin: https://eo.kych.net`，会导致所有写请求被拒。
+
+## 后端二进制发布
+
+前端产物走上面的 workflow，后端 `kych-net` 二进制则由
+[build.yml](../.github/workflows/build.yml) 在 push 到 `main` 时编译并上传 artifact。
+
+```bash
+# 1. 找到 main 上最新一次 build
+gh run list --repo kych-net/KychNet --branch main --workflow build --limit 3
+
+# 2. 下载产物（international 带宽差时可用 gh api 断点续传）
+gh run download <run-id> --name kych-net-x86_64-unknown-linux-gnu -D /tmp/kych-build
+cd /tmp/kych-build && tar -xzf kych-net-x86_64-unknown-linux-gnu.tar.gz
+
+# 3. 备份旧二进制后替换
+scp kych-net root@49.232.71.240:/tmp/kych-net.new
+ssh root@49.232.71.240 '
+  set -e
+  systemctl stop kych-net
+  cp -a /opt/kych-net/kych-net /opt/kych-net/kych-net.pre-$(date +%Y%m%d%H%M%S)
+  install -m 755 -o root -g kych-net /tmp/kych-net.new /opt/kych-net/kych-net
+  systemctl start kych-net
+  systemctl is-active kych-net
+'
+
+# 4. 模板或 SITE_URL 有变动时重建内容站
+ssh root@49.232.71.240 "sudo -u kych-net bash -c 'cd /opt/kych-net && ./kych-net build'"
+```
+
+替换二进制不会动 `.env`；若本次改了配置项，需同步修改 `/opt/kych-net/.env` 并重启。
+重建内容站必须在 `/opt/kych-net` 下执行，配置靠 `dotenvy` 读当前目录的 `.env`。
+
 ## GitHub Secrets
 
 | Secret | 值 |

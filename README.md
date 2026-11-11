@@ -8,8 +8,8 @@
 
 前端分为内容前端和管理前端:
 
-- 内容前端是纯静态站,由后端编译输出 html,通过 EdgeOne 发布.
-- 管理前端是 React SPA,通过 EdgeOne Pages 发布,以 JSON API 读写内容.
+- 内容前端是纯静态站,由后端编译输出 html,由源站 nginx 托管、EdgeOne 只做加速回源.
+- 管理前端是 React SPA,与内容站同域挂在 `/管理/` 下,以 JSON API 读写内容.
 
 后端为单一二进制 `kych-net`,同时提供 HTTP 服务、Git smart HTTP、MCP 和命令行管理能力,共用同一套 service 层.中英文命令行是同一个二进制的两个入口:中文命令先被翻译成英文参数,再交给同一个 clap 解析器.
 
@@ -77,7 +77,7 @@
 | 管理前端 | React + TypeScript + Vite |
 | 数据与表单 | 原生 fetch + React state |
 | 样式 | 原生 CSS |
-| 部署 | EdgeOne（内容 CDN）+ EdgeOne Pages（管理端） |
+| 部署 | 源站 nginx 静态托管 + EdgeOne 加速回源（两者同域 `eo.kych.net`） |
 | 项目/Git | PostgreSQL Git 对象 + Git smart HTTP + LFS |
 
 ## 目录结构
@@ -442,8 +442,8 @@ cd admin && pnpm install && cp .env.example .env && pnpm dev
 1. [.github/workflows/build.yml](.github/workflows/build.yml) 在 push、PR 和手动触发时运行测试,并编译 Linux 二进制;推送 `v*` 标签时自动创建 Release.
    - `x86_64-unknown-linux-gnu`:依赖系统 glibc,在 Ubuntu 26.04 x86-64 runner 上构建并 strip 符号表.
 2. 管理端保存内容后会自动编译当前页(改路径时同时删除旧产物);「站点设置 → 整站重建」或 `kych-net build --out dist` 重建全站.Typst 页面同时产出 `.pdf`.构建会先渲染到内存,全部成功后才清理旧的 `.html/.pdf` 并写入新路径(不再统一放 `posts/`),中途失败不会破坏现有站点.
-3. 内容站 `dist/` 由 EdgeOne 加速;管理前端构建为独立静态产物,由 EdgeOne Pages 发布.
-4. 服务器 nginx 只把 `/api/`、`/git/`、`/mcp` 等后端路径反代到 `127.0.0.1:8080`;`api.kych.net` 只作为回源 Host.
+3. 内容站产物 `dist/` 与管理端产物由源站 nginx 直接托管:前者在 `eo.kych.net/`,后者在 `eo.kych.net/管理/`(见 [deploy/README.md](deploy/README.md)).EdgeOne 只做加速回源,不再依赖 Pages.
+4. 服务器 nginx 把 `/api/`、`/git/`、`/mcp` 等后端路径反代到 `127.0.0.1:8080`;`api.kych.net` 只作为回源 Host.回源时 `SNI` 固定为 `kych.net`、`Host` 为 `eo.kych.net`,所以复用主域证书.
 5. 项目 Git 对象存 PostgreSQL,LFS 文件存 `LFS_ROOT`;systemd 需要该目录的写权限.
 
 ## 约定
@@ -463,5 +463,5 @@ cd admin && pnpm install && cp .env.example .env && pnpm dev
 - Typst 在当前进程内编译,由 `VirtualPath::resolve(root)` 加 canonicalize 双重校验把文件读取限制在 `CONTENT_ROOT` 内,避免内容作者通过 `#include` 读到构建机上的任意文件;父目录校验之外还会对目标文件本身做 `symlink_metadata` 判断,内容目录里的符号链接一律拒绝(否则 `link.png -> /etc/passwd` 会被 `fs::read` 跟进去).生产仍建议放进断网容器并加 CPU/内存限额,构建机上的 `.env` 与云凭据不要落在可读目录.
 - Wikidot 由 [ftml](https://docs.rs/ftml) 渲染,`[[include]]` 在构建时从数据库预取 Wikidot 页面并限制 8 层递归;`ftml` 是 AGPL-3.0,因此本项目也按 AGPL-3.0 分发,见 `LICENSE`.
 - 编译缓存尚未实现;目前每篇 Typst 内容会分别编译 `PagedDocument`(出 PDF)与 `HtmlDocument`(出 HTML)各一次.
-- 静态产物保持平台中立:只用相对路径、不写死域名,重定向与 404 分别在各平台配置.
+- 静态产物保持平台中立:只用相对路径、不写死域名,重定向与 404 由 nginx 配置.
 - 静态资源使用哈希文件名并长缓存,HTML 短缓存;压缩交给 CDN.
