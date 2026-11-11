@@ -11,17 +11,26 @@
 //! - v0 fetch 是有状态会话（客户端分多轮发 want/have/done），而 HTTP 的
 //!   upload-pack 是无状态 RPC，所以这里把多轮请求累积成一个
 //!   `UploadRequest` 再交给 `http::upload_pack_request()`。
-//! - v0 push 读命令段后分两路：非删除推送会跟着 pack 且客户端发完会关闭
-//!   写端（git send-pack 非 stateless 模式下由 pack 生成器收尾关闭，
-//!   见 send-pack.c 对 `fd[1]` 的交接），所以可以读到 EOF 再整体解析；
+//! - v0 push 读命令段后分两路：非删除推送会跟着 pack，正常客户端发完会
+//!   关闭写端，但 libgit2 等实现可能保持写端打开，所以读取带空闲超时，
+//!   超时后按 packfile 自身的长度判定是否已收齐，不依赖 EOF；
 //!   纯删除推送没有 pack 也不关闭写端，必须立即回 report，不能等 EOF。
-//! - v2 fetch 本身就是无状态请求，逐条转发给 `upload_pack_v2` 即可。
+//! - v2 fetch 是 stateless 请求，逐条转发给 `upload_pack_v2`；一旦响应里
+//!   带上 `packfile` 段就立即收尾，不等客户端关闭写端。
+//! - `git-lfs-authenticate` 是 LFS 客户端在 SSH 远程上执行的命令，返回
+//!   basic 传输用的 batch 端点与短期令牌，使 LFS 上传不必另配 HTTP 凭据。
+//! - 通道与协议版本按 `ChannelId` 分别保存，避免同一连接开多个 session
+//!   时互相覆盖（russh 允许一个连接承载多个通道）。
 
 use anyhow::{bail, Context, Result};
 use russh::server::{Auth, Msg, Server as _, Session};
 use russh::{Channel, ChannelId};
+use serde_json::json;
+use sha1::{Digest, Sha1};
 use sqlx::PgPool;
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::git::proto;
@@ -36,6 +45,8 @@ pub struct SshConfig {
     pub bind: String,
     /// 主机私钥文件（OpenSSH 格式）；不存在时自动生成 ed25519 并写入。
     pub host_key: PathBuf,
+    /// Git HTTP 服务的对外根地址，用于拼 LFS 的 batch 端点。
+    pub git_http_base: String,
 }
 
 /// 服务器入口：加载主机密钥、绑定端口并进入 accept 循环。
@@ -55,7 +66,10 @@ pub async fn serve(cfg: SshConfig, pool: PgPool) -> Result<()> {
         .with_context(|| format!("SSH 端口绑定失败: {}", cfg.bind))?;
     tracing::info!(bind = %cfg.bind, "Git SSH 服务已启动");
 
-    let mut server = SshServer { pool };
+    let mut server = SshServer {
+        pool,
+        git_http_base: cfg.git_http_base.clone(),
+    };
     server
         .run_on_socket(config, &listener)
         .await
@@ -91,6 +105,7 @@ fn load_or_create_host_key(path: &PathBuf) -> Result<russh::keys::PrivateKey> {
 
 struct SshServer {
     pool: PgPool,
+    git_http_base: String,
 }
 
 impl russh::server::Server for SshServer {
@@ -99,8 +114,10 @@ impl russh::server::Server for SshServer {
     fn new_client(&mut self, _: Option<std::net::SocketAddr>) -> Self::Handler {
         GitHandler {
             pool: self.pool.clone(),
-            channel: None,
-            protocol_v2: false,
+            channels: HashMap::new(),
+            protocols: HashMap::new(),
+            git_http_base: self.git_http_base.clone(),
+            auth_failures: 0,
             user: None,
         }
     }
@@ -112,10 +129,15 @@ impl russh::server::Server for SshServer {
 /// 存进 handler；`exec_request` 里据此决定放行还是拒绝。
 struct GitHandler {
     pool: PgPool,
-    /// `channel_open_session` 存下来的通道；exec 时取走交给 git 会话任务。
-    channel: Option<Channel<Msg>>,
-    /// 客户端通过 `GIT_PROTOCOL=version=2` env 请求协商出的协议版本。
-    protocol_v2: bool,
+    /// 已打开的会话通道，按 id 索引：一个连接可以承载多个通道，
+    /// 用单个 `Option<Channel>` 存会让后开的通道覆盖先开的那个。
+    channels: HashMap<ChannelId, Channel<Msg>>,
+    /// 每个通道单独记录 `GIT_PROTOCOL=version=2` 的协商结果，
+    /// 否则一个通道协商 v2 会把整条连接的其它通道也带成 v2。
+    protocols: HashMap<ChannelId, bool>,
+    git_http_base: String,
+    /// 公钥认证连续失败次数，用于简单的暴力尝试限速。
+    auth_failures: u32,
     user: Option<User>,
 }
 
@@ -136,15 +158,27 @@ impl russh::server::Handler for GitHandler {
         _: &str,
         key: russh::server::VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
+        // 一个连接上失败太多次就不再查库，并逐步拖慢重试，避免拿 SSH
+        // 端口当公钥字典的在线爆破入口。客户端逐个试自己那几个 key 时
+        // 通常不会超过 10 次，成功一次后计数清零。
+        if self.auth_failures >= 10 {
+            return Ok(Auth::reject());
+        }
         match ssh_key::authenticate(&self.pool, key.public_key).await {
             Ok(Some(user)) => {
                 tracing::info!(username = %user.username, "SSH 公钥认证通过");
                 self.user = Some(user);
+                self.auth_failures = 0;
                 Ok(Auth::Accept)
             }
-            Ok(None) => Ok(Auth::reject()),
+            Ok(None) => {
+                self.auth_failures += 1;
+                tokio::time::sleep(Duration::from_millis(100 * self.auth_failures as u64)).await;
+                Ok(Auth::reject())
+            }
             Err(error) => {
                 tracing::warn!(%error, "SSH 公钥认证查询失败");
+                self.auth_failures += 1;
                 Ok(Auth::reject())
             }
         }
@@ -157,7 +191,9 @@ impl russh::server::Handler for GitHandler {
         _: &mut Session,
     ) -> Result<(), Self::Error> {
         reply.accept().await;
-        self.channel = Some(channel);
+        // 先记 id 再存通道；同一连接后续再开 session 不会覆盖已有通道。
+        let id = channel.id();
+        self.channels.insert(id, channel);
         Ok(())
     }
 
@@ -171,8 +207,13 @@ impl russh::server::Handler for GitHandler {
         // 与 sshd 的 AcceptEnv GIT_PROTOCOL 等价：只认协议版本这一项。
         // 注意 `&mut Session` 上的应答方法是同步的（Handle 上才有 async 版本）。
         if name == "GIT_PROTOCOL" && value.trim() == "version=2" {
-            self.protocol_v2 = true;
-            session.channel_success(channel)?;
+            // 只影响当前通道；channel_open_session 里已注册的通道才接受。
+            if self.channels.contains_key(&channel) {
+                self.protocols.insert(channel, true);
+                session.channel_success(channel)?;
+            } else {
+                session.channel_failure(channel)?;
+            }
         } else {
             session.channel_failure(channel)?;
         }
@@ -196,7 +237,8 @@ impl russh::server::Handler for GitHandler {
             session.data(
                 channel,
                 error_pkt(&format!(
-                    "kych-net git: 只支持 git-upload-pack / git-receive-pack，收到: {command}"
+                    "kych-net git: 只支持 git-upload-pack / git-receive-pack / \
+                     git-lfs-authenticate，收到: {command}"
                 )),
             )?;
             session.close(channel)?;
@@ -206,14 +248,12 @@ impl russh::server::Handler for GitHandler {
             session.channel_failure(channel)?;
             return Ok(());
         };
-        let Some(channel_obj) = self.channel.take() else {
+        // 按 id 取通道：取不到就只拒绝本次请求，不会像旧实现那样先 take()
+        // 掉唯一的槽位、再发现 id 不符，导致整条连接上的其它通道也失效。
+        let Some(channel_obj) = self.channels.remove(&channel) else {
             session.channel_failure(channel)?;
             return Ok(());
         };
-        if channel_obj.id() != channel {
-            session.channel_failure(channel)?;
-            return Ok(());
-        }
 
         // 项目解析与可见性检查在 exec 回调里完成，失败直接拒绝命令。
         let project = match resolve_project(&self.pool, &slug).await {
@@ -228,14 +268,23 @@ impl russh::server::Handler for GitHandler {
 
         session.channel_success(channel)?;
         let pool = self.pool.clone();
-        let protocol_v2 = self.protocol_v2;
+        let protocol_v2 = self.protocols.remove(&channel).unwrap_or(false);
+        let git_http_base = self.git_http_base.clone();
         // git 客户端在读完 report 后还会检查 ssh 退出码：没有 exit-status
         // 请求时 ssh 以 -1 退出，推送结果会被误报成失败，所以必须显式回状态。
         let handle = session.handle();
         tokio::spawn(async move {
             let channel_id = channel_obj.id();
-            let result =
-                run_service(pool, project, user, service, protocol_v2, channel_obj).await;
+            let result = run_service(
+                pool,
+                project,
+                user,
+                service,
+                protocol_v2,
+                &git_http_base,
+                channel_obj,
+            )
+            .await;
             let status = if result.is_ok() { 0 } else { 1 };
             if let Err(error) = &result {
                 tracing::warn!(%error, "SSH git 会话异常结束");
@@ -250,14 +299,34 @@ impl russh::server::Handler for GitHandler {
 enum Service {
     Upload,
     Receive,
+    LfsAuth(LfsOperation),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LfsOperation {
+    Download,
+    Upload,
+}
+
+/// 匹配命令名，要求后面是空白或结束，避免把 `git-upload-pack-evil` 当成命令。
+fn strip_command<'a>(command: &'a str, name: &str) -> Option<&'a str> {
+    let rest = command.strip_prefix(name)?;
+    match rest.chars().next() {
+        None => Some(""),
+        Some(ch) if ch.is_whitespace() => Some(rest),
+        _ => None,
+    }
 }
 
 /// 解析 exec 命令，支持可选的 `--protocol=version=2` 与引号包裹的路径。
 fn parse_exec(command: &str) -> Option<(Service, String)> {
     let command = command.trim();
-    let (service, rest) = if let Some(rest) = command.strip_prefix("git-upload-pack") {
+    if let Some(result) = parse_lfs_auth(command) {
+        return Some(result);
+    }
+    let (service, rest) = if let Some(rest) = strip_command(command, "git-upload-pack") {
         (Service::Upload, rest)
-    } else if let Some(rest) = command.strip_prefix("git-receive-pack") {
+    } else if let Some(rest) = strip_command(command, "git-receive-pack") {
         (Service::Receive, rest)
     } else {
         return None;
@@ -278,13 +347,71 @@ fn parse_exec(command: &str) -> Option<(Service, String)> {
         value => value.trim().to_string(),
     };
 
-    // 接受 `/slug.git`、`slug.git`、`~/slug.git` 等形式，统一成 slug。
+    Some((service, normalize_slug(&path)?))
+}
+
+/// 接受 `/slug.git`、`slug.git`、`~/slug.git` 等形式，统一成 slug。
+fn normalize_slug(path: &str) -> Option<String> {
     let slug = path.trim_start_matches(['/', '~']).trim_end_matches('/');
     let slug = slug.strip_suffix(".git").unwrap_or(slug);
     if slug.is_empty() {
-        return None;
+        None
+    } else {
+        Some(slug.to_string())
     }
-    Some((service, slug.to_string()))
+}
+
+/// 把命令参数按空白切开，允许单/双引号包裹含空格的仓库路径。
+fn shell_tokens(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut started = false;
+    for ch in text.chars() {
+        match quote {
+            Some(end) if ch == end => quote = None,
+            Some(_) => current.push(ch),
+            None if ch == '\'' || ch == '"' => {
+                quote = Some(ch);
+                started = true;
+            }
+            None if ch.is_whitespace() => {
+                if started {
+                    out.push(std::mem::take(&mut current));
+                    started = false;
+                }
+            }
+            None => {
+                current.push(ch);
+                started = true;
+            }
+        }
+    }
+    if started {
+        out.push(current);
+    }
+    out
+}
+
+/// `git-lfs-authenticate <repo> <download|upload>`。
+///
+/// LFS 客户端通过 SSH 远程拿 basic 传输端点时执行这条命令；旧实现只认
+/// upload-pack / receive-pack，会把 LFS 请求当成非法命令直接拒绝。
+fn parse_lfs_auth(command: &str) -> Option<(Service, String)> {
+    let rest = strip_command(command, "git-lfs-authenticate")?;
+    let tokens = shell_tokens(rest);
+    // 只取前两个 token：`git-lfs-authenticate <path> <operation>`，
+    // 某些实现还会在末尾附加额外参数，忽略即可。
+    let (path, operation) = match tokens.as_slice() {
+        [path, op, ..] => (path, op),
+        _ => return None,
+    };
+    let operation = match operation.as_str() {
+        "download" => LfsOperation::Download,
+        "upload" => LfsOperation::Upload,
+        _ => return None,
+    };
+    Some((Service::LfsAuth(operation), normalize_slug(path)?))
 }
 
 /// SSH 侧的项目可见性与 HTTP 一致：未归档项目即可访问。
@@ -303,21 +430,98 @@ async fn run_service(
     user: User,
     service: Service,
     protocol_v2: bool,
+    git_http_base: &str,
     channel: Channel<Msg>,
 ) -> Result<()> {
     let mut stream = channel.into_stream();
-    let result = match (service, protocol_v2) {
-        (Service::Upload, true) => session_upload_pack_v2(&pool, &project, &mut stream).await,
-        (Service::Upload, false) => session_upload_pack_v0(&pool, &project, &mut stream).await,
-        (Service::Receive, _) => session_receive_pack(&pool, &project, &user, &mut stream).await,
+    let result = match service {
+        Service::Upload if protocol_v2 => {
+            session_upload_pack_v2(&pool, &project, &mut stream).await
+        }
+        Service::Upload => session_upload_pack_v0(&pool, &project, &mut stream).await,
+        Service::Receive => session_receive_pack(&pool, &project, &user, &mut stream).await,
+        Service::LfsAuth(operation) => {
+            session_lfs_authenticate(
+                &pool,
+                &project,
+                &user,
+                operation,
+                git_http_base,
+                &mut stream,
+            )
+            .await
+        }
     };
     if let Err(error) = &result {
-        // 协议层错误尽量以 pkt-line ERR 送达，客户端能看到中文原因。
-        let _ = stream.write_all(&error_pkt(&format!("{error}"))).await;
+        // 协议层错误尽量以 pkt-line ERR 送达；LFS 客户端期待 JSON，
+        // 混发 pkt-line 会被当成非法响应，所以单独回一条 JSON message。
+        let payload = match service {
+            Service::LfsAuth(_) => json!({ "message": error.to_string() }).to_string().into_bytes(),
+            _ => error_pkt(&error.to_string()),
+        };
+        let _ = stream.write_all(&payload).await;
     }
     // shutdown 会给客户端发 EOF；ChannelStream 被 drop 时自动 close 通道。
     let _ = stream.shutdown().await;
     result
+}
+
+/// LFS 的 SSH 认证响应：给出 basic 传输的 batch 端点与短期 Git 令牌。
+///
+/// `git-lfs-authenticate` 走 SSH，但 LFS 对象本身走 HTTP basic 传输；
+/// 上传时 batch 端点要求 `git_write_user()`，所以为已通过公钥认证的用户
+/// 签一个一小时过期、随用随换的令牌，客户端不必另配 HTTP 凭据。
+/// 下载端点匿名可读，不写库、不发令牌。
+async fn session_lfs_authenticate<S>(
+    pool: &PgPool,
+    project: &Project,
+    user: &User,
+    operation: LfsOperation,
+    git_http_base: &str,
+    stream: &mut S,
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let base = git_http_base.trim_end_matches('/');
+    // 注意这里给的是 **LFS 端点基址**，不是 batch 完整 URL：
+    // git-lfs 的 NewRequest 会把 ssh 认证响应里的 href 当 prefix，再用
+    // joinURL(prefix, "objects/batch") 拼出请求地址。写成
+    // `.../info/lfs/objects/batch` 会变成 `.../objects/batch/objects/batch`。
+    // 站点实际处理的是 `/git/<slug>.git/info/lfs/objects/batch`。
+    let href = format!(
+        "{base}/git/{}.git/info/lfs",
+        percent_encode_segment(&project.slug)
+    );
+    let mut response = json!({ "href": href });
+    if operation == LfsOperation::Upload {
+        const TTL_SECS: i64 = 3600;
+        let token = crate::git::token::create_ephemeral(
+            pool,
+            user.id,
+            "git-lfs-ssh",
+            TTL_SECS,
+        )
+        .await?;
+        response["header"] = json!({ "Authorization": format!("Bearer {token}") });
+        response["expires_in"] = json!(TTL_SECS);
+    }
+    stream.write_all(&serde_json::to_vec(&response)?).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// 只编码 URL 路径段里必须编码的字节（与 HTTP 侧保持一致）。
+fn percent_encode_segment(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 /// 把服务端错误包装成 pkt-line `ERR ...`，按 UTF-8 字符截断。
@@ -533,9 +737,42 @@ where
             return Ok(());
         }
         let response = crate::git::http::upload_pack_v2(pool, project, &chunk).await?;
+        let finished = response
+            .windows(9)
+            .any(|part| part == &b"packfile\n"[..]);
         stream.write_all(&response).await?;
         stream.flush().await?;
+        // fetch 的 packfile 段发完就代表这个 exec 会话结束。客户端读完 pack
+        // 未必会关闭写端，继续等 read() 会让 exit-status 一直拖到 russh 的
+        // 600 秒 inactivity_timeout（表现为 push/fetch 卡住）。ls-refs 等不带
+        // packfile 的响应仍允许在同一通道里继续发请求。
+        if finished {
+            return Ok(());
+        }
     }
+}
+
+/// 判定 pack 是否收齐时，允许的单次空闲时长与连续空闲轮数。
+const PUSH_IDLE_TIMEOUT_SECS: u64 = 3;
+const PUSH_MAX_IDLE_ROUNDS: u32 = 10;
+
+/// 检查数据末尾是不是一个完整 packfile 的 SHA-1 trailer。
+///
+/// Git pack 的最后 20 字节是前面所有字节的 SHA-1。客户端不关闭写端时，
+/// 没法靠 EOF 判断 pack 边界，但 trailer 本身是自校验的：一次哈希就能
+/// 确认是否已收齐，比逐个解压缩对象便宜得多，也不会误判正在传输中的
+/// 数据。`http::receive_pack` 随后会用 `parse_pack` 再完整校验一遍。
+fn pack_trailer_valid(data: &[u8]) -> bool {
+    let Some(start) = data.windows(4).position(|part| part == &b"PACK"[..]) else {
+        return false;
+    };
+    let pack = &data[start..];
+    if pack.len() < 32 || &pack[..4] != b"PACK" {
+        return false;
+    }
+    let split = pack.len() - 20;
+    let digest = Sha1::digest(&pack[..split]);
+    digest[..] == pack[split..]
 }
 
 /// v0 push 会话：广告 → 命令段 →（视情况）pack → report。
@@ -572,10 +809,39 @@ where
             body.extend(options);
         }
     } else {
-        // 非 stateless 模式下客户端发完 pack 会关闭写端（send-pack.c 把
-        // 写端交给 pack 生成器收尾），所以可以安全读到 EOF。
+        // 正常 git send-pack 发完 pack 会关闭写端，读到 EOF 即可；但 libgit2
+        // 等客户端会保持写端打开，`read_to_end()` 会一直挂到 russh 的 600 秒
+        // inactivity_timeout。改成「有数据就一直读，空闲超时后用 packfile
+        // 自带的 SHA-1 trailer 判断是否已收齐」，不再依赖对端关闭写端。
         let mut rest = Vec::new();
-        stream.read_to_end(&mut rest).await?;
+        let mut buf = [0u8; 8192];
+        let mut idle_rounds = 0u32;
+        loop {
+            match tokio::time::timeout(
+                Duration::from_secs(PUSH_IDLE_TIMEOUT_SECS),
+                stream.read(&mut buf),
+            )
+            .await
+            {
+                Ok(Ok(0)) => break,
+                Ok(Ok(count)) => {
+                    rest.extend_from_slice(&buf[..count]);
+                    idle_rounds = 0;
+                }
+                Ok(Err(error)) => return Err(error.into()),
+                Err(_) => {
+                    if pack_trailer_valid(&rest) {
+                        break;
+                    }
+                    // 大 pack 在客户端本地生成时可能长时间没有数据流出：
+                    // 多给几轮机会，只有确实一直没凑齐 trailer 才报错。
+                    idle_rounds += 1;
+                    if idle_rounds >= PUSH_MAX_IDLE_ROUNDS {
+                        bail!("等待推送 pack 数据超时：客户端未关闭写端且 pack 不完整");
+                    }
+                }
+            }
+        }
         body.extend(rest);
     }
 
@@ -646,5 +912,66 @@ mod tests {
     fn packfile_only_keeps_bare_pack() {
         let response = b"PACK\x00\x00\x00\x02rest".to_vec();
         assert_eq!(packfile_only(&response), response.as_slice());
+    }
+
+    #[test]
+    fn parses_lfs_authenticate_commands() {
+        assert_eq!(
+            parse_exec("git-lfs-authenticate '/地狱之下.git' download"),
+            Some((
+                Service::LfsAuth(LfsOperation::Download),
+                "地狱之下".into()
+            ))
+        );
+        assert_eq!(
+            parse_exec("git-lfs-authenticate \"/docs/a b.git\" upload"),
+            Some((
+                Service::LfsAuth(LfsOperation::Upload),
+                "docs/a b".into()
+            ))
+        );
+        assert_eq!(parse_exec("git-lfs-authenticate '/x.git' push"), None);
+        assert_eq!(parse_exec("git-lfs-authenticate '/x.git'"), None);
+        assert_eq!(
+            parse_exec("git-lfs-authenticate-evil '/x.git' download"),
+            None
+        );
+        assert_eq!(parse_exec("git-upload-pack-evil '/x.git'"), None);
+    }
+
+    #[test]
+    fn shell_tokens_keep_quoted_spaces() {
+        assert_eq!(
+            shell_tokens("'/a b.git' download"),
+            vec!["/a b.git".to_string(), "download".to_string()]
+        );
+    }
+
+    /// 一个合法的 v2 packfile：1 个内容为 `hello` 的 blob + SHA-1 trailer。
+    const SAMPLE_PACK: &[u8] = &[
+        0x50, 0x41, 0x43, 0x4b, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01,
+        0x35, 0x78, 0x9c, 0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00, 0x06, 0x2c,
+        0x02, 0x15, 0x77, 0x20, 0xd4, 0x1b, 0xf3, 0xa7, 0x16, 0xde, 0xc8, 0x04,
+        0x1e, 0xcc, 0x7e, 0x0a, 0x74, 0x84, 0xea, 0x53, 0x44, 0xdc,
+    ];
+
+    #[test]
+    fn pack_trailer_detects_complete_pack() {
+        assert!(pack_trailer_valid(SAMPLE_PACK));
+        // push-options 段在 pack 之前时也能定位到 pack 起点。
+        let mut data = proto::pkt_str("push-option foo\n");
+        data.extend(proto::flush());
+        data.extend(SAMPLE_PACK);
+        assert!(pack_trailer_valid(&data));
+    }
+
+    #[test]
+    fn pack_trailer_rejects_incomplete_or_trailing_garbage() {
+        let truncated = &SAMPLE_PACK[..SAMPLE_PACK.len() - 1];
+        assert!(!pack_trailer_valid(truncated));
+        let mut extra = SAMPLE_PACK.to_vec();
+        extra.extend(b"junk");
+        assert!(!pack_trailer_valid(&extra));
+        assert!(!pack_trailer_valid(b"no pack here"));
     }
 }
