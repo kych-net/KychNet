@@ -60,14 +60,6 @@ function firstLine(value: string): string {
   return value.split("\n")[0] || "(无提交信息)";
 }
 
-/**
- * 与后端 project.rs::is_root_index 保持一致：只有根目录 index.html 是项目主页。
- * 其它 index.* 源文件与子目录里的 index.html 都可以正常删除、改名。
- */
-function isProjectIndex(path: string): boolean {
-  return path === "index.html";
-}
-
 /** PR 与提交详情共用的行级差异展示。 */
 function DiffList({ files }: { files: PrDetail["files"] }) {
   if (files.length === 0) {
@@ -597,13 +589,6 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
       ...staged.map(([path, value]) => ({ path, content: value })),
     ];
     if (changes.length === 0) return;
-    // 服务端会拒绝删除/改名根目录 index；与其发出注定失败的请求，不如就地说明。
-    const blocked = deletions.find(isProjectIndex);
-    if (blocked) {
-      setCommitError(`「${blocked}」是项目主页，不能删除或移走，只能编辑内容；请先清空待提交更改。`);
-      setCommitNotice("");
-      return;
-    }
     setBusy(true);
     setError("");
     setNotice("");
@@ -642,11 +627,6 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
 
   function removeFile() {
     if (!file) return;
-    if (isProjectIndex(file.path)) {
-      setCommitError(`「${file.path}」是项目主页，不能删除，只能编辑内容。`);
-      setCommitNotice("");
-      return;
-    }
     if (!window.confirm(`将 ${file.path} 标记为删除？提交项目时生效。`)) return;
     setDeletions((current) => Array.from(new Set([...current, file.path])));
     setDrafts((current) => {
@@ -663,11 +643,6 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
 
   function renameFile() {
     if (!file) return;
-    if (isProjectIndex(file.path)) {
-      setCommitError(`「${file.path}」是项目主页，不能改名或移走，只能编辑内容。`);
-      setCommitNotice("");
-      return;
-    }
     const target = window.prompt("新路径", file.path);
     if (!target || target === file.path) return;
     setDrafts((current) => ({ ...current, [target]: content }));
