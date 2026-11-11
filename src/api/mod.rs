@@ -552,6 +552,8 @@ pub async fn serve(cfg: Config) -> Result<()> {
             post(content_revision_revert),
         )
         .route("/api/projects", get(project_list).post(project_create))
+        // 静态段优先于 `{id}` 匹配：/api/projects/import 不会被当成项目 id。
+        .route("/api/projects/import", post(project_import))
         .route(
             "/api/projects/{id}",
             get(project_detail)

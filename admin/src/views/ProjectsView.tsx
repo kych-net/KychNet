@@ -40,6 +40,13 @@ function joinPath(dir: string, name: string): string {
   return dir ? `${dir}/${clean}` : clean;
 }
 
+/** 从仓库地址里推断项目名：取最后一段路径，去掉 .git 后缀。 */
+function slugFromUrl(value: string): string {
+  const cleaned = value.trim().replace(/\/+$/, "").replace(/\.git$/i, "");
+  const name = cleaned.split(/[/:]/).filter(Boolean).pop() ?? "";
+  return name.replace(/[^\p{L}\p{N}\-_]/gu, "-").slice(0, 60);
+}
+
 const PR_STATUS_LABEL: Record<PullRequest["status"], string> = {
   open: "开放",
   merged: "已合并",
@@ -138,6 +145,11 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
   const [creating, setCreating] = useState(false);
   const [newSlug, setNewSlug] = useState("");
   const [newDescription, setNewDescription] = useState("");
+
+  // 从外部 Git 仓库导入（克隆）项目。
+  const [importing, setImporting] = useState(false);
+  const [importUrl, setImportUrl] = useState("");
+  const [importBranch, setImportBranch] = useState("");
 
   const [middleTab, setMiddleTab] = useState<"files" | "discussions" | "workflows">("files");
   const [rightTab, setRightTab] = useState<"history" | "prs">("history");
@@ -676,6 +688,36 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
     }
   }
 
+  async function importProject(event: React.FormEvent) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      const result = await api.importProject({
+        slug: newSlug.trim(),
+        description: newDescription,
+        url: importUrl.trim(),
+        branch: importBranch.trim() || undefined,
+      });
+      setImporting(false);
+      setImportUrl("");
+      setImportBranch("");
+      setNewSlug("");
+      setNewDescription("");
+      setNotice(
+        `项目「${result.item.slug}」已导入：${result.branches.length} 个分支、` +
+          `${result.commits} 个提交、${result.objects} 个对象`,
+      );
+      await refreshProjects();
+      await selectProject(result.item);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function editProject() {
     if (!selected) return;
     const description = window.prompt("项目描述", selected.description);
@@ -816,13 +858,78 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
             />
             显示已归档项目
           </label>
-          <button
-            type="button"
-            className="project-new-button"
-            onClick={() => setCreating((value) => !value)}
-          >
-            {creating ? "取消新建" : "+ 新建项目"}
-          </button>
+          <div className="project-new-row">
+            <button
+              type="button"
+              className="project-new-button"
+              onClick={() => {
+                setCreating((value) => !value);
+                setImporting(false);
+              }}
+            >
+              {creating ? "取消新建" : "+ 新建项目"}
+            </button>
+            <button
+              type="button"
+              className="project-new-button"
+              onClick={() => {
+                setImporting((value) => !value);
+                setCreating(false);
+              }}
+            >
+              {importing ? "取消导入" : "⇣ 从 Git 导入"}
+            </button>
+          </div>
+          {importing && (
+            <form className="project-create" onSubmit={importProject}>
+              <label>
+                仓库地址
+                <input
+                  value={importUrl}
+                  onChange={(e) => {
+                    const value = e.target.value;
+                    setImportUrl(value);
+                    // 项目名还空着时按仓库地址自动填一个，用户可以再改。
+                    if (!newSlug.trim()) setNewSlug(slugFromUrl(value));
+                  }}
+                  placeholder="https://github.com/owner/repo.git"
+                  required
+                />
+              </label>
+              <label>
+                项目名
+                <input
+                  value={newSlug}
+                  onChange={(e) => setNewSlug(e.target.value)}
+                  placeholder="repo"
+                  required
+                />
+              </label>
+              <label>
+                描述
+                <textarea
+                  value={newDescription}
+                  onChange={(e) => setNewDescription(e.target.value)}
+                  rows={2}
+                />
+              </label>
+              <label>
+                分支（可选）
+                <input
+                  value={importBranch}
+                  onChange={(e) => setImportBranch(e.target.value)}
+                  placeholder="留空导入全部分支"
+                />
+              </label>
+              <p className="hint">
+                服务端会克隆该公开仓库的分支与完整提交历史，导入后可直接用站内 Git 地址继续推送。
+                只支持 http/https 公开仓库，且历史里不能包含二进制文件（站内 Git 仅存 UTF-8 文本）。
+              </p>
+              <button type="submit" disabled={busy || !importUrl.trim() || !newSlug.trim()}>
+                {busy ? "克隆中…" : "开始导入"}
+              </button>
+            </form>
+          )}
           {creating && (
             <form className="project-create" onSubmit={createProject}>
               <label>

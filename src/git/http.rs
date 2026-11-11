@@ -1,11 +1,10 @@
-use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Utc};
+use anyhow::{bail, Result};
 use sqlx::{PgConnection, PgPool};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use super::object::{
-    commit_tree, ensure_text, Object, ObjectKind, Oid, Tree, TreeEntry,
+    commit_tree, ensure_text, parse_commit, Object, ObjectKind, Oid, Tree, TreeEntry,
 };
 use super::proto;
 use super::store;
@@ -746,56 +745,6 @@ pub async fn upload_pack_v2(
         "fetch" => v2_fetch(&mut conn, project, &request.args).await,
         other => bail!("不支持的 protocol v2 命令: {other}"),
     }
-}
-
-struct CommitInfo {
-    tree: Oid,
-    parents: Vec<Oid>,
-    author: String,
-    committed_at: DateTime<Utc>,
-    message: String,
-}
-
-fn parse_commit(data: &[u8]) -> Result<CommitInfo> {
-    let text = std::str::from_utf8(data)
-        .map_err(|_| anyhow::anyhow!("commit 对象不是 UTF-8，暂不支持"))?;
-    let (head, message) = text.split_once("\n\n").unwrap_or((text, ""));
-    let mut tree = None;
-    let mut parents = Vec::new();
-    let mut author = "KychNet".to_string();
-    let mut committed_at = Utc::now();
-    for line in head.lines() {
-        if let Some(value) = line.strip_prefix("tree ") {
-            tree = Some(Oid::from_hex(value)?);
-        } else if let Some(value) = line.strip_prefix("parent ") {
-            parents.push(Oid::from_hex(value)?);
-        } else if let Some(value) = line.strip_prefix("committer ") {
-            if let Some((name, timestamp)) = split_identity(value) {
-                author = name;
-                committed_at = DateTime::from_timestamp(timestamp, 0).unwrap_or_else(Utc::now);
-            }
-        }
-    }
-    Ok(CommitInfo {
-        tree: tree.context("commit 缺少 tree 行")?,
-        parents,
-        author,
-        committed_at,
-        message: message.trim().to_string(),
-    })
-}
-
-fn split_identity(value: &str) -> Option<(String, i64)> {
-    let close = value.rfind('>')?;
-    let name = value[..close]
-        .split('<')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    let rest = value[close + 1..].trim();
-    let timestamp = rest.split_whitespace().next()?.parse().ok()?;
-    Some((crate::git::object::identity_name(&name), timestamp))
 }
 
 async fn unpack_pack(

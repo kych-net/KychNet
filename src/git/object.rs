@@ -1,4 +1,5 @@
 use anyhow::{bail, Result};
+use chrono::{DateTime, Utc};
 use sha1::{Digest, Sha1};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -300,6 +301,56 @@ pub fn commit_parents(data: &[u8]) -> Result<Vec<Oid>> {
         }
     }
     Ok(parents)
+}
+
+/// 从 commit 对象里解析出的字段。
+pub struct CommitInfo {
+    pub tree: Oid,
+    pub parents: Vec<Oid>,
+    pub author: String,
+    pub committed_at: DateTime<Utc>,
+    pub message: String,
+}
+
+/// 一次性解析 commit 对象：tree、父提交、committer 身份与提交信息。
+///
+/// 身份取的 committer 而不是 author，与 git 的 `%cn` 一致；站内所有提交
+/// 由同一账号生成，两者本来相同，导入的外部历史才可能不同。
+pub fn parse_commit(data: &[u8]) -> Result<CommitInfo> {
+    let text = std::str::from_utf8(data).map_err(|_| anyhow::anyhow!("commit 对象不是 UTF-8"))?;
+    let (head, message) = text.split_once("\n\n").unwrap_or((text, ""));
+    let mut tree = None;
+    let mut parents = Vec::new();
+    let mut author = "KychNet".to_string();
+    let mut committed_at = Utc::now();
+    for line in head.lines() {
+        if let Some(value) = line.strip_prefix("tree ") {
+            tree = Some(Oid::from_hex(value)?);
+        } else if let Some(value) = line.strip_prefix("parent ") {
+            parents.push(Oid::from_hex(value)?);
+        } else if let Some(value) = line.strip_prefix("committer ") {
+            if let Some((name, timestamp)) = split_identity(value) {
+                author = name;
+                committed_at = DateTime::from_timestamp(timestamp, 0).unwrap_or_else(Utc::now);
+            }
+        }
+    }
+    Ok(CommitInfo {
+        tree: tree.ok_or_else(|| anyhow::anyhow!("commit 对象缺少 tree 行"))?,
+        parents,
+        author,
+        committed_at,
+        message: message.trim().to_string(),
+    })
+}
+
+/// 解析 `名字 <email> 1700000000 +0800` 这一段，返回清理过的名字与时间戳。
+fn split_identity(value: &str) -> Option<(String, i64)> {
+    let close = value.rfind('>')?;
+    let name = value[..close].split('<').next().unwrap_or_default().trim();
+    let rest = value[close + 1..].trim();
+    let timestamp = rest.split_whitespace().next()?.parse().ok()?;
+    Some((identity_name(name), timestamp))
 }
 
 /// 清理用户名中会破坏 commit 身份行的字符。

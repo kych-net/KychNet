@@ -1,3 +1,4 @@
+pub mod fetch;
 pub mod gc;
 pub mod http;
 pub mod lfs;

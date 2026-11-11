@@ -464,6 +464,20 @@ export const api = {
       method: "POST",
       body: JSON.stringify(payload),
     }),
+  // 从外部公开 Git 仓库克隆出一个项目；branch 缺省时导入远端全部分支。
+  importProject: (payload: {
+    slug: string;
+    description: string;
+    url: string;
+    branch?: string;
+  }) =>
+    request<{ item: Project; branches: string[]; objects: number; commits: number }>(
+      "/projects/import",
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+    ),
   project: (id: string) =>
     request<{ item: Project; branches: string[] }>(`/projects/${id}`),
   updateProject: (id: string, payload: { description?: string; archived?: boolean }) =>

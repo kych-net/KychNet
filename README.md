@@ -393,6 +393,9 @@ access token 一小时内自然过期；refresh token 最长 30 天。数据库�
 - 匿名可以 clone 公开仓库,写操作可用 Git token 或登录会话;
 - git smart HTTP 协议版本 v2(/git/ls-refs 等 v2 组接口,serve、info/refs 与导出为 v1 回退);runner 对内容仓库的写走登录会话,规则与匿名读、LFS 内容、代码归档只读一致;
 - 归档为管理员或项目创建者专属操作,普通登录用户不能归档他人项目;
+- 管理端「项目」页可以从外部仓库克隆导入:填仓库地址(可自动带出项目名)、描述与可选分支,服务端走 Git smart HTTP v0 拉全量 pack,对象、分支与提交历史一并落库,不依赖系统 git 或 libgit2;
+- 导入只接受 http/https 公开仓库,地址里不能带账号密码、查询串或锚点;目标必须是公网地址,禁止重定向(避免 SSRF 与 302 绕过校验),内网自建 Git 服务器需显式设置 `KYCHNET_IMPORT_ALLOW_PRIVATE=1`;
+- 导入上限:30 个分支、10 万个对象、5000 个提交、单个 pack 128 MiB,按用户与 IP 各限流 5 次 / 10 分钟;历史里含二进制文件的仓库会被拒(站内 Git 只存 UTF-8 文本),校验在写库前完成,失败不留半个项目;
 - 已知限制:协议 v0 浅克隆(`--depth`)修复待 PR 发布,命令行 git 与 v2 客户端不受影响;
 - 迁移 `0009_projects` / `0010_lfs` 创建项目、对象、refs、commits、PR、讨论与 LFS 索引;
 - `kych-net gc --project <slug>` 清理不可达对象。
