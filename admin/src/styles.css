@@ -3107,6 +3107,17 @@ code,
   background: color-mix(in srgb, var(--accent) 88%, #000);
 }
 
+/* 提交结果就地显示：复用全局 error/notice 配色，但取消 sticky，
+   否则会脱离工作区面板、粘到视口顶部而看不见。 */
+.project-commit-feedback {
+  position: static;
+  z-index: auto;
+  margin: 0.6rem 0 0;
+  padding: 0.5rem 0.7rem;
+  font-size: 0.78rem;
+  line-height: 1.5;
+}
+
 .staged-badge {
   margin-right: 0.4rem;
   padding: 0.08rem 0.32rem;
