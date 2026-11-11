@@ -125,8 +125,7 @@ pub fn v2_capabilities() -> Vec<u8> {
 
 /// 读取 tag 对象指向的目标 OID。
 fn tag_target(data: &[u8]) -> Result<Option<Oid>> {
-    let text = std::str::from_utf8(data)
-        .map_err(|_| anyhow::anyhow!("tag 对象不是 UTF-8"))?;
+    let text = std::str::from_utf8(data).map_err(|_| anyhow::anyhow!("tag 对象不是 UTF-8"))?;
     for line in text.lines() {
         if line.is_empty() {
             break;
@@ -139,11 +138,7 @@ fn tag_target(data: &[u8]) -> Result<Option<Oid>> {
 }
 
 /// 逐层剥开 annotated tag，直到拿到一个普通对象。
-async fn peel_tag_once(
-    conn: &mut PgConnection,
-    project_id: Uuid,
-    oid: Oid,
-) -> Result<Oid> {
+async fn peel_tag_once(conn: &mut PgConnection, project_id: Uuid, oid: Oid) -> Result<Oid> {
     let mut current = oid;
     for _ in 0..8 {
         let Some(object) = store::get_object(conn, project_id, current).await? else {
@@ -333,6 +328,8 @@ async fn collect_objects(
                     for entry in tree.entries.values() {
                         match entry {
                             TreeEntry::Blob(oid) | TreeEntry::Dir(oid) => stack.push(*oid),
+                            // gitlink 指向外部仓库的提交，对象库中不存在。
+                            TreeEntry::Gitlink(_) => {}
                         }
                     }
                 }
@@ -425,6 +422,8 @@ pub(crate) async fn have_reachable(
                     for entry in tree.entries.values() {
                         match entry {
                             TreeEntry::Blob(oid) | TreeEntry::Dir(oid) => stack.push(*oid),
+                            // gitlink 指向外部仓库的提交，对象库中不存在。
+                            TreeEntry::Gitlink(_) => {}
                         }
                     }
                 }
@@ -550,11 +549,7 @@ pub(crate) async fn upload_pack_request(
 }
 
 /// v2 `ls-refs`。
-async fn ls_refs(
-    conn: &mut PgConnection,
-    project: &Project,
-    args: &[String],
-) -> Result<Vec<u8>> {
+async fn ls_refs(conn: &mut PgConnection, project: &Project, args: &[String]) -> Result<Vec<u8>> {
     let mut prefixes: Vec<String> = Vec::new();
     let mut symrefs = false;
     let mut peel = false;
@@ -587,10 +582,7 @@ async fn ls_refs(
                 oid.to_hex(),
                 default_ref
             )),
-            None if unborn => lines.push(format!(
-                "unborn HEAD symref-target:{}\n",
-                default_ref
-            )),
+            None if unborn => lines.push(format!("unborn HEAD symref-target:{}\n", default_ref)),
             None => {}
         }
     }
@@ -622,11 +614,7 @@ async fn ls_refs(
 }
 
 /// v2 `fetch`。
-async fn v2_fetch(
-    conn: &mut PgConnection,
-    project: &Project,
-    args: &[String],
-) -> Result<Vec<u8>> {
+async fn v2_fetch(conn: &mut PgConnection, project: &Project, args: &[String]) -> Result<Vec<u8>> {
     let mut request = proto::UploadRequest::default();
     for arg in args {
         if let Some(rest) = arg.strip_prefix("want ") {
@@ -733,11 +721,7 @@ async fn v2_fetch(
 }
 
 /// v2 请求入口：根据 `command=` 分发。
-pub async fn upload_pack_v2(
-    pool: &PgPool,
-    project: &Project,
-    body: &[u8],
-) -> Result<Vec<u8>> {
+pub async fn upload_pack_v2(pool: &PgPool, project: &Project, body: &[u8]) -> Result<Vec<u8>> {
     let request = proto::parse_v2_request(body)?;
     let mut conn = pool.acquire().await?;
     match request.command.as_str() {
@@ -747,11 +731,7 @@ pub async fn upload_pack_v2(
     }
 }
 
-async fn unpack_pack(
-    conn: &mut PgConnection,
-    project_id: Uuid,
-    data: &[u8],
-) -> Result<usize> {
+async fn unpack_pack(conn: &mut PgConnection, project_id: Uuid, data: &[u8]) -> Result<usize> {
     if data.is_empty() {
         return Ok(0);
     }
@@ -829,13 +809,12 @@ pub(crate) async fn index_commits(
         if seen.len() > MAX_COMMIT_WALK {
             bail!("提交历史过深，无法建立索引");
         }
-        let known: Option<(i32,)> = sqlx::query_as(
-            "SELECT 1 FROM git_commits WHERE project_id = $1 AND oid = $2",
-        )
-        .bind(project_id)
-        .bind(&oid.as_bytes()[..])
-        .fetch_optional(&mut *conn)
-        .await?;
+        let known: Option<(i32,)> =
+            sqlx::query_as("SELECT 1 FROM git_commits WHERE project_id = $1 AND oid = $2")
+                .bind(project_id)
+                .bind(&oid.as_bytes()[..])
+                .fetch_optional(&mut *conn)
+                .await?;
         if known.is_some() {
             continue;
         }
@@ -955,9 +934,7 @@ pub async fn receive_pack(
                     if current != *old {
                         Err("远端引用已变化，请先 fetch 后重试".to_string())
                     } else if let CommandAction::Set {
-                        target,
-                        is_head,
-                        ..
+                        target, is_head, ..
                     } = &action
                     {
                         let peeled = peel_tag_once(&mut tx, project.id, *target)
@@ -997,11 +974,7 @@ pub async fn receive_pack(
         for (name, _, _, result) in checked {
             match result {
                 Err(reason) => statuses.push((name, false, reason)),
-                Ok(_) => statuses.push((
-                    name,
-                    false,
-                    "原子推送失败，所有引用均未更新".to_string(),
-                )),
+                Ok(_) => statuses.push((name, false, "原子推送失败，所有引用均未更新".to_string())),
             }
         }
     } else {

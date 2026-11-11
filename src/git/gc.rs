@@ -49,6 +49,8 @@ async fn mark_reachable(
                 for entry in tree.entries.values() {
                     match entry {
                         TreeEntry::Blob(oid) | TreeEntry::Dir(oid) => stack.push(*oid),
+                        // gitlink 指向外部仓库的提交，本仓库无此对象。
+                        TreeEntry::Gitlink(_) => {}
                     }
                 }
             }
@@ -68,8 +70,7 @@ async fn mark_reachable(
 }
 
 fn tag_target(data: &[u8]) -> Result<Option<Oid>> {
-    let text = std::str::from_utf8(data)
-        .map_err(|_| anyhow::anyhow!("tag 对象不是 UTF-8"))?;
+    let text = std::str::from_utf8(data).map_err(|_| anyhow::anyhow!("tag 对象不是 UTF-8"))?;
     for line in text.lines() {
         if line.is_empty() {
             break;
