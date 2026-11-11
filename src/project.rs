@@ -189,11 +189,35 @@ fn parent_dir(path: &str) -> &str {
     }
 }
 
-/// 项目主页：只有根目录下的 `index.html` 不允许删除或改名。
-/// 其它源文件（`index.md` / `index.typ` / `index.wj` …）以及子目录里的
-/// `index.html` 都只是普通文件，可以正常删除、改名。
-fn is_root_index(path: &str) -> bool {
-    path == "index.html"
+// 项目 Git 侧对文件名不做任何主页保护：项目里的 index.html / index.md /
+// index.svg 都是普通文件，可以自由删除、改名。
+// 「网站根目录只允许 index.html」的规则只作用于内容侧的 contents 表
+// （见 service.rs::ensure_root_index_html_only），两套存储彼此独立。
+
+/// 校验一批文件变更：路径合法、无重复、非删除变更必须是文本。
+///
+/// 这里刻意不检查任何「主页」文件名——项目 Git 侧不设限。
+fn validate_changes(changes: &[FileChange]) -> Result<()> {
+    if changes.is_empty() || changes.len() > 200 {
+        bail!("一次提交需要 1-200 个文件变更");
+    }
+    let mut seen = std::collections::HashSet::new();
+    for change in changes {
+        if !valid_file_path(&change.path) {
+            bail!("非法文件路径: {}", change.path);
+        }
+        if !seen.insert(change.path.as_str()) {
+            bail!("重复的文件路径: {}", change.path);
+        }
+        if !change.delete {
+            let content = change
+                .content
+                .as_deref()
+                .context("非删除变更缺少 content")?;
+            ensure_text(content.as_bytes())?;
+        }
+    }
+    Ok(())
 }
 
 /// 同一目录下 `a.md` 与 `a.html` 会输出到同一个页面，必须提前拒绝。
@@ -646,29 +670,7 @@ pub async fn commit_changes(
     if !valid_branch(branch) {
         bail!("非法分支名");
     }
-    if changes.is_empty() || changes.len() > 200 {
-        bail!("一次提交需要 1-200 个文件变更");
-    }
-    let mut seen = std::collections::HashSet::new();
-    for change in changes {
-        if !valid_file_path(&change.path) {
-            bail!("非法文件路径: {}", change.path);
-        }
-        if !seen.insert(change.path.as_str()) {
-            bail!("重复的文件路径: {}", change.path);
-        }
-        if change.delete {
-            if is_root_index(&change.path) {
-                bail!("项目主页 index.html 不能删除，只能编辑");
-            }
-        } else {
-            let content = change
-                .content
-                .as_deref()
-                .context("非删除变更缺少 content")?;
-            ensure_text(content.as_bytes())?;
-        }
-    }
+    validate_changes(changes)?;
     get_project(pool, project_id).await?.context("项目不存在")?;
 
     let mut tx = pool.begin().await?;
@@ -781,9 +783,6 @@ pub async fn delete_file(
     if !valid_file_path(path) {
         bail!("非法文件路径");
     }
-    if is_root_index(path) {
-        bail!("项目主页 index.html 不能删除，只能编辑");
-    }
 
     let mut tx = pool.begin().await?;
     lock_project(&mut tx, project_id).await?;
@@ -836,9 +835,6 @@ pub async fn move_file(
     }
     if from == to {
         bail!("源路径与目标路径相同");
-    }
-    if is_root_index(from) {
-        bail!("项目主页 index.html 不能改名");
     }
 
     let mut tx = pool.begin().await?;
@@ -1260,16 +1256,44 @@ mod tests {
     }
 
     #[test]
-    fn only_root_index_html_is_protected() {
-        assert!(is_root_index("index.html"));
-        // 其它源文件与子目录下的同名文件都可以正常删除、改名。
-        assert!(!is_root_index("index.md"));
-        assert!(!is_root_index("index.typ"));
-        assert!(!is_root_index("index.wj"));
-        assert!(!is_root_index("index.css"));
-        assert!(!is_root_index("index.svg"));
-        assert!(!is_root_index("index"));
-        assert!(!is_root_index("docs/index.html"));
-        assert!(!is_root_index("Index.html"));
+    fn project_side_allows_deleting_any_index_file() {
+        // 项目 Git 侧不设主页保护：index.html / index.md / 子目录同名文件
+        // 都只是普通文件。「网站根目录只允许 index.html」只在内容侧生效。
+        let changes: Vec<FileChange> = [
+            "index.html",
+            "index.md",
+            "index.typ",
+            "index.svg",
+            "docs/index.html",
+        ]
+        .iter()
+        .map(|path| FileChange {
+            path: (*path).to_string(),
+            content: None,
+            delete: true,
+        })
+        .collect();
+        assert!(validate_changes(&changes).is_ok());
+
+        // 通用校验仍然生效：重复路径、非法路径照旧拒绝。
+        let duplicated = vec![
+            FileChange {
+                path: "index.html".into(),
+                content: None,
+                delete: true,
+            },
+            FileChange {
+                path: "index.html".into(),
+                content: None,
+                delete: true,
+            },
+        ];
+        assert!(validate_changes(&duplicated).is_err());
+        assert!(validate_changes(&[FileChange {
+            path: "/index.html".into(),
+            content: None,
+            delete: true,
+        }])
+        .is_err());
     }
 }
