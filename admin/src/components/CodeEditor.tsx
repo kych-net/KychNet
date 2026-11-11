@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import { basicSetup } from "codemirror";
-import { Compartment, EditorState } from "@codemirror/state";
+import { Annotation, Compartment, EditorState } from "@codemirror/state";
 import { EditorView, keymap } from "@codemirror/view";
 import {
   HighlightStyle,
@@ -20,6 +20,11 @@ type Props = {
   format: ContentFormat;
   onChange: (value: string) => void;
 };
+
+// 标记「由外部 setValue 引起的文档变更」。
+// 这类变更必须同步进编辑器，但不能回头触发 onChange——否则打开文件
+// 本身就会被当成一次编辑，把文件标成「待提交」。
+const ExternalSync = Annotation.define<boolean>();
 
 const highlightStyle = HighlightStyle.define([
   { tag: t.heading, color: "var(--accent)", fontWeight: "700" },
@@ -186,9 +191,13 @@ export function CodeEditor({ value, format, onChange }: Props) {
         editorTheme,
         EditorView.lineWrapping,
         EditorView.updateListener.of((update) => {
-          if (update.docChanged) {
-            onChangeRef.current(update.state.doc.toString());
-          }
+          if (!update.docChanged) return;
+          // 外部同步进来的内容不算用户编辑。
+          const external = update.transactions.some((tr) =>
+            tr.annotation(ExternalSync),
+          );
+          if (external) return;
+          onChangeRef.current(update.state.doc.toString());
         }),
       ],
     });
@@ -210,6 +219,7 @@ export function CodeEditor({ value, format, onChange }: Props) {
     if (current !== value) {
       view.dispatch({
         changes: { from: 0, to: current.length, insert: value },
+        annotations: ExternalSync.of(true),
       });
     }
   }, [value]);
