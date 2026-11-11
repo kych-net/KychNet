@@ -168,6 +168,12 @@ pub fn ensure_text(data: &[u8]) -> Result<()> {
 pub enum TreeEntry {
     Blob(Oid),
     Dir(Oid),
+    /// 子模块 gitlink（mode `160000`）。
+    ///
+    /// 指向**外部仓库**的提交：这个 OID 在本仓库对象库里永远不存在，
+    /// 任何遍历（clone/GC/模板复制/工作树统计）都必须跳过它，
+    /// 否则会把一次普通的 clone 变成「请求的对象不存在」。
+    Gitlink(Oid),
 }
 
 #[derive(Clone, Default, Debug)]
@@ -212,6 +218,10 @@ impl Tree {
             let oid = Oid::from_slice(&data[nul + 1..nul + 21])?;
             let entry = if mode == "40000" || mode == "040000" {
                 TreeEntry::Dir(oid)
+            } else if mode == "160000" {
+                // gitlink：子模块引用。OID 是外部仓库的提交，
+                // 不是本仓库的对象，绝不能当作 blob/dir 展开。
+                TreeEntry::Gitlink(oid)
             } else {
                 TreeEntry::Blob(oid)
             };
@@ -227,11 +237,11 @@ impl Tree {
         items.sort_by(|(left_name, left), (right_name, right)| {
             let left_key = match left {
                 TreeEntry::Dir(_) => format!("{left_name}/"),
-                TreeEntry::Blob(_) => (*left_name).clone(),
+                TreeEntry::Blob(_) | TreeEntry::Gitlink(_) => (*left_name).clone(),
             };
             let right_key = match right {
                 TreeEntry::Dir(_) => format!("{right_name}/"),
-                TreeEntry::Blob(_) => (*right_name).clone(),
+                TreeEntry::Blob(_) | TreeEntry::Gitlink(_) => (*right_name).clone(),
             };
             left_key.as_bytes().cmp(right_key.as_bytes())
         });
@@ -240,6 +250,8 @@ impl Tree {
         for (name, entry) in items {
             let (mode, oid) = match entry {
                 TreeEntry::Blob(oid) => (&b"100644 "[..], oid),
+                // gitlink 原样回写 160000，保持与导入的仓库一致。
+                TreeEntry::Gitlink(oid) => (&b"160000 "[..], oid),
                 TreeEntry::Dir(oid) => (&b"40000 "[..], oid),
             };
             out.extend_from_slice(mode);
@@ -412,6 +424,38 @@ mod tests {
         assert_eq!(parsed.entries.len(), 2);
         assert!(matches!(parsed.get("a"), Some(TreeEntry::Dir(_))));
         assert!(matches!(parsed.get("a.txt"), Some(TreeEntry::Blob(_))));
+
+        // gitlink（子模块）：160000 解析为独立变体，编码时原样回写。
+        let submodule = Oid::from_hex("1107741ce227fbd500ef201b1ef8140518f0eb44").unwrap();
+        let mut data = format!("160000 地狱之下\0").into_bytes();
+        data.extend_from_slice(submodule.as_bytes());
+        let parsed = Tree::parse(&data).unwrap();
+        assert!(matches!(
+            parsed.get("地狱之下"),
+            Some(TreeEntry::Gitlink(_))
+        ));
+
+        // gitlink 排序与 blob 相同（目录名才带 `/`），编码往返不失真。
+        let mut tree = Tree::default();
+        tree.entries
+            .insert("mod".into(), TreeEntry::Gitlink(submodule));
+        tree.entries.insert(
+            "mod.txt".into(),
+            TreeEntry::Blob(Oid::from_hex("e69de29bb2d1d6434b8b29ae775ad8c2e48c5391").unwrap()),
+        );
+        tree.entries.insert(
+            "mod.d".into(),
+            TreeEntry::Dir(Oid::from_hex("e69de29bb2d1d6434b8b29ae775ad8c2e48c5391").unwrap()),
+        );
+        let parsed = Tree::parse(&tree.encode()).unwrap();
+        assert!(matches!(parsed.get("mod"), Some(TreeEntry::Gitlink(_))));
+        let raw = tree.encode();
+        let prefix = format!("160000 mod\0");
+        assert!(
+            raw.windows(prefix.len() + 20)
+                .any(|w| w.starts_with(prefix.as_bytes())),
+            "gitlink 应以 160000 模式编码"
+        );
     }
 
     #[test]

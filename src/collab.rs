@@ -282,7 +282,10 @@ pub(crate) async fn merge_base(
     // 避免在大仓库上做平方级的祖先判定。
     if common.len() > 64 {
         common.sort_by_key(|oid| {
-            depths_a.get(oid).copied().unwrap_or(usize::MAX)
+            depths_a
+                .get(oid)
+                .copied()
+                .unwrap_or(usize::MAX)
                 .saturating_add(depths_b.get(oid).copied().unwrap_or(usize::MAX))
         });
         return Ok(common.first().copied());
@@ -321,6 +324,8 @@ async fn blob_map(
                     files.insert(path, oid);
                 }
                 TreeEntry::Dir(oid) => stack.push((path, oid)),
+                // 子模块占位：不参与协作合并的文件集。
+                TreeEntry::Gitlink(_) => {}
             }
         }
     }
@@ -397,10 +402,12 @@ async fn merge_conflicts(
     let base_files = commit_files(conn, project_id, base).await?;
     let target_files = commit_files(conn, project_id, target).await?;
     let source_files = commit_files(conn, project_id, source).await?;
-    Ok(match three_way_merge(&base_files, &target_files, &source_files) {
-        Ok(_) => Vec::new(),
-        Err(conflicts) => conflicts,
-    })
+    Ok(
+        match three_way_merge(&base_files, &target_files, &source_files) {
+            Ok(_) => Vec::new(),
+            Err(conflicts) => conflicts,
+        },
+    )
 }
 
 /// 生成三方合并后的根 tree；冲突时直接返回错误，事务会整体回滚。
@@ -415,14 +422,13 @@ async fn merged_tree(
     let base_files = commit_files(conn, project_id, base).await?;
     let target_files = commit_files(conn, project_id, target).await?;
     let source_files = commit_files(conn, project_id, source).await?;
-    let merged = three_way_merge(&base_files, &target_files, &source_files).map_err(
-        |conflicts| {
+    let merged =
+        three_way_merge(&base_files, &target_files, &source_files).map_err(|conflicts| {
             anyhow::anyhow!(
                 "合并存在冲突，请先把目标分支合并到来源分支后重试：{}",
                 conflicts.join("、")
             )
-        },
-    )?;
+        })?;
     // 复用已有 blob OID 重建树，不重写对象内容，也不受 UTF-8 校验限制。
     let mut root: Option<Oid> = None;
     for (path, blob) in &merged {
@@ -582,10 +588,7 @@ async fn fetch_pr(
     .await?)
 }
 
-async fn list_pr_comments(
-    conn: &mut PgConnection,
-    pr_id: Uuid,
-) -> Result<Vec<PrComment>> {
+async fn list_pr_comments(conn: &mut PgConnection, pr_id: Uuid) -> Result<Vec<PrComment>> {
     Ok(sqlx::query_as::<_, PrComment>(
         "SELECT c.id, COALESCE(u.username, '已注销用户') AS author_name,
                 c.body, c.created_at
@@ -719,11 +722,7 @@ pub async fn create_pr(
         .context("PR 创建后无法读取")
 }
 
-pub async fn pr_detail(
-    pool: &PgPool,
-    project_id: Uuid,
-    number: i32,
-) -> Result<Option<PrDetail>> {
+pub async fn pr_detail(pool: &PgPool, project_id: Uuid, number: i32) -> Result<Option<PrDetail>> {
     let mut conn = pool.acquire().await?;
     let Some(pr) = fetch_pr(&mut conn, project_id, number).await? else {
         return Ok(None);
@@ -732,45 +731,37 @@ pub async fn pr_detail(
 
     let source = store::resolve_branch(&mut conn, project_id, &pr.source_branch).await?;
     let target = store::resolve_branch(&mut conn, project_id, &pr.target_branch).await?;
-    let (files, mergeable, is_fast_forward, conflicts, merge_base) =
-        match (source, target) {
-            (Some(source_oid), Some(target_oid)) => {
-                // 三点差异：以两个分支的合并基点为基准，避免把目标分支
-                // 独有的历史算进 PR 的改动里。
-                let base = merge_base(&mut conn, project_id, target_oid, source_oid).await?;
-                let files = diff_commits(&mut conn, project_id, base, source_oid).await?;
-                let fast_forward = source_oid == target_oid
-                    || is_ancestor(&mut conn, project_id, target_oid, source_oid).await?;
-                // 非快进合并要逐文件三方合并；提前把冲突文件列给前端，
-                // 让「合并」按钮在冲突时不再是可点的假动作。
-                let conflicts = if fast_forward {
-                    Vec::new()
-                } else {
-                    merge_conflicts(
-                        &mut conn,
-                        project_id,
-                        base,
-                        target_oid,
-                        source_oid,
-                    )
-                    .await?
-                };
-                (
-                    files,
-                    conflicts.is_empty(),
-                    fast_forward,
-                    conflicts,
-                    base.map(|oid| oid.to_hex()),
-                )
-            }
-            _ => (
-                Vec::new(),
-                false,
-                false,
-                vec!["<来源或目标分支不存在>".to_string()],
-                None,
-            ),
-        };
+    let (files, mergeable, is_fast_forward, conflicts, merge_base) = match (source, target) {
+        (Some(source_oid), Some(target_oid)) => {
+            // 三点差异：以两个分支的合并基点为基准，避免把目标分支
+            // 独有的历史算进 PR 的改动里。
+            let base = merge_base(&mut conn, project_id, target_oid, source_oid).await?;
+            let files = diff_commits(&mut conn, project_id, base, source_oid).await?;
+            let fast_forward = source_oid == target_oid
+                || is_ancestor(&mut conn, project_id, target_oid, source_oid).await?;
+            // 非快进合并要逐文件三方合并；提前把冲突文件列给前端，
+            // 让「合并」按钮在冲突时不再是可点的假动作。
+            let conflicts = if fast_forward {
+                Vec::new()
+            } else {
+                merge_conflicts(&mut conn, project_id, base, target_oid, source_oid).await?
+            };
+            (
+                files,
+                conflicts.is_empty(),
+                fast_forward,
+                conflicts,
+                base.map(|oid| oid.to_hex()),
+            )
+        }
+        _ => (
+            Vec::new(),
+            false,
+            false,
+            vec!["<来源或目标分支不存在>".to_string()],
+            None,
+        ),
+    };
 
     Ok(Some(PrDetail {
         pr,
@@ -874,13 +865,7 @@ pub async fn merge_pr(
             "合并 PR #{number}: {}\n\n来源分支: {}\n目标分支: {}",
             pr.title, pr.source_branch, pr.target_branch
         );
-        let data = encode_commit(
-            tree_oid,
-            &[target, source],
-            &identity,
-            &message,
-            timestamp,
-        );
+        let data = encode_commit(tree_oid, &[target, source], &identity, &message, timestamp);
         store::put_object(
             &mut tx,
             project_id,

@@ -1,6 +1,6 @@
 use anyhow::{bail, Result};
-use std::collections::BTreeMap;
 use sqlx::PgConnection;
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 use super::object::{commit_tree, ensure_text, Object, Oid, Tree, TreeEntry};
@@ -48,7 +48,10 @@ pub async fn read_files(
             } else {
                 format!("{prefix}/{name}")
             };
-            if path.split('/').any(|part| !super::object::valid_tree_entry_name(part)) {
+            if path
+                .split('/')
+                .any(|part| !super::object::valid_tree_entry_name(part))
+            {
                 bail!("tree 对象拼接出非法路径: {path:?}");
             }
             match entry {
@@ -57,6 +60,8 @@ pub async fn read_files(
                     let object = require_object(conn, project_id, oid).await?;
                     files.insert(path, object.data);
                 }
+                // 子模块占位：不参与归档/快照内容。
+                TreeEntry::Gitlink(_) => {}
             }
         }
     }
@@ -80,6 +85,7 @@ pub async fn list_dir(
             match entry {
                 TreeEntry::Dir(oid) => current = oid,
                 TreeEntry::Blob(_) => bail!("{dir} 不是目录"),
+                TreeEntry::Gitlink(_) => bail!("{dir} 是子模块，站内不托管其内容"),
             }
         }
     }
@@ -110,6 +116,17 @@ pub async fn list_dir(
                     path,
                     is_dir: false,
                     size,
+                    oid: oid.to_hex(),
+                });
+            }
+            // 子模块：工作树里是目录占位，列表里按目录展示，
+            // 深入时由上面的 Gitlink 分支给出明确报错。
+            TreeEntry::Gitlink(oid) => {
+                items.push(DirItem {
+                    name,
+                    path,
+                    is_dir: true,
+                    size: 0,
                     oid: oid.to_hex(),
                 });
             }
@@ -152,7 +169,7 @@ pub async fn find_file(
         };
         if index + 1 == parts.len() {
             return match entry {
-                TreeEntry::Dir(_) => Ok(None),
+                TreeEntry::Dir(_) | TreeEntry::Gitlink(_) => Ok(None),
                 TreeEntry::Blob(oid) => {
                     let object = require_object(conn, project_id, oid).await?;
                     Ok(Some((oid, object.data)))
@@ -161,7 +178,7 @@ pub async fn find_file(
         }
         match entry {
             TreeEntry::Dir(oid) => current = oid,
-            TreeEntry::Blob(_) => return Ok(None),
+            TreeEntry::Blob(_) | TreeEntry::Gitlink(_) => return Ok(None),
         }
     }
     Ok(None)
@@ -195,7 +212,9 @@ pub async fn update_path(
                 parents.push(current.clone());
                 current = read_tree(conn, project_id, oid).await?;
             }
-            Some(TreeEntry::Blob(_)) => bail!("路径 {path} 的中间段是文件"),
+            Some(TreeEntry::Blob(_)) | Some(TreeEntry::Gitlink(_)) => {
+                bail!("路径 {path} 的中间段是文件")
+            }
             None => {
                 parents.push(current.clone());
                 current = Tree::default();
@@ -206,7 +225,9 @@ pub async fn update_path(
     let leaf = parts[parts.len() - 1];
     match blob {
         Some(oid) => {
-            current.entries.insert(leaf.to_string(), TreeEntry::Blob(oid));
+            current
+                .entries
+                .insert(leaf.to_string(), TreeEntry::Blob(oid));
         }
         None => {
             current.entries.remove(leaf);
@@ -247,19 +268,11 @@ pub async fn update_path(
     }
 }
 
-pub async fn write_tree(
-    conn: &mut PgConnection,
-    project_id: Uuid,
-    tree: &Tree,
-) -> Result<Oid> {
+pub async fn write_tree(conn: &mut PgConnection, project_id: Uuid, tree: &Tree) -> Result<Oid> {
     put_object(conn, project_id, &Object::tree(tree.encode())).await
 }
 
-pub async fn write_blob(
-    conn: &mut PgConnection,
-    project_id: Uuid,
-    content: &[u8],
-) -> Result<Oid> {
+pub async fn write_blob(conn: &mut PgConnection, project_id: Uuid, content: &[u8]) -> Result<Oid> {
     ensure_text(content)?;
     put_object(conn, project_id, &Object::blob(content.to_vec())).await
 }

@@ -16,8 +16,8 @@ use uuid::Uuid;
 
 use super::lfs;
 use super::object::Oid;
-use super::store;
 use super::object::TreeEntry;
+use super::store;
 use super::tree::{self, DirItem};
 use crate::project::{valid_branch, valid_file_path};
 
@@ -154,6 +154,8 @@ pub async fn ensure_within_limit(
                         bail!("工作树超过字节上限 {max_bytes}");
                     }
                 }
+                // 子模块占位：站内不托管其内容，不计入字节统计。
+                TreeEntry::Gitlink(_) => {}
             }
         }
     }

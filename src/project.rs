@@ -8,9 +8,7 @@ use std::path::Path;
 use uuid::Uuid;
 
 use crate::git::lfs;
-use crate::git::object::{
-    commit_parents, encode_commit, ensure_text, identity_name, is_text, Oid,
-};
+use crate::git::object::{commit_parents, encode_commit, ensure_text, identity_name, is_text, Oid};
 use crate::git::proto;
 use crate::git::store;
 use crate::git::tree;
@@ -22,11 +20,7 @@ pub const PROJECT_NAMESPACE: &str = "项目";
 /// 项目图标的候选文件名（按优先级），放在项目根目录即可被站点识别。
 /// 平台把 `.svg` 也当作内容格式，因此构建时会对这些源文件跳过页面编译，
 /// 只把内容原样输出成 `icon.svg`，不会被编译成内容页面。
-pub const PROJECT_ICON_FILES: &[&str] = &[
-    "图标.svg",
-    "favicon.svg",
-    "logo.svg",
-];
+pub const PROJECT_ICON_FILES: &[&str] = &["图标.svg", "favicon.svg", "logo.svg"];
 
 /// 项目图标在内容站的固定输出名。
 pub const PROJECT_ICON_ASSET: &str = "icon.svg";
@@ -54,8 +48,8 @@ pub fn project_icon_svg(slug: &str) -> String {
         hash = hash.wrapping_mul(16_777_619);
     }
     const PALETTE: &[&str] = &[
-        "#7c3aed", "#db2777", "#dc2626", "#ea580c", "#ca8a04", "#16a34a",
-        "#0891b2", "#4f46e5", "#0d9488", "#be123c", "#4338ca", "#b45309",
+        "#7c3aed", "#db2777", "#dc2626", "#ea580c", "#ca8a04", "#16a34a", "#0891b2", "#4f46e5",
+        "#0d9488", "#be123c", "#4338ca", "#b45309",
     ];
     let color = PALETTE[(hash as usize) % PALETTE.len()];
     let escaped = match slug.chars().next().unwrap_or('?') {
@@ -125,9 +119,7 @@ pub fn valid_project_slug(slug: &str) -> bool {
         return false;
     }
     !slug.chars().any(|ch| {
-        ch.is_control()
-            || ch.is_whitespace()
-            || matches!(ch, '/' | '\\' | '?' | '#' | '%' | '\0')
+        ch.is_control() || ch.is_whitespace() || matches!(ch, '/' | '\\' | '?' | '#' | '%' | '\0')
     })
 }
 
@@ -144,7 +136,9 @@ pub fn valid_branch(name: &str) -> bool {
         || name.contains("//")
         || name.contains("@{")
         || name == "@"
-        || name.split('/').any(|part| part.starts_with('.') || part.ends_with(".lock"))
+        || name
+            .split('/')
+            .any(|part| part.starts_with('.') || part.ends_with(".lock"))
     {
         return false;
     }
@@ -266,7 +260,13 @@ async fn commit_snapshot(
 ) -> Result<Oid> {
     let now = Utc::now();
     let parents: Vec<Oid> = parent.into_iter().collect();
-    let data = encode_commit(tree_oid, &parents, &identity(user), message, now.timestamp());
+    let data = encode_commit(
+        tree_oid,
+        &parents,
+        &identity(user),
+        message,
+        now.timestamp(),
+    );
     let commit =
         store::put_object(conn, project_id, &crate::git::object::Object::commit(data)).await?;
     store::set_ref(conn, project_id, &format!("refs/heads/{branch}"), commit).await?;
@@ -303,12 +303,8 @@ async fn commit_files(
     old_path: Option<&str>,
     blob: Option<Oid>,
 ) -> Result<Oid> {
-    let commit =
-        commit_snapshot(conn, project_id, user, branch, parent, tree_oid, message).await?;
-    store::insert_commit_path(
-        conn, project_id, commit, path, change, old_path, blob,
-    )
-    .await?;
+    let commit = commit_snapshot(conn, project_id, user, branch, parent, tree_oid, message).await?;
+    store::insert_commit_path(conn, project_id, commit, path, change, old_path, blob).await?;
     Ok(commit)
 }
 
@@ -348,6 +344,9 @@ async fn copy_tree_snapshot(
                     match entry {
                         crate::git::object::TreeEntry::Dir(child)
                         | crate::git::object::TreeEntry::Blob(child) => stack.push(*child),
+                        // gitlink 的 OID 是外部仓库的提交，对象库中不存在；
+                        // 条目本身会随 tree 原样复制，不展开遍历。
+                        crate::git::object::TreeEntry::Gitlink(_) => {}
                     }
                 }
             }
@@ -457,10 +456,9 @@ pub async fn create_project(
                 "index.md",
                 "add",
                 None,
-                files.get("index.md").map(|body| crate::git::object::hash_object(
-                    crate::git::object::ObjectKind::Blob,
-                    body,
-                )),
+                files.get("index.md").map(|body| {
+                    crate::git::object::hash_object(crate::git::object::ObjectKind::Blob, body)
+                }),
             )
             .await?;
         }
@@ -678,10 +676,12 @@ pub async fn list_projects(pool: &PgPool, include_archived: bool) -> Result<Vec<
 }
 
 pub async fn get_project(pool: &PgPool, id: Uuid) -> Result<Option<Project>> {
-    Ok(sqlx::query_as::<_, Project>("SELECT * FROM projects WHERE id = $1")
-        .bind(id)
-        .fetch_optional(pool)
-        .await?)
+    Ok(
+        sqlx::query_as::<_, Project>("SELECT * FROM projects WHERE id = $1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?,
+    )
 }
 
 pub async fn find_project_by_slug(pool: &PgPool, slug: &str) -> Result<Option<Project>> {
@@ -822,9 +822,9 @@ pub async fn write_file(
         Some(commit) => tree::read_files(&mut tx, project_id, commit).await?,
         None => BTreeMap::new(),
     };
-    let existing_oid = files.get(path).map(|data| {
-        crate::git::object::hash_object(crate::git::object::ObjectKind::Blob, data)
-    });
+    let existing_oid = files
+        .get(path)
+        .map(|data| crate::git::object::hash_object(crate::git::object::ObjectKind::Blob, data));
     store::check_old_oid(existing_oid, base_oid)?;
     ensure_no_output_conflict(path, &files)?;
 
@@ -834,10 +834,18 @@ pub async fn write_file(
         None => None,
     };
     let tree_oid = tree::update_path(&mut tx, project_id, root, path, Some(blob)).await?;
-    let change = if existing_oid.is_some() { "modify" } else { "add" };
+    let change = if existing_oid.is_some() {
+        "modify"
+    } else {
+        "add"
+    };
     let default_message = format!(
         "{} {path}",
-        if existing_oid.is_some() { "更新" } else { "新增" }
+        if existing_oid.is_some() {
+            "更新"
+        } else {
+            "新增"
+        }
     );
     let message = message_or(&default_message, message);
     let commit = commit_files(
@@ -907,9 +915,9 @@ pub async fn write_file_bytes(
         Some(commit) => tree::read_files(&mut tx, project_id, commit).await?,
         None => BTreeMap::new(),
     };
-    let existing_oid = files.get(path).map(|old| {
-        crate::git::object::hash_object(crate::git::object::ObjectKind::Blob, old)
-    });
+    let existing_oid = files
+        .get(path)
+        .map(|old| crate::git::object::hash_object(crate::git::object::ObjectKind::Blob, old));
     store::check_old_oid(existing_oid, base_oid)?;
     ensure_no_output_conflict(path, &files)?;
 
@@ -919,10 +927,18 @@ pub async fn write_file_bytes(
         None => None,
     };
     let tree_oid = tree::update_path(&mut tx, project_id, root, path, Some(blob)).await?;
-    let change = if existing_oid.is_some() { "modify" } else { "add" };
+    let change = if existing_oid.is_some() {
+        "modify"
+    } else {
+        "add"
+    };
     let default_message = format!(
         "{} {path}",
-        if existing_oid.is_some() { "更新" } else { "新增" }
+        if existing_oid.is_some() {
+            "更新"
+        } else {
+            "新增"
+        }
     );
     let message = message_or(&default_message, message);
     let commit = commit_files(
@@ -996,15 +1012,19 @@ pub async fn commit_changes(
             };
             root = Some(tree::update_path(&mut tx, project_id, root, &change.path, None).await?);
             files.remove(&change.path);
-            metadata.push((change.path.clone(), "delete".to_string(), None, Some(old_oid)));
+            metadata.push((
+                change.path.clone(),
+                "delete".to_string(),
+                None,
+                Some(old_oid),
+            ));
         } else {
             ensure_no_output_conflict(&change.path, &files)?;
             let content = change.content.as_deref().unwrap_or_default();
             let blob = tree::write_blob(&mut tx, project_id, content.as_bytes()).await?;
             let existed = files.contains_key(&change.path);
-            root = Some(
-                tree::update_path(&mut tx, project_id, root, &change.path, Some(blob)).await?,
-            );
+            root =
+                Some(tree::update_path(&mut tx, project_id, root, &change.path, Some(blob)).await?);
             files.insert(change.path.clone(), content.as_bytes().to_vec());
             metadata.push((
                 change.path.clone(),
@@ -1031,13 +1051,7 @@ pub async fn commit_changes(
     };
     let message = message_or(&default_message, message);
     let commit = commit_snapshot(
-        &mut tx,
-        project_id,
-        user,
-        branch,
-        parent,
-        tree_oid,
-        &message,
+        &mut tx, project_id, user, branch, parent, tree_oid, &message,
     )
     .await?;
     for (path, change, blob, old_blob) in &metadata {
@@ -1203,11 +1217,7 @@ const COMMIT_SELECT: &str = "SELECT encode(oid, 'hex') AS oid,
      FROM git_commits";
 
 /// 从引用出发遍历全部父提交，用于按分支过滤历史。
-async fn walk_commit_oids(
-    conn: &mut PgConnection,
-    project_id: Uuid,
-    tip: Oid,
-) -> Result<Vec<Oid>> {
+async fn walk_commit_oids(conn: &mut PgConnection, project_id: Uuid, tip: Oid) -> Result<Vec<Oid>> {
     let mut seen = HashSet::new();
     let mut stack = vec![tip];
     let mut out = Vec::new();
@@ -1381,16 +1391,8 @@ pub async fn revert_commit(
     let new_commit =
         commit_snapshot(&mut tx, project_id, user, branch, Some(tip), root, &message).await?;
     for (path, change, blob) in &changes {
-        store::insert_commit_path(
-            &mut tx,
-            project_id,
-            new_commit,
-            path,
-            change,
-            None,
-            *blob,
-        )
-        .await?;
+        store::insert_commit_path(&mut tx, project_id, new_commit, path, change, None, *blob)
+            .await?;
     }
     sqlx::query("UPDATE projects SET updated_at = now() WHERE id = $1")
         .bind(project_id)
@@ -1403,18 +1405,16 @@ pub async fn revert_commit(
 }
 
 /// 从指定分支（或默认分支）拉出新分支。
-pub async fn create_branch(
-    pool: &PgPool,
-    project_id: Uuid,
-    name: &str,
-    from: &str,
-) -> Result<()> {
+pub async fn create_branch(pool: &PgPool, project_id: Uuid, name: &str, from: &str) -> Result<()> {
     if !valid_branch(name) || !valid_branch(from) {
         bail!("非法分支名");
     }
     let mut tx = pool.begin().await?;
     lock_project(&mut tx, project_id).await?;
-    if store::resolve_branch(&mut tx, project_id, name).await?.is_some() {
+    if store::resolve_branch(&mut tx, project_id, name)
+        .await?
+        .is_some()
+    {
         bail!("分支已存在: {name}");
     }
     let tip = store::resolve_branch(&mut tx, project_id, from)
@@ -1439,7 +1439,10 @@ pub async fn delete_branch(pool: &PgPool, project_id: Uuid, name: &str) -> Resul
     }
     let mut tx = pool.begin().await?;
     lock_project(&mut tx, project_id).await?;
-    if store::resolve_branch(&mut tx, project_id, name).await?.is_none() {
+    if store::resolve_branch(&mut tx, project_id, name)
+        .await?
+        .is_none()
+    {
         bail!("分支不存在: {name}");
     }
     store::delete_ref(&mut tx, project_id, &format!("refs/heads/{name}")).await?;
