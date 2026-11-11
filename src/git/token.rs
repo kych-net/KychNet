@@ -49,12 +49,22 @@ pub async fn create(pool: &PgPool, user_id: Uuid, name: &str) -> Result<(GitToke
     Ok((item, token))
 }
 
+/// SSH 侧 `git-lfs-authenticate` 签发的临时令牌名称前缀。
+///
+/// `create_ephemeral` 会在后面接一个 UUID，保证每次会话独占一行。
+pub const LFS_EPHEMERAL_NAME: &str = "git-lfs-ssh";
+
 /// 签发一个限时令牌（SSH 侧的 `git-lfs-authenticate` 用）。
 ///
 /// LFS 对象走 HTTP basic 传输，上传需要 `git_write_user()` 认可的令牌，
 /// 但 SSH 用户手上只有公钥。这里为已通过公钥认证的用户临时发一个
 /// Bearer 令牌，明文只在创建时返回一次，库里仍只存 SHA-256。
-/// 同一用户同名令牌只保留一个，避免每次 LFS 会话都堆积新行。
+///
+/// **每次签发独立一行**：git-lfs 会用多个 worker 并发执行
+/// `git-lfs-authenticate … upload`。旧实现按固定名称先删同名行再插入，
+/// 后签发的会话会把前一个会话仍在使用的令牌删掉，导致先发出的 batch
+/// 请求立刻 401、上传失败。现在名称带 UUID 后缀，清理只回收**已过期**
+/// 的行，并且与插入放在同一事务里。
 pub async fn create_ephemeral(
     pool: &PgPool,
     user_id: Uuid,
@@ -63,31 +73,43 @@ pub async fn create_ephemeral(
 ) -> Result<String> {
     let token = new_token();
     let expires_at = chrono::Utc::now() + chrono::Duration::seconds(ttl_secs);
-    sqlx::query("DELETE FROM git_tokens WHERE user_id = $1 AND name = $2")
-        .bind(user_id)
-        .bind(name)
-        .execute(pool)
-        .await?;
+    let unique_name = format!("{name}-{}", Uuid::new_v4());
+    let mut tx = pool.begin().await?;
+    // 长期令牌的 expires_at 为 NULL，不受影响；顺手回收该用户积压的
+    // 过期临时行，避免每次 LFS 会话都往 git_tokens 里堆新行。
+    sqlx::query(
+        "DELETE FROM git_tokens
+         WHERE user_id = $1 AND expires_at IS NOT NULL AND expires_at <= now()",
+    )
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
     sqlx::query(
         "INSERT INTO git_tokens (id, user_id, name, token_hash, expires_at)
          VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(Uuid::new_v4())
     .bind(user_id)
-    .bind(name)
+    .bind(unique_name.as_str())
     .bind(&hash(&token)[..])
     .bind(expires_at)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(token)
 }
 
 pub async fn list(pool: &PgPool, user_id: Uuid) -> Result<Vec<GitToken>> {
+    // SSH LFS 会话签发的临时令牌不进入管理列表：一小时后自动失效，由
+    // create_ephemeral 顺带回收；展示出来只会刷屏，且无法主动续期。
     Ok(sqlx::query_as::<_, GitToken>(
         "SELECT id, name, created_at, expires_at, last_used_at
-         FROM git_tokens WHERE user_id = $1 ORDER BY created_at DESC",
+         FROM git_tokens
+         WHERE user_id = $1 AND name NOT LIKE $2
+         ORDER BY created_at DESC",
     )
     .bind(user_id)
+    .bind(format!("{}-%", LFS_EPHEMERAL_NAME))
     .fetch_all(pool)
     .await?)
 }

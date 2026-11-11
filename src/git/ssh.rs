@@ -10,7 +10,9 @@
 //!   `GIT_PROTOCOL=version=2` 协商（与真实 sshd + git 的机制一致）。
 //! - v0 fetch 是有状态会话（客户端分多轮发 want/have/done），而 HTTP 的
 //!   upload-pack 是无状态 RPC，所以这里把多轮请求累积成一个
-//!   `UploadRequest` 再交给 `http::upload_pack_request()`。
+//!   `UploadRequest` 再交给 `http::upload_pack_request()`。协商轮直接复用
+//!   它的 `!done` 输出，浅边界段只发一次；done 轮按「浅边界是否已发过」
+//!   决定原样回完整响应还是只回 packfile，避免与 HTTP 的顺序出现偏差。
 //! - v0 push 读命令段后分两路：非删除推送会跟着 pack，正常客户端发完会
 //!   关闭写端，但 libgit2 等实现可能保持写端打开，所以读取带空闲超时，
 //!   超时后按 packfile 自身的长度判定是否已收齐，不依赖 EOF；
@@ -123,6 +125,23 @@ impl russh::server::Server for SshServer {
     }
 }
 
+/// 单个 SSH 连接允许同时持有的会话通道数上限。
+///
+/// 客户端可能反复开 session 却从不发 exec，也不能让它无限占用
+/// `Channel<Msg>`（每个都持有发送端）。超过上限直接 drop reply，
+/// russh 会回 `AdministrativelyProhibited` 拒绝这次开通道请求。
+const MAX_CHANNELS: usize = 32;
+
+/// 公钥认证失败的退避时长：按失败次数线性增长，封顶 1 秒。
+///
+/// 封顶是关键——失败次数只能用来拖慢爆破，不能变成「达到阈值就
+/// 永久拒绝」的开关。否则 ssh-agent 里 key 较多的正常用户，在同一条
+/// 连接上试完前 10 个 key 后连正确的 key 也认证不了，只能断开重连。
+fn auth_backoff(failures: u32) -> Duration {
+    let millis = 100u64.saturating_mul(failures as u64).min(1_000);
+    Duration::from_millis(millis)
+}
+
 /// 单个 SSH 连接的处理器。
 ///
 /// russh 会在签名验证通过后回调 `auth_publickey`，此时才能把用户身份
@@ -136,9 +155,21 @@ struct GitHandler {
     /// 否则一个通道协商 v2 会把整条连接的其它通道也带成 v2。
     protocols: HashMap<ChannelId, bool>,
     git_http_base: String,
-    /// 公钥认证连续失败次数，用于简单的暴力尝试限速。
+    /// 公钥认证连续失败次数，只用于退避限速，成功一次即清零。
     auth_failures: u32,
     user: Option<User>,
+}
+
+impl GitHandler {
+    /// 释放一个通道的槽位与协商标记。
+    ///
+    /// exec 成功时会把 `Channel` 移交给会话任务，这里再 remove 只是 no-op；
+    /// 真正要清的是「开了 session 但没发 exec / 命令被拒绝 / 通道关闭」
+    /// 这些残留。
+    fn release_channel(&mut self, id: ChannelId) {
+        self.channels.remove(&id);
+        self.protocols.remove(&id);
+    }
 }
 
 impl russh::server::Handler for GitHandler {
@@ -158,12 +189,10 @@ impl russh::server::Handler for GitHandler {
         _: &str,
         key: russh::server::VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
-        // 一个连接上失败太多次就不再查库，并逐步拖慢重试，避免拿 SSH
-        // 端口当公钥字典的在线爆破入口。客户端逐个试自己那几个 key 时
-        // 通常不会超过 10 次，成功一次后计数清零。
-        if self.auth_failures >= 10 {
-            return Ok(Auth::reject());
-        }
+        // 始终验证公钥。旧实现在失败 10 次后直接 reject 且不再查库，
+        // `auth_failures = 0` 只在成功分支里，于是那条连接被永久锁死：
+        // key 较多的正常用户即使随后提供正确的 key 也认证不了。
+        // 现在失败次数只决定退避时长（有上限），成功一次即清零。
         match ssh_key::authenticate(&self.pool, key.public_key).await {
             Ok(Some(user)) => {
                 tracing::info!(username = %user.username, "SSH 公钥认证通过");
@@ -172,13 +201,14 @@ impl russh::server::Handler for GitHandler {
                 Ok(Auth::Accept)
             }
             Ok(None) => {
-                self.auth_failures += 1;
-                tokio::time::sleep(Duration::from_millis(100 * self.auth_failures as u64)).await;
+                self.auth_failures = self.auth_failures.saturating_add(1);
+                tokio::time::sleep(auth_backoff(self.auth_failures)).await;
                 Ok(Auth::reject())
             }
             Err(error) => {
                 tracing::warn!(%error, "SSH 公钥认证查询失败");
-                self.auth_failures += 1;
+                self.auth_failures = self.auth_failures.saturating_add(1);
+                tokio::time::sleep(auth_backoff(self.auth_failures)).await;
                 Ok(Auth::reject())
             }
         }
@@ -190,10 +220,32 @@ impl russh::server::Handler for GitHandler {
         reply: russh::server::ChannelOpenHandle,
         _: &mut Session,
     ) -> Result<(), Self::Error> {
+        if self.channels.len() >= MAX_CHANNELS {
+            drop(reply); // russh 的 Drop 会回 AdministrativelyProhibited
+            return Ok(());
+        }
         reply.accept().await;
         // 先记 id 再存通道；同一连接后续再开 session 不会覆盖已有通道。
         let id = channel.id();
         self.channels.insert(id, channel);
+        Ok(())
+    }
+
+    async fn channel_close(
+        &mut self,
+        channel: ChannelId,
+        _: &mut Session,
+    ) -> Result<(), Self::Error> {
+        self.release_channel(channel);
+        Ok(())
+    }
+
+    async fn channel_eof(
+        &mut self,
+        channel: ChannelId,
+        _: &mut Session,
+    ) -> Result<(), Self::Error> {
+        self.release_channel(channel);
         Ok(())
     }
 
@@ -229,6 +281,7 @@ impl russh::server::Handler for GitHandler {
         let command = match std::str::from_utf8(data) {
             Ok(value) => value,
             Err(_) => {
+                self.release_channel(channel);
                 session.channel_failure(channel)?;
                 return Ok(());
             }
@@ -242,15 +295,18 @@ impl russh::server::Handler for GitHandler {
                 )),
             )?;
             session.close(channel)?;
+            self.release_channel(channel);
             return Ok(());
         };
         let Some(user) = self.user.clone() else {
+            self.release_channel(channel);
             session.channel_failure(channel)?;
             return Ok(());
         };
         // 按 id 取通道：取不到就只拒绝本次请求，不会像旧实现那样先 take()
         // 掉唯一的槽位、再发现 id 不符，导致整条连接上的其它通道也失效。
         let Some(channel_obj) = self.channels.remove(&channel) else {
+            self.release_channel(channel);
             session.channel_failure(channel)?;
             return Ok(());
         };
@@ -262,6 +318,7 @@ impl russh::server::Handler for GitHandler {
                 tracing::info!(slug = %slug, %error, "SSH git 请求被拒绝");
                 session.data(channel, error_pkt(&error.to_string()))?;
                 session.close(channel)?;
+                self.release_channel(channel);
                 return Ok(());
             }
         };
@@ -499,7 +556,7 @@ where
         let token = crate::git::token::create_ephemeral(
             pool,
             user.id,
-            "git-lfs-ssh",
+            crate::git::token::LFS_EPHEMERAL_NAME,
             TTL_SECS,
         )
         .await?;
@@ -622,6 +679,46 @@ fn packfile_only(out: &[u8]) -> &[u8] {
     &out[pos..]
 }
 
+/// 把累积的协商状态还原成「协商轮」请求，交给 `upload_pack_request` 的
+/// `!done` 分支处理。
+///
+/// 会话层不再自己维护一份 shallow / ACK 状态机，直接复用 smart HTTP 的
+/// 输出，两边的浅边界段、flush、ACK … ready + NAK 顺序就完全一致。
+/// `send_shallow` 为 false 时清掉 deepen：客户端只在第一轮期待
+/// shallow 段 + flush，后续协商轮不能重复回这一段。
+fn negotiation_request(
+    acc: &proto::UploadRequest,
+    send_shallow: bool,
+) -> proto::UploadRequest {
+    proto::UploadRequest {
+        wants: acc.wants.clone(),
+        haves: acc.haves.clone(),
+        done: false,
+        deepen: if send_shallow { acc.deepen } else { None },
+        deepen_relative: acc.deepen_relative,
+        shallow: acc.shallow.clone(),
+        filter_blob_none: acc.filter_blob_none,
+    }
+}
+
+/// done 轮该发给客户端的响应。
+///
+/// 客户端把 deepen 与 done 放在同一轮时（HTTP 的 stateless 请求也是这种
+/// 形态），浅边界段还没发过：此时 `upload_pack_request` 的输出本身就是
+/// 「shallow 段 + flush + ACK/NAK + PACK」，必须原样发回才与 HTTP 顺序
+/// 一致。旧实现无条件调 `packfile_only`，把这 65 字节的 shallow 段剥掉，
+/// SSH 浅克隆就收不到边界信息。
+///
+/// 反之协商轮已经发过浅边界与 ACK/NAK，只发 packfile（PR #33 的修复，
+/// 避免 libgit2 把重复的 `0008NAK\n` 当成 PACK 头）。
+fn done_response<'a>(out: &'a [u8], preserve_shallow: bool) -> &'a [u8] {
+    if preserve_shallow {
+        out
+    } else {
+        packfile_only(out)
+    }
+}
+
 /// v0 fetch 会话：广告 → 多轮 want/have 协商 → done 后发 pack。
 async fn session_upload_pack_v0<S>(
     pool: &PgPool,
@@ -638,7 +735,9 @@ where
     // 客户端在第一轮把 wants/shallow/deepen 都发出来，之后各轮只有 haves
     // 和最后的 done；累积成一个请求，语义与真实 git-upload-pack 一致。
     let mut acc = proto::UploadRequest::default();
-    let mut shallow_sent = false;
+    // 浅边界段只发一次：客户端第一轮读完 shallow 段 + flush 后，才进入
+    // ACK/NAK 协商。
+    let mut shallow_pending = true;
     loop {
         let chunk = read_pkt_lines(stream, true).await?;
         if chunk.is_empty() {
@@ -666,56 +765,34 @@ where
             // 分支，SSH v0 克隆根本收不到 pack（客户端只看到 EOF）。
             acc.done = true;
             let out = crate::git::http::upload_pack_request(pool, project, &acc).await?;
-            // upload_pack_request 是给无状态 HTTP RPC 用的，返回
-            // 「ACK/NAK + packfile」。SSH 是有状态会话：协商轮已经把 ACK/NAK
-            // 发给客户端，libgit2 的 wait_while_ack() 读到第一个 NAK 就结束
-            // 协商并开始读 pack 流。若这里再发一次控制行，客户端会把 `0008`
-            // 当成 PACK 头，报 "Incomplete pack header"（Working Copy 等
-            // libgit2 客户端）；macOS 命令行 git 走 v2 路径，所以不受影响。
-            // 本轮只发 packfile 段，与上面已发过的协商响应拼成完整序列。
-            stream.write_all(packfile_only(&out)).await?;
+            // deepen 与 done 同轮时浅边界还没发过，原样发回完整响应；
+            // 否则只发 packfile（协商轮的控制行已经发过了）。
+            let preserve_shallow = shallow_pending && acc.deepen.is_some();
+            stream.write_all(done_response(&out, preserve_shallow)).await?;
             stream.flush().await?;
             return Ok(());
         }
 
-        // 带 deepen 的第一轮必须先回浅边界段（以 flush 收尾），
-        // 客户端读完这段才进入 ACK/NAK 协商。
-        if !shallow_sent && acc.deepen.is_some() {
-            let mut conn = pool.acquire().await?;
-            let (boundaries, unshallow, _) =
-                crate::git::http::compute_shallow(&mut conn, project.id, &acc.wants, &acc).await?;
-            let mut out = crate::git::http::shallow_response(&boundaries, &unshallow);
-            out.extend(proto::flush());
-            stream.write_all(&out).await?;
-            shallow_sent = true;
+        // 协商轮直接复用 upload_pack_request 的 !done 输出，不再在会话层
+        // 另写一套 compute_shallow / have_reachable 分支：旧实现首轮发完
+        // shallow 段后还无条件补 NAK，客户端会报
+        // "expected shallow/unshallow, got NAK"；HTTP 侧同场景返回空段。
+        let send_shallow = shallow_pending && acc.deepen.is_some();
+        let negotiation = negotiation_request(&acc, send_shallow);
+        let out = crate::git::http::upload_pack_request(pool, project, &negotiation).await?;
+        if send_shallow {
+            shallow_pending = false;
         }
-
-        // 协商轮：只回 ACK/NAK，绝不提前发 pack。
-        // 广告里声明了 multi_ack_detailed，就必须按该扩展的序列回应：
-        // `ACK … common` … `ACK … ready` + `NAK`，与 http::upload_pack_request
-        // 的 !done 分支一致。旧实现只回一条裸 `ACK <oid>`，libgit2 的
-        // store_common() 会一直等下一条 pkt，增量 fetch 会卡住。
-        let ack = if acc.haves.is_empty() {
-            proto::pkt_str("NAK\n")
+        if out.is_empty() {
+            // HTTP 是无状态 RPC，回空就表示这一轮没有共同提交；SSH 是
+            // 有状态会话，客户端发完一轮会阻塞等应答，补一个 NAK 作为
+            // 轮次分隔。deepen 首轮的 out 含 shallow 段 + flush，不会
+            // 走到这里，因此不会触发上面那个 "got NAK" 错误。
+            let nak = proto::pkt_str("NAK\n");
+            stream.write_all(&nak).await?;
         } else {
-            let mut conn = pool.acquire().await?;
-            match crate::git::http::have_reachable(&mut conn, project.id, &acc.haves, &acc.shallow)
-                .await?
-            {
-                Some((common, _)) if !common.is_empty() => {
-                    let mut out = Vec::new();
-                    for oid in &common {
-                        out.extend(proto::pkt_str(&format!("ACK {} common\n", oid.to_hex())));
-                    }
-                    let last = common.last().expect("common 非空");
-                    out.extend(proto::pkt_str(&format!("ACK {} ready\n", last.to_hex())));
-                    out.extend(proto::pkt_str("NAK\n"));
-                    out
-                }
-                _ => proto::pkt_str("NAK\n"),
-            }
-        };
-        stream.write_all(&ack).await?;
+            stream.write_all(&out).await?;
+        }
         stream.flush().await?;
     }
 }
@@ -912,6 +989,50 @@ mod tests {
     fn packfile_only_keeps_bare_pack() {
         let response = b"PACK\x00\x00\x00\x02rest".to_vec();
         assert_eq!(packfile_only(&response), response.as_slice());
+    }
+
+    #[test]
+    fn negotiation_request_sends_shallow_only_once() {
+        let mut acc = proto::UploadRequest::default();
+        acc.deepen = Some(3);
+        acc.deepen_relative = true;
+        acc.filter_blob_none = true;
+        acc.done = true; // 累积状态里带了 done，协商轮也必须强制 false
+
+        let first = negotiation_request(&acc, true);
+        assert_eq!(first.deepen, Some(3));
+        assert!(!first.done);
+        assert!(first.deepen_relative);
+        assert!(first.filter_blob_none);
+
+        // 浅边界段发过之后，后续协商轮不能再带 deepen，
+        // 否则 upload_pack_request 会每轮重复回 shallow 段 + flush。
+        let next = negotiation_request(&acc, false);
+        assert_eq!(next.deepen, None);
+        assert!(!next.done);
+    }
+
+    #[test]
+    fn done_response_keeps_shallow_section_for_same_round_deepen() {
+        // 客户端把 deepen 与 done 同轮发出时，浅边界段还没发过：
+        // 响应必须保留「shallow 段 + flush + NAK + PACK」的完整顺序。
+        let mut response = proto::pkt_str("shallow 8d523ed47d6dba3062ef9728b49adc41f3d6ac49\n");
+        response.extend(proto::flush());
+        response.extend(proto::pkt_str("NAK\n"));
+        response.extend(b"PACKdata");
+
+        assert_eq!(done_response(&response, true), response.as_slice());
+        // 协商轮已发过浅边界 / ACK 时仍只发 packfile（PR #33）。
+        assert_eq!(done_response(&response, false), &b"PACKdata"[..]);
+    }
+
+    #[test]
+    fn auth_backoff_is_bounded() {
+        assert_eq!(auth_backoff(0), Duration::from_millis(0));
+        assert_eq!(auth_backoff(3), Duration::from_millis(300));
+        assert_eq!(auth_backoff(10), Duration::from_millis(1_000));
+        // 失败次数再多也不无限增长；阈值不再变成「永久拒绝」的开关。
+        assert_eq!(auth_backoff(u32::MAX), Duration::from_millis(1_000));
     }
 
     #[test]
