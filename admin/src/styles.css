@@ -2366,18 +2366,76 @@ code,
 
 .contents-aux {
   min-height: 38rem;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   background: var(--panel-soft);
   border: 1px solid var(--border);
   border-radius: 13px;
 }
 
-/* 精简版历史面板（右栏 contents-aux） */
+/* 内容页的 Git 区域：提交说明 + 版本历史，内容相关的 Git 操作都收在这里。 */
+.contents-git {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+}
+
+.contents-git-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.7rem 0.85rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.contents-git-head > div {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+}
+
+.contents-git-head strong {
+  font-size: 0.86rem;
+}
+
+.contents-git-badge {
+  padding: 0.15rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 0.72rem;
+  white-space: nowrap;
+}
+
+.contents-git-commit {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  padding: 0.75rem 0.85rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.contents-git-commit label {
+  margin-bottom: 0;
+  font-size: 0.82rem;
+}
+
+.contents-git-commit .hint {
+  margin: 0;
+  font-size: 0.78rem;
+  line-height: 1.5;
+}
+
+/* 精简版历史面板（右栏 Git 区域内） */
 .revision-panel {
   display: flex;
   flex-direction: column;
   gap: 0.55rem;
   padding: 0.75rem;
-  max-height: calc(100vh - 6.5rem);
+  max-height: calc(100vh - 15rem);
   overflow: auto;
 }
 
@@ -2521,7 +2579,7 @@ code,
     display: none;
   }
   .contents-layout[data-pane="git"] .contents-aux {
-    display: block;
+    display: flex;
     grid-column: 1 / -1;
   }
 }

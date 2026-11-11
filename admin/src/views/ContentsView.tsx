@@ -79,9 +79,9 @@ export function ContentsView() {
   const [previewHtml, setPreviewHtml] = useState("");
   const [previewError, setPreviewError] = useState("");
   const [previewLoading, setPreviewLoading] = useState(false);
-  // 窄屏三选一视图：编辑器（默认）/ 目录 / Git 历史。
+  // 窄屏三选一视图：编辑器（默认）/ 目录 / Git 区域。
   const [mobilePane, setMobilePane] = useState<"editor" | "tree" | "git">("editor");
-  // 保存/删除会让右栏 git 历史重新拉取（contentId 不变时也需要）。
+  // 保存/删除会让右栏 Git 区域的版本历史重新拉取（contentId 不变时也需要）。
   const [historyKey, setHistoryKey] = useState(0);
 
   useEffect(() => {
@@ -270,7 +270,7 @@ export function ContentsView() {
         </aside>
 
         <div className="contents-main">
-      <form onSubmit={save}>
+      <form id="content-editor-form" onSubmit={save}>
         <div className="row">
           <label>
             路径
@@ -355,14 +355,6 @@ export function ContentsView() {
             />
             发布
           </label>
-          <label>
-            版本说明
-            <input
-              value={message}
-              onChange={(e) => setMessage(e.target.value)}
-              placeholder="可选，记入版本历史"
-            />
-          </label>
           <button type="submit">保存</button>
           <button type="button" onClick={newContent}>
             新建内容
@@ -370,7 +362,7 @@ export function ContentsView() {
         </div>
       </form>
 
-      {/* 全站清单默认收起：当前文件的 git 历史由右栏（窄屏点「版本历史」）承担。 */}
+      {/* 全站清单默认收起：当前文件的版本历史由右栏 Git 区域承担。 */}
       <details className="contents-all">
         <summary>全部内容（{items.length}）· 编辑与删除</summary>
         <div className="table-wrap">
@@ -405,21 +397,47 @@ export function ContentsView() {
       </details>
         </div>
         <aside className="contents-aux">
-          <RevisionPanel
-            contentId={contentId}
-            refreshKey={historyKey}
-            onReverted={(item) => {
-              // 回滚是移动指针：编辑器同步显示回滚后的正文与格式。
-              setContentId(item.id);
-              setSlug(editorPath(item));
-              setFormat(item.format);
-              setBody(item.body);
-              setPublished(item.published);
-              setNotice(`已回滚到版本 ${item.rev_seq}`);
-              setHistoryKey((value) => value + 1);
-              void refresh();
-            }}
-          />
+          {/* 内容页的所有 Git 操作集中在这一栏：提交说明 + 版本历史 / 对比 / 快照 / 回滚。
+              输入框用 form 属性关联回编辑器表单，按 Enter 与表单内的行为保持一致。 */}
+          <div className="contents-git">
+            <div className="contents-git-head">
+              <div>
+                <span className="contents-tree-kicker">GIT</span>
+                <strong>Git</strong>
+              </div>
+              <span className="contents-git-badge">版本与提交</span>
+            </div>
+            <div className="contents-git-commit">
+              <label htmlFor="content-commit-message">
+                版本说明
+                <input
+                  id="content-commit-message"
+                  form="content-editor-form"
+                  value={message}
+                  onChange={(e) => setMessage(e.target.value)}
+                  placeholder="可选，保存时记入版本历史"
+                />
+              </label>
+              <p className="hint">
+                在编辑器点「保存」时，说明随新版本一起记录；正文或格式没有变化则不会产生新版本。
+              </p>
+            </div>
+            <RevisionPanel
+              contentId={contentId}
+              refreshKey={historyKey}
+              onReverted={(item) => {
+                // 回滚是移动指针：编辑器同步显示回滚后的正文与格式。
+                setContentId(item.id);
+                setSlug(editorPath(item));
+                setFormat(item.format);
+                setBody(item.body);
+                setPublished(item.published);
+                setNotice(`已回滚到版本 ${item.rev_seq}`);
+                setHistoryKey((value) => value + 1);
+                void refresh();
+              }}
+            />
+          </div>
         </aside>
       </div>
     </section>
