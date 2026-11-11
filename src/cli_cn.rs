@@ -28,6 +28,7 @@ pub enum Kind {
     Serve,
     Build,
     Migrate,
+    Compress,
     InviteCreate,
     InviteList,
     InviteRevoke,
@@ -78,6 +79,15 @@ const CMDS: &[Cmd] = &[
         group: "数据库",
         usage: "执行数据库迁移",
         desc: "执行数据库迁移",
+    },
+    Cmd {
+        kind: Kind::Compress,
+        cn: "压缩对象库",
+        aliases: &["压缩对象", "压缩 Git 对象", "压缩仓库"],
+        en: "db compress",
+        group: "数据库",
+        usage: "压缩对象库",
+        desc: "把历史遗留的未压缩 Git 对象压成 zlib，可重复执行",
     },
     Cmd {
         kind: Kind::InviteCreate,

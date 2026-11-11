@@ -81,6 +81,8 @@ enum Command {
 #[derive(Subcommand)]
 enum DbCommand {
     Migrate,
+    /// 把历史遗留的未压缩 Git 对象压成 zlib（可重复执行）
+    Compress,
 }
 
 #[derive(Subcommand)]
@@ -216,6 +218,12 @@ async fn main() -> Result<()> {
             let pool = db::connect(&cfg.database_url).await?;
             match command {
                 DbCommand::Migrate => db::migrate(&pool).await,
+                DbCommand::Compress => {
+                    let (done, skipped) =
+                        crate::git::store::compress_existing_objects(&pool).await?;
+                    println!("已压缩 {done} 个 Git 对象，{skipped} 个太小或压不动，保持原样");
+                    Ok(())
+                }
             }
         }
         Command::Invite { command } => {
