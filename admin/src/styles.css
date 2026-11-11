@@ -1644,6 +1644,24 @@ code,
   background: color-mix(in srgb, var(--accent) 88%, #000);
 }
 
+/* 并排放两个按钮在窄侧栏里会挤成两行，直接纵向排；导入入口用次级样式。 */
+.project-new-row {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.project-new-row .project-new-button:last-child {
+  color: var(--text);
+  background: var(--panel-soft);
+  border-color: var(--border);
+  font-weight: 600;
+}
+
+.project-new-row .project-new-button:last-child:hover:not(:disabled) {
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 12%, var(--panel-soft));
+}
+
 .project-create {
   padding: 0.85rem;
   background: var(--panel-soft);

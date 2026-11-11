@@ -9,6 +9,17 @@ pub(crate) struct ProjectCreateBody {
 }
 
 #[derive(Deserialize)]
+pub(crate) struct ProjectImportBody {
+    slug: String,
+    #[serde(default)]
+    description: String,
+    url: String,
+    /// 可选：只导入指定分支；缺省导入远端全部分支。
+    #[serde(default)]
+    branch: Option<String>,
+}
+
+#[derive(Deserialize)]
 pub(crate) struct ProjectUpdateBody {
     description: Option<String>,
     archived: Option<bool>,
@@ -106,6 +117,47 @@ pub(crate) async fn project_create(
         ));
     }
     Ok(Json(json!({ "item": project })))
+}
+
+/// 导入是「服务端替你访问外部网络 + 写库」的重操作：按用户和 IP 双向限量，
+/// 避免有人拿它当免费克隆代理刷外部站点或把数据库塞满。
+const IMPORT_PER_USER: (u32, u64) = (5, 600);
+const IMPORT_PER_IP: (u32, u64) = (5, 600);
+
+/// 从外部公开 Git 仓库克隆出一个项目（导入全部对象与分支历史）。
+pub(crate) async fn project_import(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    session: Session,
+    Json(body): Json<ProjectImportBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = current_user(&state, &session).await?;
+    let ip = client_ip(&state, &headers, peer);
+    limited(&state, &format!("import:user:{}", user.id), IMPORT_PER_USER)?;
+    limited(&state, &format!("import:ip:{ip}"), IMPORT_PER_IP)?;
+
+    let outcome = crate::project::import_project(
+        &state.pool,
+        &user,
+        &body.slug,
+        &body.description,
+        &body.url,
+        body.branch.as_deref(),
+    )
+    .await?;
+    if let Err(error) = state.build_ctl.build_all().await {
+        return Err(ApiError::with_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("项目已导入，但自动编译失败：{error}"),
+        ));
+    }
+    Ok(Json(json!({
+        "item": outcome.project,
+        "branches": outcome.branches,
+        "objects": outcome.objects,
+        "commits": outcome.commits,
+    })))
 }
 
 pub(crate) async fn project_detail(

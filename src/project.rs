@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::{PgConnection, PgPool};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use uuid::Uuid;
 
@@ -11,6 +11,7 @@ use crate::git::lfs;
 use crate::git::object::{
     commit_parents, encode_commit, ensure_text, identity_name, is_text, Oid,
 };
+use crate::git::proto;
 use crate::git::store;
 use crate::git::tree;
 use crate::models::User;
@@ -374,6 +375,202 @@ pub async fn create_project(
 
     tx.commit().await?;
     Ok(project)
+}
+
+/// 导入时单个项目允许的最长提交链。与历史/PR 侧的 MAX_COMMIT_WALK 对齐。
+const IMPORT_MAX_COMMITS: usize = 5000;
+
+#[derive(Debug, Serialize)]
+pub struct ImportOutcome {
+    pub project: Project,
+    pub branches: Vec<String>,
+    pub objects: usize,
+    pub commits: usize,
+}
+
+/// 从外部公开 Git 仓库克隆出一个站内项目。
+///
+/// 流程：refs 协商 → 全量 fetch pack → 解析与校验（纯内存，失败零副作用）
+/// → 单事务写库（projects 行 + git_objects + git_refs + git_commits 索引）。
+/// 校验规则与推送通道一致：仓库历史里不能有二进制 blob（站内 Git 只存
+/// UTF-8 文本），提交数量与对象数量都有硬上限。
+pub async fn import_project(
+    pool: &PgPool,
+    user: &User,
+    slug: &str,
+    description: &str,
+    url: &str,
+    branch: Option<&str>,
+) -> Result<ImportOutcome> {
+    if !valid_project_slug(slug) {
+        bail!("项目名只能包含非特殊 UTF-8 字符，不能含 / \\ ? # % 或空白");
+    }
+    let url = crate::git::fetch::normalize_remote_url(url)?;
+
+    // refs 协商：确定分支清单与默认分支，此时还没有写任何数据。
+    let remote = crate::git::fetch::fetch_refs(url.clone()).await?;
+    if remote.branches.is_empty() {
+        bail!("远端仓库没有可导入的分支（空仓库或不是 Git 仓库）");
+    }
+    // want 行只能请求远端宣告过的能力，先把广告里的能力名带下来。
+    let capabilities = remote.capabilities.clone();
+    let mut branches = remote.branches;
+    if let Some(wanted) = branch.map(str::trim).filter(|value| !value.is_empty()) {
+        branches.retain(|(name, _)| name == wanted);
+        if branches.is_empty() {
+            bail!("远端不存在分支: {wanted}");
+        }
+    }
+    if branches.len() > crate::git::fetch::MAX_BRANCHES {
+        bail!(
+            "远端有 {} 个分支，一次最多导入 {} 个；可指定 branch 只导入单个分支",
+            branches.len(),
+            crate::git::fetch::MAX_BRANCHES
+        );
+    }
+    // 默认分支优先取远端 HEAD（symref 能力），其次远端第一个分支。
+    let default_branch = branch
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or(remote.default_branch)
+        .unwrap_or_else(|| branches[0].0.clone());
+    if !valid_branch(&default_branch) {
+        bail!("远端默认分支名不合法: {default_branch}");
+    }
+
+    // 全量拉 pack；refs 里指向的必须是分支顶点提交。
+    let wants: Vec<Oid> = branches.iter().map(|(_, oid)| *oid).collect();
+    let pack = crate::git::fetch::fetch_pack(url, wants, capabilities).await?;
+    let raw = proto::parse_pack(&pack)?;
+    let resolved = proto::resolve(&raw, &HashMap::new())?;
+    if resolved.is_empty() {
+        bail!("远端没有返回任何 Git 对象");
+    }
+    if resolved.len() > crate::git::fetch::MAX_OBJECTS {
+        bail!(
+            "仓库共有 {} 个对象，超出导入上限 {} 个",
+            resolved.len(),
+            crate::git::fetch::MAX_OBJECTS
+        );
+    }
+    // 文本校验提前到写库之前：任何一个二进制 blob 都会导入失败，
+    // 此时事务还没开，不留半拉子数据。
+    for (oid, kind, data) in &resolved {
+        match kind {
+            crate::git::object::ObjectKind::Blob => {
+                if !is_text(data) {
+                    bail!(
+                        "仓库历史里包含二进制文件（blob {oid}），无法导入；站内 Git 只支持 UTF-8 文本"
+                    );
+                }
+            }
+            crate::git::object::ObjectKind::Commit | crate::git::object::ObjectKind::Tag => {
+                ensure_text(data)?
+            }
+            crate::git::object::ObjectKind::Tree => {}
+        }
+    }
+
+    let mut tx = pool.begin().await?;
+    // 与 create_project 一致：项目名不能撞上普通内容的路径空间。
+    let pattern = format!("{PROJECT_NAMESPACE}/{slug}/%");
+    let occupied: Option<(String,)> =
+        sqlx::query_as("SELECT slug FROM contents WHERE slug LIKE $1 LIMIT 1")
+            .bind(pattern)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if let Some((taken,)) = occupied {
+        bail!("/{taken} 已被普通内容占用，项目无法使用这个路径");
+    }
+
+    let project = sqlx::query_as::<_, Project>(
+        "INSERT INTO projects (id, slug, description, default_branch, created_by)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING *",
+    )
+    .bind(Uuid::new_v4())
+    .bind(slug)
+    .bind(description.trim())
+    .bind(&default_branch)
+    .bind(user.id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|error| match &error {
+        sqlx::Error::Database(db) if db.code().as_deref() == Some("23505") => {
+            anyhow::anyhow!("项目名已被占用")
+        }
+        _ => error.into(),
+    })?;
+
+    for (_oid, kind, data) in &resolved {
+        // OID 由对象内容算出，与 pack 里的一致，这里不需要再用它。
+        store::put_object(
+            &mut tx,
+            project.id,
+            &crate::git::object::Object {
+                kind: *kind,
+                data: data.clone(),
+            },
+        )
+        .await?;
+    }
+    for (name, target) in &branches {
+        if !valid_branch(name) {
+            continue;
+        }
+        store::set_ref(&mut tx, project.id, &format!("refs/heads/{name}"), *target).await?;
+    }
+
+    // 提交索引：从各分支顶点向上遍历整条父链。外部提交不属于站内用户，
+    // author_id 记 NULL（与 KychRunner 的系统身份约定一致），作者名取
+    // 原始提交里的 committer。
+    let mut seen = HashSet::new();
+    let mut stack: Vec<Oid> = branches.iter().map(|(_, oid)| *oid).collect();
+    let mut commits = 0usize;
+    while let Some(oid) = stack.pop() {
+        if !seen.insert(oid) {
+            continue;
+        }
+        if seen.len() > IMPORT_MAX_COMMITS {
+            bail!("提交历史超过 {IMPORT_MAX_COMMITS} 个提交，超出导入上限");
+        }
+        let Some(object) = store::get_object(&mut tx, project.id, oid).await? else {
+            bail!("远端 pack 缺少提交对象 {oid}");
+        };
+        if object.kind != crate::git::object::ObjectKind::Commit {
+            continue;
+        }
+        let info = crate::git::object::parse_commit(&object.data)?;
+        store::insert_commit_index(
+            &mut tx,
+            project.id,
+            oid,
+            info.parents.first().copied(),
+            info.parents.get(1).copied(),
+            info.tree,
+            None,
+            &info.author,
+            &info.message,
+            info.committed_at,
+        )
+        .await?;
+        commits += 1;
+        stack.extend(info.parents);
+    }
+
+    tx.commit().await?;
+    let imported_branches: Vec<String> = branches
+        .into_iter()
+        .filter(|(name, _)| valid_branch(name))
+        .map(|(name, _)| name)
+        .collect();
+    Ok(ImportOutcome {
+        project,
+        branches: imported_branches,
+        objects: resolved.len(),
+        commits,
+    })
 }
 
 /// include_archived 为 true 时把已归档项目一并返回(管理台用于删除/取消归档);
@@ -1297,3 +1494,4 @@ mod tests {
         .is_err());
     }
 }
+
