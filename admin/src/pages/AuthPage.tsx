@@ -61,6 +61,15 @@ export function AuthPage({ onLogin }: Props) {
     passkeySupported ? null : false,
   );
 
+  const [siteName, setSiteName] = useState("");
+  // 登录页在鉴权之前就要显示站点名，自行拉一次设置；失败则保持空。
+  useEffect(() => {
+    api
+      .getSettings()
+      .then((result) => setSiteName(result.site.site_name))
+      .catch(() => undefined);
+  }, []);
+
   useEffect(() => {
     if (!passkeySupported) return;
     if (typeof window.isSecureContext === "boolean" && !window.isSecureContext) {
@@ -130,7 +139,7 @@ export function AuthPage({ onLogin }: Props) {
 
   return (
     <div className="auth">
-      <h1>KychNet</h1>
+      <h1>{siteName || "管理"}</h1>
       <div className="tabs">
         <button className={mode === "login" ? "active" : ""} onClick={() => setMode("login")}>
           登录

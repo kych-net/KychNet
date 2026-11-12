@@ -149,7 +149,7 @@ export function Shell({
       <main className="appmain">
         <div className="page-head">
           <div>
-            <span className="page-eyebrow">KychNet Admin</span>
+            <span className="page-eyebrow">{site.site_name || "Admin"} Admin</span>
             <h1>{viewMeta[view].title}</h1>
             <p>{viewMeta[view].subtitle}</p>
           </div>
