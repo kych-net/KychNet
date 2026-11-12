@@ -156,13 +156,37 @@ pub async fn require_object(
         .ok_or_else(|| anyhow::anyhow!("Git 对象不存在: {oid}"))
 }
 
-/// 批量取对象：fetch 热路径按批拉取，替代每个对象一次 `SELECT` 的逐行查询。
-/// 返回按数据库顺序的结果，缺失的 oid 不返回，由调用方决定容忍或报错。
-pub async fn get_objects(
+/// 库里一行的原始形态：`data` 可能是已压缩的 zlib 流。
+/// fetch 热路径直接把压缩字节写进 pack，只有需要解析 tree/commit 时才解压。
+#[derive(Clone)]
+pub struct StoredObject {
+    pub oid: Oid,
+    pub kind: ObjectKind,
+    pub size: i64,
+    pub data: Vec<u8>,
+    pub compressed: bool,
+}
+
+impl StoredObject {
+    pub fn into_object(self) -> Result<Object> {
+        let data = if self.compressed {
+            decompress_blob(&self.data, self.size)?
+        } else {
+            self.data
+        };
+        Ok(Object {
+            kind: self.kind,
+            data,
+        })
+    }
+}
+
+/// 批量取对象原始行，不做解压。
+pub async fn get_objects_raw(
     conn: &mut PgConnection,
     project_id: Uuid,
     oids: &[Oid],
-) -> Result<Vec<(Oid, Object)>> {
+) -> Result<Vec<StoredObject>> {
     if oids.is_empty() {
         return Ok(Vec::new());
     }
@@ -180,17 +204,31 @@ pub async fn get_objects(
         let raw: Vec<u8> = row.try_get("oid")?;
         let oid = Oid::from_slice(&raw)?;
         let kind: i16 = row.try_get("kind")?;
-        let size: i64 = row.try_get("size")?;
-        let raw: Vec<u8> = row.try_get("data")?;
-        let compressed: bool = row.try_get("compressed")?;
         let kind = ObjectKind::from_i16(kind)
             .ok_or_else(|| anyhow::anyhow!("未知的 Git 对象类型: {kind}"))?;
-        let data = if compressed {
-            decompress_blob(&raw, size)?
-        } else {
-            raw
-        };
-        out.push((oid, Object { kind, data }));
+        out.push(StoredObject {
+            oid,
+            kind,
+            size: row.try_get("size")?,
+            data: row.try_get("data")?,
+            compressed: row.try_get("compressed")?,
+        });
+    }
+    Ok(out)
+}
+
+/// 批量取对象：fetch 热路径按批拉取，替代每个对象一次 `SELECT` 的逐行查询。
+/// 返回按数据库顺序的结果，缺失的 oid 不返回，由调用方决定容忍或报错。
+pub async fn get_objects(
+    conn: &mut PgConnection,
+    project_id: Uuid,
+    oids: &[Oid],
+) -> Result<Vec<(Oid, Object)>> {
+    let rows = get_objects_raw(conn, project_id, oids).await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let oid = row.oid;
+        out.push((oid, row.into_object()?));
     }
     Ok(out)
 }
@@ -291,6 +329,8 @@ pub async fn set_ref(
     .bind(&target.as_bytes()[..])
     .execute(conn)
     .await?;
+    // ref 变了，该项目的全量 clone pack 缓存必须作废。
+    super::pack_cache::invalidate_project(project_id);
     Ok(())
 }
 
@@ -304,6 +344,7 @@ pub async fn delete_ref(
         .bind(name)
         .execute(conn)
         .await?;
+    super::pack_cache::invalidate_project(project_id);
     Ok(())
 }
 

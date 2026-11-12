@@ -113,6 +113,7 @@ pub(crate) async fn project_create(
         .filter(|value| !value.is_empty());
     let project = crate::project::create_project(
         &state.pool,
+        &state.lfs_root,
         &user,
         &body.slug,
         &body.description,

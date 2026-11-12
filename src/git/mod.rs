@@ -3,6 +3,7 @@ pub mod gc;
 pub mod http;
 pub mod lfs;
 pub mod object;
+pub mod pack_cache;
 pub mod proto;
 pub mod ssh;
 pub mod ssh_key;

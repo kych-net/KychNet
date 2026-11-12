@@ -586,33 +586,81 @@ pub fn resolve(
     Ok(resolved.into_iter().flatten().collect())
 }
 
-/// 生成不含 delta 的 pack。对象数量不大时，这比做 delta 压缩更简单可靠。
-pub fn build_pack(objects: &[(ObjectKind, Vec<u8>)]) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(b"PACK");
-    out.extend_from_slice(&2u32.to_be_bytes());
-    out.extend_from_slice(&(objects.len() as u32).to_be_bytes());
-    for (kind, data) in objects {
-        let type_number = (*kind as i16) as u8;
-        let mut size = data.len() as u64;
-        let mut byte = (type_number << 4) | (size & 0x0f) as u8;
-        size >>= 4;
-        while size > 0 {
-            out.push(byte | 0x80);
-            byte = (size & 0x7f) as u8;
-            size >>= 7;
-        }
-        out.push(byte);
+/// 增量构建不含 delta 的 pack。
+///
+/// `push` 可以直接写入库里已经 zlib 压缩过的字节：packfile 每个对象体本身
+/// 就是一条标准 zlib 流，与 `store::compress_blob` 产出的格式一致，因此
+/// 全量 clone 不必「解压 → 再压缩」，也无需把所有对象同时留在内存里。
+pub struct PackBuilder {
+    out: Vec<u8>,
+    count: u32,
+}
 
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-        encoder
-            .write_all(data)
-            .expect("写入内存中的 deflate 流不会失败");
-        out.extend_from_slice(&encoder.finish().expect("结束内存中的 deflate 流不会失败"));
+impl PackBuilder {
+    pub fn new() -> Self {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"PACK");
+        out.extend_from_slice(&2u32.to_be_bytes());
+        out.extend_from_slice(&0u32.to_be_bytes()); // 对象数占位，finish 时回填
+        Self { out, count: 0 }
     }
-    let digest = Sha1::digest(&out);
-    out.extend_from_slice(&digest);
-    out
+
+    /// `size` 是对象**原始**长度；`data` 是待写入的字节。
+    /// `compressed=true` 表示 data 已是完整 zlib 流，可直接复用。
+    pub fn push(&mut self, kind: ObjectKind, size: usize, data: &[u8], compressed: bool) {
+        let type_number = (kind as i16) as u8;
+        let mut remaining = size as u64;
+        let mut byte = (type_number << 4) | (remaining & 0x0f) as u8;
+        remaining >>= 4;
+        while remaining > 0 {
+            self.out.push(byte | 0x80);
+            byte = (remaining & 0x7f) as u8;
+            remaining >>= 7;
+        }
+        self.out.push(byte);
+
+        if compressed {
+            self.out.extend_from_slice(data);
+        } else {
+            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+            encoder
+                .write_all(data)
+                .expect("写入内存中的 deflate 流不会失败");
+            self.out.extend_from_slice(
+                &encoder
+                    .finish()
+                    .expect("结束内存中的 deflate 流不会失败"),
+            );
+        }
+        self.count += 1;
+    }
+
+    pub fn finish(mut self) -> Vec<u8> {
+        // 对象数在头部 8..12 字节；先回填，再对整个 pack 算 SHA-1 尾。
+        self.out[8..12].copy_from_slice(&self.count.to_be_bytes());
+        let digest = Sha1::digest(&self.out);
+        self.out.extend_from_slice(&digest);
+        self.out
+    }
+}
+
+impl Default for PackBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 生成不含 delta 的 pack。对象数量不大时，这比做 delta 压缩更简单可靠。
+///
+/// 生产路径已改用 `PackBuilder` 增量构建；这里保留一次性打包的实现，
+/// 作为测试里校验「直接复用库内 zlib 字节」是否字节级一致的基准。
+#[allow(dead_code)]
+pub fn build_pack(objects: &[(ObjectKind, Vec<u8>)]) -> Vec<u8> {
+    let mut builder = PackBuilder::new();
+    for (kind, data) in objects {
+        builder.push(*kind, data.len(), data, false);
+    }
+    builder.finish()
 }
 
 #[cfg(test)]
@@ -627,6 +675,36 @@ mod tests {
         let (lines, consumed) = parse_pkt_lines(&data).unwrap();
         assert_eq!(lines, vec![b"want abc\n".to_vec()]);
         assert_eq!(&data[consumed..], b"PACKtail");
+    }
+
+    #[test]
+    fn pack_builder_reuses_stored_zlib_bytes() {
+        let objects = vec![
+            (ObjectKind::Blob, b"tiny\n".to_vec()),
+            (
+                ObjectKind::Blob,
+                "compressible text line\n".repeat(200).into_bytes(),
+            ),
+        ];
+        let direct = build_pack(&objects);
+
+        // 模拟库里存的行：小对象存原样，大对象存 zlib 流。
+        let mut builder = PackBuilder::new();
+        for (kind, data) in &objects {
+            if data.len() >= 256 {
+                let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+                encoder.write_all(data).unwrap();
+                let zlib = encoder.finish().unwrap();
+                builder.push(*kind, data.len(), &zlib, true);
+            } else {
+                builder.push(*kind, data.len(), data, false);
+            }
+        }
+        assert_eq!(
+            direct,
+            builder.finish(),
+            "库内 zlib 字节必须能原样写进 pack，字节级一致"
+        );
     }
 
     #[test]
@@ -687,6 +765,36 @@ mod tests {
         let resolved = resolve(&raw, &HashMap::new()).unwrap();
         let expected = hash_object(ObjectKind::Blob, b"hello there\n");
         assert!(resolved.iter().any(|(oid, kind, _)| *oid == expected && *kind == ObjectKind::Blob));
+    }
+
+    /// thin pack：基准对象不在包里，由调用方从对象库查出来传进来。
+    /// `prepare_receive_pack` 批量取 REF_DELTA base 走的就是这条路径。
+    #[test]
+    fn resolves_ref_delta_against_external_base() {
+        let base = b"hello world\n".to_vec();
+        let base_oid = hash_object(ObjectKind::Blob, &base);
+        let delta = vec![12u8, 12, 0x90, 0x06, 6, b't', b'h', b'e', b'r', b'e', b'\n'];
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&1u32.to_be_bytes()); // 包里只有 delta，没有 base
+        pack.extend_from_slice(&object_header(7, delta.len()));
+        pack.extend_from_slice(base_oid.as_bytes());
+        pack.extend_from_slice(&zlib(&delta));
+        let digest = Sha1::digest(&pack);
+        pack.extend_from_slice(&digest);
+
+        let raw = parse_pack(&pack).unwrap();
+        let mut external = HashMap::new();
+        external.insert(base_oid, (ObjectKind::Blob, base));
+        let resolved = resolve(&raw, &external).unwrap();
+        let expected = hash_object(ObjectKind::Blob, b"hello there\n");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].0, expected);
+        assert_eq!(resolved[0].2, b"hello there\n");
+
+        // 库里查不到 base 时必须报错，不能静默丢掉这个对象。
+        assert!(resolve(&raw, &HashMap::new()).is_err());
     }
 
     #[test]
