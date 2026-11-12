@@ -233,35 +233,72 @@ pub async fn get_objects(
     Ok(out)
 }
 
+/// 一批待更新行的三个 `unnest` 数组，以及压不动的行数。
+struct CompressBatch {
+    project_ids: Vec<Uuid>,
+    oids: Vec<Vec<u8>>,
+    payloads: Vec<Vec<u8>>,
+    skipped: usize,
+}
+
+/// 纯 CPU：对本批原始行做 zlib 压缩，分流出可更新行与压不动行。
+/// SQL 已经滤掉小于阈值的行，这里再兜一次 `compress_blob` 的判断。
+fn prepare_compress_batch(rows: &[(Uuid, Vec<u8>, Vec<u8>)]) -> Result<CompressBatch> {
+    let mut batch = CompressBatch {
+        project_ids: Vec::with_capacity(rows.len()),
+        oids: Vec::with_capacity(rows.len()),
+        payloads: Vec::with_capacity(rows.len()),
+        skipped: 0,
+    };
+    for (project_id, oid, data) in rows {
+        match compress_blob(data)? {
+            Some(packed) => {
+                batch.project_ids.push(*project_id);
+                batch.oids.push(oid.clone());
+                batch.payloads.push(packed);
+            }
+            None => batch.skipped += 1,
+        }
+    }
+    Ok(batch)
+}
+
 /// 把历史遗留的未压缩对象批量压成 zlib。可重复执行：
-/// 已压缩的行、以及压不动的对象都会自然跳过。
+/// 已压缩的行、小于阈值的行，以及压不动的对象都会自然跳过。
 ///
-/// 按 `(project_id, oid)` 游标分页，避免一次把整个对象库读进内存。
+/// 按 `(project_id, oid)` 游标分页，避免一次把整个对象库读进内存；
+/// 每批只做一次 `unnest` 批量 UPDATE，不再逐行往返。
 /// 返回 (本次压缩数, 压不动跳过数)。
 pub async fn compress_existing_objects(pool: &PgPool) -> Result<(usize, usize)> {
     let mut compressed_count = 0usize;
     let mut skipped = 0usize;
     let mut conn = pool.acquire().await?;
     let mut cursor: Option<(Uuid, Vec<u8>)> = None;
+    let min_size = COMPRESS_MIN_BYTES as i64;
     loop {
+        // 小于阈值的行必然压不动，直接在 SQL 里滤掉；否则重复执行时
+        // 每次都要把这些小对象读出来再判一次，规模一大就是固定开销。
         let rows = match &cursor {
             Some((project_id, oid)) => {
                 sqlx::query(
                     "SELECT project_id, oid, data FROM git_objects
-                     WHERE NOT compressed AND (project_id, oid) > ($1, $2)
+                     WHERE NOT compressed AND size >= $3
+                       AND (project_id, oid) > ($1, $2)
                      ORDER BY project_id, oid LIMIT 500",
                 )
                 .bind(project_id)
                 .bind(oid)
+                .bind(min_size)
                 .fetch_all(&mut *conn)
                 .await?
             }
             None => {
                 sqlx::query(
                     "SELECT project_id, oid, data FROM git_objects
-                     WHERE NOT compressed
+                     WHERE NOT compressed AND size >= $1
                      ORDER BY project_id, oid LIMIT 500",
                 )
+                .bind(min_size)
                 .fetch_all(&mut *conn)
                 .await?
             }
@@ -269,28 +306,36 @@ pub async fn compress_existing_objects(pool: &PgPool) -> Result<(usize, usize)> 
         if rows.is_empty() {
             break;
         }
+        let mut raw = Vec::with_capacity(rows.len());
         for row in &rows {
             let project_id: Uuid = row.try_get("project_id")?;
             let oid: Vec<u8> = row.try_get("oid")?;
             let data: Vec<u8> = row.try_get("data")?;
-            // 游标始终推进：压不动的对象下一轮不会再被选中。
+            // 游标始终推进：压不动的对象在本次执行里不会再被选中。
             cursor = Some((project_id, oid.clone()));
-            match compress_blob(&data)? {
-                Some(packed) => {
-                    sqlx::query(
-                        "UPDATE git_objects SET data = $3, compressed = true
-                         WHERE project_id = $1 AND oid = $2",
-                    )
-                    .bind(project_id)
-                    .bind(&oid)
-                    .bind(&packed)
-                    .execute(&mut *conn)
-                    .await?;
-                    compressed_count += 1;
-                }
-                None => skipped += 1,
-            }
+            raw.push((project_id, oid, data));
         }
+        let batch = prepare_compress_batch(&raw)?;
+        skipped += batch.skipped;
+        if batch.oids.is_empty() {
+            continue;
+        }
+        // 单条语句原子更新整批；`NOT g.compressed` 避免覆盖并发写入。
+        // rows_affected 才是真正落库的条数，不用预估数记账。
+        let result = sqlx::query(
+            "UPDATE git_objects AS g
+             SET data = u.data, compressed = true
+             FROM unnest($1::uuid[], $2::bytea[], $3::bytea[])
+                  AS u(project_id, oid, data)
+             WHERE g.project_id = u.project_id AND g.oid = u.oid
+               AND NOT g.compressed",
+        )
+        .bind(batch.project_ids)
+        .bind(batch.oids)
+        .bind(batch.payloads)
+        .execute(&mut *conn)
+        .await?;
+        compressed_count += result.rows_affected() as usize;
     }
     Ok((compressed_count, skipped))
 }
@@ -511,18 +556,44 @@ mod tests {
         assert!(compress_blob(b"tiny").unwrap().is_none());
     }
 
-    #[test]
-    fn incompressible_blob_is_stored_raw() {
-        // 高熵数据压不动时返回 None，避免多存一份更大的副本。
-        let mut data = Vec::new();
+    fn high_entropy_bytes(len: usize) -> Vec<u8> {
+        let mut data = Vec::with_capacity(len);
         let mut seed: u64 = 0x9E3779B97F4A7C15;
-        for _ in 0..2048 {
+        for _ in 0..len {
             seed ^= seed << 13;
             seed ^= seed >> 7;
             seed ^= seed << 17;
             data.push((seed & 0xFF) as u8);
         }
-        assert!(compress_blob(&data).unwrap().is_none());
+        data
+    }
+
+    #[test]
+    fn incompressible_blob_is_stored_raw() {
+        // 高熵数据压不动时返回 None，避免多存一份更大的副本。
+        assert!(compress_blob(&high_entropy_bytes(2048)).unwrap().is_none());
+    }
+
+    #[test]
+    fn compress_batch_splits_rows_and_counts_skipped() {
+        // SQL 已经滤掉小于阈值的行，这里同时验证纯 CPU 分流的兜底判断。
+        let id = Uuid::nil();
+        let compressible = "line of markdown content\n".repeat(200).into_bytes();
+        let rows = vec![
+            (id, vec![1u8; 20], b"tiny".to_vec()),
+            (id, vec![2u8; 20], compressible.clone()),
+            (id, vec![3u8; 20], high_entropy_bytes(2048)),
+        ];
+        let batch = prepare_compress_batch(&rows).unwrap();
+        assert_eq!(batch.project_ids.len(), 1);
+        assert_eq!(batch.oids, vec![vec![2u8; 20]]);
+        assert_eq!(batch.payloads.len(), 1);
+        assert_eq!(batch.skipped, 2, "小对象与高熵对象都应跳过");
+        assert_eq!(
+            decompress_blob(&batch.payloads[0], compressible.len() as i64).unwrap(),
+            compressible
+        );
+        assert!(prepare_compress_batch(&[]).unwrap().oids.is_empty());
     }
 
     #[test]
