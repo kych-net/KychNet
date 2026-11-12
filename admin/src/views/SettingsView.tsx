@@ -9,6 +9,9 @@ export function SettingsView() {
   const [siteName, setSiteName] = useState("");
   const [description, setDescription] = useState("");
   const [logoUrl, setLogoUrl] = useState("");
+  const [icpBeian, setIcpBeian] = useState("");
+  const [policeBeian, setPoliceBeian] = useState("");
+  const [policeBeianCode, setPoliceBeianCode] = useState("");
   const [nav, setNav] = useState<NavLink[]>([]);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -22,6 +25,9 @@ export function SettingsView() {
         setSiteName(result.site.site_name);
         setDescription(result.site.description);
         setLogoUrl(result.site.logo_url);
+        setIcpBeian(result.site.icp_beian ?? "");
+        setPoliceBeian(result.site.police_beian ?? "");
+        setPoliceBeianCode(result.site.police_beian_code ?? "");
         setNav(result.site.nav);
       })
       .catch((e) => setError((e as Error).message));
@@ -59,7 +65,15 @@ export function SettingsView() {
     event.preventDefault();
     setError("");
     try {
-      await api.saveSettings({ site_name: siteName, description, logo_url: logoUrl, nav });
+      await api.saveSettings({
+        site_name: siteName,
+        description,
+        logo_url: logoUrl,
+        nav,
+        icp_beian: icpBeian,
+        police_beian: policeBeian,
+        police_beian_code: policeBeianCode,
+      });
       setNotice("站点设置已保存,重新构建后生效");
     } catch (e) {
       setError((e as Error).message);
@@ -96,6 +110,43 @@ export function SettingsView() {
             placeholder="用于 meta description / Open Graph，最多 300 字"
           />
         </label>
+
+        <h3>备案信息</h3>
+        <p className="hint">
+          按《互联网信息服务管理办法》与公安机关互联网站安全管理要求，境内运营的网站需在页脚展示备案号并链接至官方查询平台。留空则不显示对应条目；保存后需重建站点生效。
+        </p>
+        <div className="row">
+          <label>
+            ICP 备案号
+            <input
+              value={icpBeian}
+              onChange={(e) => setIcpBeian(e.target.value)}
+              maxLength={64}
+              placeholder="例如：京ICP备12345678号-1"
+            />
+          </label>
+        </div>
+        <div className="row">
+          <label>
+            公安联网备案号
+            <input
+              value={policeBeian}
+              onChange={(e) => setPoliceBeian(e.target.value)}
+              maxLength={64}
+              placeholder="例如：京公网安备 11010802012345号"
+            />
+          </label>
+          <label>
+            公安备案编号（数字，可选）
+            <input
+              value={policeBeianCode}
+              onChange={(e) => setPoliceBeianCode(e.target.value)}
+              maxLength={32}
+              inputMode="numeric"
+              placeholder="留空则从左侧备案号自动提取"
+            />
+          </label>
+        </div>
 
         <h3>顶栏链接</h3>
         {nav.map((link, index) => (

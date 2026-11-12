@@ -6,7 +6,15 @@ import { applyTheme, readTheme, Theme } from "./theme";
 // 登录后再加载管理端 Shell，避免把 CodeMirror 等重依赖塞进首屏。
 const Shell = lazy(() => import("./components/Shell").then((module) => ({ default: module.Shell })));
 
-const defaultSite: SiteSettings = { site_name: "KychNet", description: "", logo_url: "", nav: [] };
+const defaultSite: SiteSettings = {
+  site_name: "KychNet",
+  description: "",
+  logo_url: "",
+  nav: [],
+  icp_beian: "",
+  police_beian: "",
+  police_beian_code: "",
+};
 
 export function App() {
   const [user, setUser] = useState<User | null>(null);

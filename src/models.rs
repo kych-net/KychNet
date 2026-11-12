@@ -25,6 +25,57 @@ pub struct SiteSettings {
     pub description: String,
     pub logo_url: String,
     pub nav: Vec<NavLink>,
+    /// ICP 备案号，如「京ICP备12345678号-1」；留空则页脚不显示备案信息。
+    #[serde(default)]
+    pub icp_beian: String,
+    /// 公安机关互联网站安全管理服务平台备案号显示文本，
+    /// 如「京公网安备 11010802012345号」；留空则不显示。
+    #[serde(default)]
+    pub police_beian: String,
+    /// 公安备案编号（纯数字），用于拼接备案查询链接。
+    /// 留空时自动从 `police_beian` 中取最长的一段连续数字。
+    #[serde(default)]
+    pub police_beian_code: String,
+}
+
+impl SiteSettings {
+    /// 页脚是否需要展示备案信息。
+    pub fn has_beian(&self) -> bool {
+        !self.icp_beian.trim().is_empty() || !self.police_beian.trim().is_empty()
+    }
+
+    /// 公安备案查询链接。编号只取数字，避免把任意文本拼进 URL。
+    /// 取不到编号时回落到平台首页，保证链接始终可用。
+    pub fn police_beian_href(&self) -> String {
+        let code = if self
+            .police_beian_code
+            .chars()
+            .all(|c| c.is_ascii_digit())
+            && !self.police_beian_code.is_empty()
+        {
+            self.police_beian_code.trim().to_string()
+        } else {
+            // 备案号形如「京公网安备 11010802012345号」，取其中最长数字段。
+            let mut best = String::new();
+            let mut current = String::new();
+            for c in self.police_beian.chars() {
+                if c.is_ascii_digit() {
+                    current.push(c);
+                    if current.len() > best.len() {
+                        best.clone_from(&current);
+                    }
+                } else {
+                    current.clear();
+                }
+            }
+            best
+        };
+        if code.is_empty() {
+            "https://beian.gov.cn/".to_string()
+        } else {
+            format!("https://beian.gov.cn/portal/registerSystemInfo?recordcode={code}")
+        }
+    }
 }
 
 impl Default for SiteSettings {
@@ -43,6 +94,9 @@ impl Default for SiteSettings {
                     href: "/about".into(),
                 },
             ],
+            icp_beian: String::new(),
+            police_beian: String::new(),
+            police_beian_code: String::new(),
         }
     }
 }
@@ -177,4 +231,66 @@ pub struct PasskeyRow {
     pub credential_id: String,
     pub passkey: serde_json::Value,
     pub created_at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn beian(icp: &str, police: &str, code: &str) -> SiteSettings {
+        SiteSettings {
+            icp_beian: icp.into(),
+            police_beian: police.into(),
+            police_beian_code: code.into(),
+            ..SiteSettings::default()
+        }
+    }
+
+    #[test]
+    fn beian_footer_hidden_when_not_configured() {
+        assert!(!SiteSettings::default().has_beian());
+        assert!(!beian("", "  ", "").has_beian());
+        assert!(beian("京ICP备12345678号-1", "", "").has_beian());
+        assert!(beian("", "京公网安备 11010802012345号", "").has_beian());
+    }
+
+    #[test]
+    fn police_href_prefers_explicit_numeric_code() {
+        let site = beian("", "京公网安备 11010802012345号", "11010802012345");
+        assert_eq!(
+            site.police_beian_href(),
+            "https://beian.gov.cn/portal/registerSystemInfo?recordcode=11010802012345"
+        );
+    }
+
+    #[test]
+    fn police_href_extracts_longest_digits_from_text() {
+        let site = beian("", "京公网安备 11010802012345号", "");
+        assert_eq!(
+            site.police_beian_href(),
+            "https://beian.gov.cn/portal/registerSystemInfo?recordcode=11010802012345"
+        );
+    }
+
+    #[test]
+    fn police_href_falls_back_when_code_is_not_numeric() {
+        // 有人在编号框里粘了整段文本或脚本，一律忽略，避免拼进 URL。
+        let site = beian("", "京公网安备 11010802012345号", "javascript:alert(1)");
+        assert_eq!(
+            site.police_beian_href(),
+            "https://beian.gov.cn/portal/registerSystemInfo?recordcode=11010802012345"
+        );
+        let empty = beian("", "备案号待申请", "");
+        assert_eq!(empty.police_beian_href(), "https://beian.gov.cn/");
+    }
+
+    #[test]
+    fn site_settings_deserialize_legacy_json_without_beian() {
+        // 升级前存进 site_settings 的 JSON 没有这三个字段，必须能读出来。
+        let old = r#"{"site_name":"KychNet","description":"站点","logo_url":"","nav":[]}"#;
+        let site: SiteSettings = serde_json::from_str(old).unwrap();
+        assert_eq!(site.site_name, "KychNet");
+        assert!(!site.has_beian());
+        assert!(site.icp_beian.is_empty());
+    }
 }

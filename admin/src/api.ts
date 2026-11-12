@@ -43,6 +43,9 @@ export type SiteSettings = {
   description: string;
   logo_url: string;
   nav: NavLink[];
+  icp_beian: string;
+  police_beian: string;
+  police_beian_code: string;
 };
 
 export type Invite = {
