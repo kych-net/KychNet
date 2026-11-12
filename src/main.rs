@@ -221,7 +221,13 @@ async fn main() -> Result<()> {
                 DbCommand::Compress => {
                     let (done, skipped) =
                         crate::git::store::compress_existing_objects(&pool).await?;
-                    println!("已压缩 {done} 个 Git 对象，{skipped} 个太小或压不动，保持原样");
+                    println!("已压缩 {done} 个 Git 对象，{skipped} 个压不动，保持原样");
+                    if done > 0 {
+                        println!(
+                            "提示：批量 UPDATE 会留下 TOAST 死元组，磁盘空间需在运维窗口执行 \
+                             VACUUM FULL git_objects 后才会回收（该命令会锁表）"
+                        );
+                    }
                     Ok(())
                 }
             }
