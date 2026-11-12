@@ -7,7 +7,9 @@ import { applyTheme, readTheme, Theme } from "./theme";
 const Shell = lazy(() => import("./components/Shell").then((module) => ({ default: module.Shell })));
 
 const defaultSite: SiteSettings = {
-  site_name: "KychNet",
+  // 站点名以 /api/settings 返回为准；留空让标题与页眉先呈现中性文案，
+  // 接口失败也不至于显示错误品牌。
+  site_name: "",
   description: "",
   logo_url: "",
   nav: [],
@@ -29,6 +31,11 @@ export function App() {
   useEffect(() => {
     applyTheme(theme);
   }, [theme]);
+
+  // 标题跟随站点设置，不再硬编码品牌名；PWA 加到主屏后的名称同源。
+  useEffect(() => {
+    document.title = site.site_name ? `${site.site_name} 管理` : "管理";
+  }, [site.site_name]);
 
   useEffect(() => {
     api
