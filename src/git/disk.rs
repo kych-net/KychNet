@@ -909,6 +909,9 @@ pub async fn offload(
         bail!("项目里没有可导出的 Git 对象");
     }
     let written = all.len();
+    // 在 `all` 被 move 进阻塞任务之前记下本轮导出的 oid 清单，删冷行时
+    // 只允许删这份清单里的行。
+    let exported: Vec<Vec<u8>> = all.iter().map(|object| object.oid.clone()).collect();
     let disk = disk.clone();
     let project_id = project.id;
     tokio::task::spawn_blocking(move || disk.repack_from(project_id, all))
@@ -923,11 +926,16 @@ pub async fn offload(
         });
     }
     let hot_oids: Vec<Vec<u8>> = hot.iter().map(|oid| oid.as_bytes().to_vec()).collect();
+    // 只删这一轮已经写进磁盘 pack 的行。热集快照之后新 push 进来的对象
+    // 不在 `exported` 里，留着它们——ref 已指向这些提交，删了就是悬空
+    // 引用；磁盘 pack 没有的行下一轮扫描自然覆盖。
     let dropped = sqlx::query(
-        "DELETE FROM git_objects WHERE project_id = $1 AND NOT (oid = ANY($2::bytea[]))",
+        "DELETE FROM git_objects
+         WHERE project_id = $1 AND NOT (oid = ANY($2::bytea[])) AND oid = ANY($3::bytea[])",
     )
     .bind(project.id)
     .bind(hot_oids)
+    .bind(exported)
     .execute(pool)
     .await?
     .rows_affected() as usize;
@@ -938,6 +946,59 @@ pub async fn offload(
         hot_kept: hot.len(),
         cold_dropped: dropped,
     })
+}
+
+/// 自动 offload 的一轮扫描结果，后台任务打印用。
+pub struct SweepStats {
+    pub project: String,
+    pub stats: OffloadStats,
+}
+
+/// 扫描 PG 里对象数超过 `min_objects` 的未归档项目，逐个执行
+/// offload（含删冷行）。大仓库的早期历史因此自动进磁盘，PG 退化为
+/// 默认分支 tip 的热缓存；小仓库留在 PG，不值得动。
+///
+/// 串行执行：offload 本身是大 IO 操作，并行只会互相抢带宽。
+/// 单个项目失败不中断整轮，下轮重试。
+pub async fn auto_offload_sweep(
+    pool: &PgPool,
+    disk: &DiskStore,
+    min_objects: usize,
+) -> Result<Vec<SweepStats>> {
+    let rows = sqlx::query(
+        "SELECT p.slug FROM projects p
+         JOIN git_objects g ON g.project_id = p.id
+         WHERE p.archived = false
+         GROUP BY p.id, p.slug
+         HAVING count(*) >= $1
+         ORDER BY count(*) DESC",
+    )
+    .bind(min_objects as i64)
+    .fetch_all(pool)
+    .await?;
+    let mut swept = Vec::new();
+    for row in rows {
+        let slug: String = row.try_get("slug")?;
+        let Some(project) = crate::project::find_project_by_slug(pool, &slug).await? else {
+            continue;
+        };
+        match offload(pool, &project, disk, true).await {
+            Ok(stats) => {
+                tracing::info!(
+                    %slug,
+                    objects = stats.objects_written,
+                    hot = stats.hot_kept,
+                    dropped = stats.cold_dropped,
+                    "自动 offload 完成"
+                );
+                swept.push(SweepStats { project: slug, stats });
+            }
+            Err(error) => {
+                tracing::warn!(%slug, %error, "自动 offload 失败，等待下轮重试");
+            }
+        }
+    }
+    Ok(swept)
 }
 
 impl DiskStore {

@@ -26,6 +26,12 @@ pub struct Config {
     pub git_root: PathBuf,
     /// Git 对象后端：`pg`（默认，PG 唯一权威）或 `disk`（双写 + 可 offload）。
     pub git_object_backend: String,
+    /// 自动 offload 门槛：项目 PG 里的 git_objects 行数超过该值时，后台任务
+    /// 自动把冷历史导出磁盘 pack 并删除 PG 冷行，PG 只留默认分支 tip 热缓存。
+    /// 0 表示禁用。仅在 GIT_OBJECT_BACKEND=disk 时生效。
+    pub git_offload_min_objects: usize,
+    /// 自动 offload 扫描间隔（秒）。
+    pub git_offload_interval_secs: u64,
     /// Git over SSH 服务监听地址（如 `0.0.0.0:2222`）；未设置则不启动 SSH 服务。
     pub ssh_bind: Option<String>,
     /// SSH 主机私钥文件路径，首次启动自动生成。
@@ -37,6 +43,14 @@ pub struct Config {
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// 数值环境变量：未设置或解析失败一律回落默认值。
+fn env_num<T: std::str::FromStr>(key: &str, default: T) -> T {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(default)
 }
 
 /// 只认显式的真值，没设置一律按 false：限流用的客户端 IP 一旦信错来源，
@@ -78,6 +92,9 @@ impl Config {
             lfs_root: PathBuf::from(env_or("LFS_ROOT", "lfs")),
             git_root: PathBuf::from(env_or("GIT_ROOT", "git-objects")),
             git_object_backend: env_or("GIT_OBJECT_BACKEND", "pg"),
+            // 默认 5000 行起步：小仓库 offload 收益抵不过复杂度，大仓库才值得。
+            git_offload_min_objects: env_num("GIT_OFFLOAD_MIN_OBJECTS", 5000),
+            git_offload_interval_secs: env_num("GIT_OFFLOAD_INTERVAL_SECS", 3600),
             // SSH 不设默认值：不显式开启就不监听，行为与升级前完全一致。
             ssh_bind: std::env::var("SSH_BIND").ok().filter(|value| !value.trim().is_empty()),
             ssh_host_key: PathBuf::from(env_or("SSH_HOST_KEY", "ssh_host_ed25519_key")),

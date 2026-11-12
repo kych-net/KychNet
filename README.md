@@ -451,6 +451,7 @@ cd admin && pnpm install && cp .env.example .env && pnpm dev
    - **切换到 S3**:`kych-net db offload --project <slug>` 先把 PG 全量对象导出成一个全量 pack 并写好 `FULL` 标记(此时 PG 仍保留全量字节,是双写观察期);确认稳定后加 `--drop-cold`,只保留默认分支 tip 的单棵快照作热缓存,冷行删除后读路径自动回退到磁盘.模板浅克隆复制的正是 tip 快照,所以 `project.rs` 那套纯 SQL `INSERT ... SELECT` 无需改动.回滚把 pack 解回 PG 即可.
    - **全量 clone**:`FULL` 标记存在且请求是无 have / 无 shallow / 无 filter 的干净全量 clone 时,直接把磁盘 pack 字节发出,跳过对象图遍历与组包;ref 变更会清掉标记,增量 fetch 仍走 want/have 协商.
    - **必须 repack**:每次 push 写的 pack 自包含,OFS_DELTA 只能引用本 pack 内的偏移,历史版本链被切断后压缩率会持续退化(本地 1.4 万对象实测:1 个 pack 1.59 MiB,256 个 pack 5.08 MiB).低峰期跑 `kych-net db repack --project <slug>` 合并成单 pack;`--prune` 额外只保留 refs 可达对象(同样保护排队中的工作流快照).`db offload` / `db repack` 是低频运维命令,只提供英文形式.
+   - **自动 offload**:`GIT_OBJECT_BACKEND=disk` 时,serve 后台任务默认每小时扫描一次,PG 对象行数超过 `GIT_OFFLOAD_MIN_OBJECTS`(默认 5000,设 0 禁用)的项目自动执行 offload + 删冷行——大仓库的早期历史自动进磁盘,PG 只留默认分支 tip 热缓存,无需人工跑运维命令;扫描间隔可用 `GIT_OFFLOAD_INTERVAL_SECS` 调整.删行范围限定在本轮已写入磁盘 pack 的对象,与并发 push 无竞态.
    - 本地 `kych_test` 的 14,219 对象仓库实测:`.pack` 1,670,264 B + `.idx` 399,204 B = 1.974 MiB,PG 热缓存 143 行 0.500 MiB,**合计 2.474 MiB**,相比当前逐对象 zlib 的 9.03 MiB 省 72.6%;`git verify-pack` 校验通过,13,973 / 14,219 个对象编成 delta,抽查 200 个对象与 PG 逐字节一致.
    - 代价:磁盘成为对象字节的唯一副本,必须与 PG 在同一时间点备份;多实例部署需要共享磁盘或按 `project_id` 粘滞路由.单仓库不到几十 MiB 时不建议启用.
 

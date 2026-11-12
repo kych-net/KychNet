@@ -384,6 +384,22 @@ pub async fn serve(cfg: Config) -> Result<()> {
         tracing::warn!(%error, "OAuth 过期数据清理失败");
     }
 
+    // 磁盘对象后端开启时，把大仓库的早期历史定期自动 offload 到磁盘。
+    // 未开 disk 后端或门槛为 0 则什么都不做，行为与之前一致。
+    if cfg.git_object_backend.eq_ignore_ascii_case("disk") && cfg.git_offload_min_objects > 0 {
+        match crate::git::store::disk_store() {
+            Some(disk) => spawn_auto_offloader(
+                pool.clone(),
+                disk,
+                cfg.git_offload_min_objects,
+                cfg.git_offload_interval_secs,
+            ),
+            None => tracing::warn!(
+                "GIT_OBJECT_BACKEND=disk 但磁盘存储未初始化，自动 offload 不生效"
+            ),
+        }
+    }
+
     // Git over SSH：显式配置 SSH_BIND 才启动，独立端口监听，
     // 与系统 sshd（登录用）互不相干，也不需要系统账号。
     if let Some(bind) = cfg.ssh_bind.clone() {
@@ -708,6 +724,33 @@ fn spawn_flow_pruner(pool: PgPool) {
                 Ok(0) => {}
                 Ok(removed) => tracing::info!("清理过期认证流程 {removed} 条"),
                 Err(e) => tracing::warn!("清理过期认证流程失败: {e:#}"),
+            }
+        }
+    });
+}
+
+/// 定期把 PG 对象数超门槛的项目 offload 到磁盘。每轮先睡满间隔再扫，
+/// 启动阶段不抢资源。
+fn spawn_auto_offloader(
+    pool: PgPool,
+    disk: &'static crate::git::disk::DiskStore,
+    min_objects: usize,
+    interval_secs: u64,
+) {
+    tokio::spawn(async move {
+        let mut ticker =
+            tokio::time::interval(std::time::Duration::from_secs(interval_secs.max(60)));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // interval 第一次 tick 立即触发，这里跳过，让服务先稳定启动。
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            match crate::git::disk::auto_offload_sweep(&pool, disk, min_objects).await {
+                Ok(swept) if !swept.is_empty() => {
+                    tracing::info!("本轮自动 offload 处理了 {} 个大仓库", swept.len());
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!("自动 offload 扫描失败: {error:#}"),
             }
         }
     });
