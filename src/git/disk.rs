@@ -911,7 +911,7 @@ pub async fn offload(
     let written = all.len();
     // 在 `all` 被 move 进阻塞任务之前记下本轮导出的 oid 清单，删冷行时
     // 只允许删这份清单里的行。
-    let exported: Vec<Vec<u8>> = all.iter().map(|object| object.oid.clone()).collect();
+    let exported: Vec<Vec<u8>> = all.iter().map(|object| object.oid.as_bytes().to_vec()).collect();
     let disk = disk.clone();
     let project_id = project.id;
     tokio::task::spawn_blocking(move || disk.repack_from(project_id, all))
