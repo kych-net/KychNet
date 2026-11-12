@@ -317,13 +317,114 @@ const TEMPLATE_MAX_BYTES: usize = 64 * 1024 * 1024;
 ///
 /// 只走 tree/blob，不碰 commit：模板的提交历史属于模板自己，新项目只拿
 /// 最新文件快照（浅克隆 depth=1 的语义）。
-async fn copy_tree_snapshot(
+/// 模板快照里的 LFS 指针必须连同对象一起复制。pointer 本身只是文本 blob，
+/// 真正内容在 `lfs_objects` 索引 + `LFS_ROOT` 里**按项目隔离**；只搬 tree/blob
+/// 会让新项目 clone 后 `git lfs` 下载 404、checkout 直接失败。
+fn lfs_pointers_in_snapshot(objects: &[crate::git::object::Object]) -> Vec<String> {
+    use crate::git::object::ObjectKind;
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for object in objects {
+        if object.kind != ObjectKind::Blob || !lfs::is_pointer(&object.data) {
+            continue;
+        }
+        if let Some(oid) = lfs::pointer_oid(&object.data) {
+            if seen.insert(oid.clone()) {
+                out.push(oid);
+            }
+        }
+    }
+    out
+}
+
+/// 同步部分：把源项目的 LFS 文件硬链接到目标项目路径。
+/// 硬链接零拷贝；GC 按项目删除，一个项目删掉不会影响另一个项目的链接。
+/// 跨文件系统时硬链接可能失败，退回字节复制。
+/// 项目创建失败时清掉它的 LFS 目录。
+///
+/// 硬链接是文件系统操作，不受事务回滚约束；而 `GC` 只按 `lfs_objects`
+/// 索引行找文件，没有索引行的目录它看不见。项目 id 是新生成的 UUID，
+/// 整个目录只属于这个没落地的项目，直接删掉最干净。
+fn remove_project_lfs_dir(root: &Path, project_id: Uuid) {
+    let dir = root.join(project_id.to_string());
+    if dir.exists() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+fn link_lfs_files(root: &Path, source: Uuid, target: Uuid, oids: &[String]) -> Result<()> {
+    for oid in oids {
+        let from = lfs::object_path(root, source, oid);
+        let to = lfs::object_path(root, target, oid);
+        if to.exists() {
+            continue;
+        }
+        if !from.exists() {
+            bail!("模板的 LFS 内容缺失，无法创建完整快照: {oid}");
+        }
+        let parent = to.parent().context("LFS 目标路径没有父目录")?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("无法创建 LFS 目录: {}", parent.display()))?;
+        if std::fs::hard_link(&from, &to).is_err() {
+            std::fs::copy(&from, &to)
+                .with_context(|| format!("无法复制 LFS 文件: {}", from.display()))?;
+        }
+    }
+    Ok(())
+}
+
+async fn copy_lfs_objects(
     conn: &mut PgConnection,
+    root: &Path,
     source: Uuid,
     target: Uuid,
-    root: Oid,
+    oids: &[String],
+) -> Result<()> {
+    if oids.is_empty() {
+        return Ok(());
+    }
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT oid, size FROM lfs_objects WHERE project_id = $1 AND oid = ANY($2::text[])",
+    )
+    .bind(source)
+    .bind(oids.to_vec())
+    .fetch_all(&mut *conn)
+    .await?;
+    let sizes: HashMap<String, i64> = rows.into_iter().collect();
+    // 索引行缺失说明源项目的 LFS 对象还没上传，此时生成快照只会得到一个
+    // 永远拉不到内容的坏项目，不如直接拒绝。
+    if sizes.len() != oids.len() {
+        bail!("模板里有 LFS 对象尚未上传，无法创建完整快照");
+    }
+    let keys: Vec<String> = oids.to_vec();
+    let values: Vec<i64> = keys.iter().map(|oid| sizes[oid]).collect();
+    sqlx::query(
+        "INSERT INTO lfs_objects (project_id, oid, size)
+         SELECT $1, u.oid, u.size FROM unnest($2::text[], $3::bigint[]) AS u(oid, size)
+         ON CONFLICT (project_id, oid) DO NOTHING",
+    )
+    .bind(target)
+    .bind(keys)
+    .bind(values)
+    .execute(&mut *conn)
+    .await?;
+
+    let root = root.to_path_buf();
+    let oids = oids.to_vec();
+    tokio::task::spawn_blocking(move || link_lfs_files(&root, source, target, &oids))
+        .await
+        .context("复制模板 LFS 文件任务失败")??;
+    Ok(())
+}
+
+async fn copy_tree_snapshot(
+    conn: &mut PgConnection,
+    lfs_root: &Path,
+    source: Uuid,
+    target: Uuid,
+    tree_root: Oid,
 ) -> Result<usize> {
-    let mut stack = vec![root];
+    let mut stack = vec![tree_root];
     let mut seen = HashSet::new();
     let mut objects = 0usize;
     let mut bytes = 0usize;
@@ -356,11 +457,13 @@ async fn copy_tree_snapshot(
         }
         collected.push(object);
     }
+    let lfs_oids = lfs_pointers_in_snapshot(&collected);
     // 压缩与 OID 计算放到 blocking 线程，写库收敛为一次批量 INSERT。
     let prepared = tokio::task::spawn_blocking(move || store::prepare_objects(&collected))
         .await
         .context("模板对象压缩任务失败")??;
     store::insert_prepared(conn, target, &prepared).await?;
+    copy_lfs_objects(conn, lfs_root, source, target, &lfs_oids).await?;
     Ok(objects)
 }
 
@@ -369,6 +472,7 @@ async fn copy_tree_snapshot(
 /// 文件齐全、历史只有一条，不会引用模板里的提交对象。
 pub async fn create_project(
     pool: &PgPool,
+    lfs_root: &Path,
     user: &User,
     slug: &str,
     description: &str,
@@ -433,18 +537,34 @@ pub async fn create_project(
 
     match template {
         Some((source, root)) => {
-            copy_tree_snapshot(&mut *tx, source.id, project.id, root).await?;
-            // 提交信息里带上模板名，方便回溯来源；parent 留空即浅克隆。
-            commit_snapshot(
-                &mut tx,
+            let snapshot: Result<()> = match copy_tree_snapshot(
+                &mut *tx,
+                lfs_root,
+                source.id,
                 project.id,
-                user,
-                &project.default_branch,
-                None,
                 root,
-                &format!("从模板「{}」创建", source.slug),
             )
-            .await?;
+            .await
+            {
+                // 提交信息里带上模板名，方便回溯来源；parent 留空即浅克隆。
+                Ok(_) => commit_snapshot(
+                    &mut tx,
+                    project.id,
+                    user,
+                    &project.default_branch,
+                    None,
+                    root,
+                    &format!("从模板「{}」创建", source.slug),
+                )
+                .await
+                .map(|_| ()),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = snapshot {
+                // tx 随即 drop 回滚，但已经链接好的 LFS 文件要手工回收。
+                remove_project_lfs_dir(lfs_root, project.id);
+                return Err(error);
+            }
         }
         None => {
             let mut files = BTreeMap::new();
@@ -1525,6 +1645,77 @@ pub async fn commit_parent_chain(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lfs_pointers_are_collected_and_deduplicated() {
+        use crate::git::object::{Object, ObjectKind};
+        let oid = "b435436345666e81778e90daa2d85cd1a13a4a27543f764cc7ac8815dbab1801";
+        let pointer = format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{oid}\nsize 4286\n"
+        )
+        .into_bytes();
+        let objects = vec![
+            Object {
+                kind: ObjectKind::Blob,
+                data: b"# plain text\n".to_vec(),
+            },
+            Object {
+                kind: ObjectKind::Blob,
+                data: pointer.clone(),
+            },
+            Object {
+                kind: ObjectKind::Blob,
+                data: pointer.clone(),
+            },
+            // 非 blob 即使长得像 pointer 也不能算。
+            Object {
+                kind: ObjectKind::Commit,
+                data: pointer,
+            },
+        ];
+        assert_eq!(lfs_pointers_in_snapshot(&objects), vec![oid.to_string()]);
+        assert!(lfs_pointers_in_snapshot(&[]).is_empty());
+    }
+
+    #[test]
+    fn link_lfs_files_copies_content_and_is_idempotent() {
+        let oid = "b435436345666e81778e90daa2d85cd1a13a4a27543f764cc7ac8815dbab1801";
+        let base = std::env::temp_dir().join(format!("kychnet-lfs-{}", uuid::Uuid::new_v4()));
+        let source = uuid::Uuid::new_v4();
+        let target = uuid::Uuid::new_v4();
+        let from = lfs::object_path(&base, source, oid);
+        std::fs::create_dir_all(from.parent().unwrap()).unwrap();
+        std::fs::write(&from, b"binary payload").unwrap();
+
+        let oids = [oid.to_string()];
+        link_lfs_files(&base, source, target, &oids).unwrap();
+        let to = lfs::object_path(&base, target, oid);
+        assert_eq!(std::fs::read(&to).unwrap(), b"binary payload");
+        // 目标已存在时重复调用不能报错，也不能破坏内容。
+        link_lfs_files(&base, source, target, &oids).unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), b"binary payload");
+
+        let missing = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        assert!(link_lfs_files(&base, source, target, &[missing.to_string()]).is_err());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn failed_snapshot_cleans_up_lfs_dir() {
+        let base = std::env::temp_dir().join(format!("kychnet-lfs-clean-{}", uuid::Uuid::new_v4()));
+        let project = uuid::Uuid::new_v4();
+        let oid = "aabbaabbaabbaabbaabbaabbaabbaabbaabbaabbaabbaabbaabbaabbaabbaabb";
+        let file = lfs::object_path(&base, project, oid);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"orphan").unwrap();
+        assert!(file.exists());
+
+        remove_project_lfs_dir(&base, project);
+        assert!(!file.exists());
+        // 目录本来就不存在时也不能 panic。
+        remove_project_lfs_dir(&base, project);
+        std::fs::remove_dir_all(&base).ok();
+    }
 
     #[test]
     fn project_slug_allows_unicode_but_rejects_separators() {

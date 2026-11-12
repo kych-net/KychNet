@@ -1,11 +1,13 @@
 use anyhow::{bail, Context, Result};
 use sqlx::{PgConnection, PgPool};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use uuid::Uuid;
 
 use super::object::{
     commit_tree, ensure_text, parse_commit, Object, ObjectKind, Oid, Tree, TreeEntry,
 };
+use super::pack_cache;
 use super::proto;
 use super::store;
 use crate::models::User;
@@ -259,7 +261,7 @@ pub(crate) async fn compute_shallow(
     Ok((boundaries, unshallow, stop))
 }
 
-/// 收集 want 可达的对象。
+/// 增量组装 want 可达对象的 pack。
 ///
 /// - `exclude`：客户端已经拥有的对象，不发送也不继续遍历；
 /// - `shallow`：这些提交不再向父提交展开；
@@ -267,7 +269,11 @@ pub(crate) async fn compute_shallow(
 /// - `deepen`：本轮是加深请求。此时 `exclude` 中的提交是客户端已有的
 ///   通道（含旧浅边界），必须沿提交父链继续穿过它们才能走到新浅边界，
 ///   否则 unshallow 之后客户端向上遍历会因缺父对象而失败。
-async fn collect_objects(
+///
+/// 每批 512 个对象：只在 blocking 线程里解压需要解析的 commit/tree/tag，
+/// blob 直接把库里的 zlib 字节写进 pack。内存从「全部对象 + 完整 pack」
+/// 降到「一批对象 + 完整 pack」，并省掉全量的解压与二次压缩。
+async fn collect_pack(
     conn: &mut PgConnection,
     project_id: Uuid,
     wants: &[Oid],
@@ -275,13 +281,11 @@ async fn collect_objects(
     shallow: &HashSet<Oid>,
     filter_blob_none: bool,
     deepen: bool,
-) -> Result<Vec<(ObjectKind, Vec<u8>)>> {
+) -> Result<Vec<u8>> {
     let direct: HashSet<Oid> = wants.iter().copied().collect();
     let mut seen = HashSet::new();
-    let mut objects = Vec::new();
     let mut stack: Vec<Oid> = wants.to_vec();
-    // 按批拉取:每批 oid 一次 `ANY($2)` 查询,把原先每对象一行的
-    // 逐行 SELECT 收敛为常数次往返,对象数再多也不会线性放大延迟。
+    let mut builder = proto::PackBuilder::new();
     const BATCH: usize = 512;
     while !stack.is_empty() {
         let take = stack.len().min(BATCH);
@@ -299,55 +303,126 @@ async fn collect_objects(
                 fetch.push(oid);
             }
         }
-        let rows = store::get_objects(conn, project_id, &fetch).await?;
-        let mut found: HashMap<Oid, Object> = rows.into_iter().collect();
-        for oid in fetch {
-            let Some(object) = found.remove(&oid) else {
-                if exclude.contains(&oid) {
-                    continue;
-                }
-                bail!("请求的对象不存在: {oid}");
-            };
-            if exclude.contains(&oid) {
-                // 加深请求:已有对象本身不发送,只沿提交链向下走到新浅边界,
-                // 否则 unshallow 之后客户端向上遍历会因缺父对象而失败。
-                if object.kind == ObjectKind::Commit && !shallow.contains(&oid) {
-                    stack.extend(super::object::commit_parents(&object.data)?);
-                }
-                continue;
-            }
-            match object.kind {
-                ObjectKind::Commit => {
-                    stack.push(commit_tree(&object.data)?);
-                    if !shallow.contains(&oid) {
-                        stack.extend(super::object::commit_parents(&object.data)?);
+        if fetch.is_empty() {
+            continue;
+        }
+        let rows = store::get_objects_raw(conn, project_id, &fetch).await?;
+        let excluded = exclude.clone();
+        let shallow_set = shallow.clone();
+        let direct_set = direct.clone();
+        let (next_builder, children) = tokio::task::spawn_blocking(
+            move || -> Result<(proto::PackBuilder, Vec<Oid>)> {
+                let mut builder = builder;
+                let mut found: HashMap<Oid, store::StoredObject> =
+                    rows.into_iter().map(|row| (row.oid, row)).collect();
+                let mut children = Vec::new();
+                for oid in fetch {
+                    let Some(row) = found.remove(&oid) else {
+                        if excluded.contains(&oid) {
+                            continue;
+                        }
+                        bail!("请求的对象不存在: {oid}");
+                    };
+                    let is_excluded = excluded.contains(&oid);
+                    // blob 不参与遍历，也不需要解压；库里若是 zlib 流，
+                    // 直接写进 pack，省掉「解压 → 再压缩」两份 CPU。
+                    let parsed = match row.kind {
+                        ObjectKind::Commit | ObjectKind::Tree | ObjectKind::Tag => {
+                            Some(row.clone().into_object()?)
+                        }
+                        ObjectKind::Blob => None,
+                    };
+                    if is_excluded {
+                        // 加深请求:已有对象本身不发送,只沿提交链向下走到新浅边界。
+                        if let Some(object) = parsed.as_ref() {
+                            if object.kind == ObjectKind::Commit && !shallow_set.contains(&oid) {
+                                children.extend(super::object::commit_parents(&object.data)?);
+                            }
+                        }
+                        continue;
                     }
-                }
-                ObjectKind::Tree => {
-                    let tree = Tree::parse(&object.data)?;
-                    for entry in tree.entries.values() {
-                        match entry {
-                            TreeEntry::Blob(oid) | TreeEntry::Dir(oid) => stack.push(*oid),
-                            // gitlink 指向外部仓库的提交，对象库中不存在。
-                            TreeEntry::Gitlink(_) => {}
+                    if filter_blob_none
+                        && row.kind == ObjectKind::Blob
+                        && !direct_set.contains(&oid)
+                    {
+                        continue;
+                    }
+                    builder.push(
+                        row.kind,
+                        row.size.max(0) as usize,
+                        &row.data,
+                        row.compressed,
+                    );
+                    if let Some(object) = parsed.as_ref() {
+                        match object.kind {
+                            ObjectKind::Commit => {
+                                children.push(commit_tree(&object.data)?);
+                                if !shallow_set.contains(&oid) {
+                                    children.extend(super::object::commit_parents(&object.data)?);
+                                }
+                            }
+                            ObjectKind::Tree => {
+                                let tree = Tree::parse(&object.data)?;
+                                for entry in tree.entries.values() {
+                                    match entry {
+                                        TreeEntry::Blob(child) | TreeEntry::Dir(child) => {
+                                            children.push(*child)
+                                        }
+                                        // gitlink 指向外部仓库的提交，对象库中不存在。
+                                        TreeEntry::Gitlink(_) => {}
+                                    }
+                                }
+                            }
+                            ObjectKind::Tag => {
+                                if let Some(target) = tag_target(&object.data)? {
+                                    children.push(target);
+                                }
+                            }
+                            ObjectKind::Blob => {}
                         }
                     }
                 }
-                ObjectKind::Tag => {
-                    if let Some(target) = tag_target(&object.data)? {
-                        stack.push(target);
-                    }
-                }
-                ObjectKind::Blob => {
-                    if filter_blob_none && !direct.contains(&oid) {
-                        continue;
-                    }
-                }
-            }
-            objects.push((object.kind, object.data));
-        }
+                Ok((builder, children))
+            },
+        )
+        .await
+        .context("pack 构建任务失败")??;
+        builder = next_builder;
+        stack.extend(children);
     }
-    Ok(objects)
+    Ok(builder.finish())
+}
+
+/// 取回本次 fetch 要发送的 pack：命中缓存直接复用，否则实时组装并缓存。
+///
+/// 只缓存「无 have / 无 shallow / 无 filter 的全量 clone」（见
+/// `pack_cache::key_for`）；ref 一变就由 `store::set_ref` / `delete_ref` 失效。
+async fn fetch_pack(
+    conn: &mut PgConnection,
+    project: &Project,
+    request: &proto::UploadRequest,
+    exclude: &HashSet<Oid>,
+    shallow: &HashSet<Oid>,
+) -> Result<Arc<Vec<u8>>> {
+    let key = pack_cache::key_for(project.id, request);
+    if let Some(hit) = key.as_ref().and_then(pack_cache::get) {
+        return Ok(hit);
+    }
+    let pack = collect_pack(
+        conn,
+        project.id,
+        &request.wants,
+        exclude,
+        shallow,
+        request.filter_blob_none,
+        request.deepen.is_some(),
+    )
+    .await?;
+    let pack = Arc::new(pack);
+    if let Some(key) = key {
+        pack_cache::insert(key, pack.clone());
+    }
+    Ok(pack)
 }
 
 /// 计算客户端已有对象集合。
@@ -530,26 +605,12 @@ pub(crate) async fn upload_pack_request(
     }
 
     // `done` 轮:ACK/NAK 后紧跟 packfile。
-    let objects = collect_objects(
-        &mut conn,
-        project.id,
-        &request.wants,
-        &exclude,
-        &shallow,
-        request.filter_blob_none,
-        request.deepen.is_some(),
-    )
-    .await?;
+    let pack = fetch_pack(&mut conn, project, request, &exclude, &shallow).await?;
     match common.last() {
         Some(oid) => out.extend(proto::pkt_str(&format!("ACK {}\n", oid.to_hex()))),
         None => out.extend(proto::pkt_str("NAK\n")),
     }
-    // pack 组装是同步 CPU（逐对象 zlib），放到 blocking 线程池，
-    // 免得大仓库 clone 卡住 tokio worker。
-    let pack = tokio::task::spawn_blocking(move || proto::build_pack(&objects))
-        .await
-        .context("pack 组装任务失败")?;
-    out.extend(pack);
+    out.extend_from_slice(&pack);
     Ok(out)
 }
 
@@ -670,21 +731,7 @@ async fn v2_fetch(conn: &mut PgConnection, project: &Project, args: &[String]) -
         return Ok(out);
     }
 
-    let objects = collect_objects(
-        conn,
-        project.id,
-        &request.wants,
-        &exclude,
-        &shallow,
-        request.filter_blob_none,
-        request.deepen.is_some(),
-    )
-    .await?;
-
-    // 同步 CPU 的 pack 组装放到 blocking 线程池，与 v0 路径保持一致。
-    let pack = tokio::task::spawn_blocking(move || proto::build_pack(&objects))
-        .await
-        .context("pack 组装任务失败")?;
+    let pack = fetch_pack(conn, project, &request, &exclude, &shallow).await?;
 
     // packfile 段：ready 与 done 两条路径共用（v2 规范要求 ready 之后
     // 必须紧跟 delim 并在同一响应里带上 shallow-info / packfile 段，
@@ -701,7 +748,7 @@ async fn v2_fetch(conn: &mut PgConnection, project: &Project, args: &[String]) -
             out.extend(proto::delim());
         }
         out.extend(proto::pkt_str("packfile\n"));
-        out.extend(sideband_pack(&pack));
+        out.extend(sideband_pack(pack.as_slice()));
     };
 
     if !request.done {
@@ -759,16 +806,22 @@ async fn prepare_receive_pack(
         .await
         .context("pack 解析任务失败")??;
 
-    // REF delta 的 base 可能已在库里；用独立只读连接取，不占写事务。
+    // REF delta 的 base 可能已在库里；去重后一次批量取，不占写事务。
+    let bases: Vec<Oid> = raw
+        .entries
+        .iter()
+        .filter_map(|entry| match entry {
+            proto::RawEntry::RefDelta { base, .. } => Some(*base),
+            _ => None,
+        })
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
     let mut external = HashMap::new();
-    {
+    if !bases.is_empty() {
         let mut conn = pool.acquire().await?;
-        for entry in &raw.entries {
-            if let proto::RawEntry::RefDelta { base, .. } = entry {
-                if let Some(object) = store::get_object(&mut conn, project_id, *base).await? {
-                    external.insert(*base, (object.kind, object.data));
-                }
-            }
+        for (oid, object) in store::get_objects(&mut conn, project_id, &bases).await? {
+            external.insert(oid, (object.kind, object.data));
         }
     }
 
@@ -799,24 +852,42 @@ async fn is_ancestor(
     ancestor: Oid,
     descendant: Oid,
 ) -> Result<bool> {
+    // 沿父链按批取 commit，替代过去「每个提交一次 SELECT」的线性往返。
+    // 祖先关系仍走 git_objects 权威数据，不依赖提交索引表是否完整。
+    const BATCH: usize = 256;
     let mut seen = HashSet::new();
     let mut stack = vec![descendant];
-    while let Some(oid) = stack.pop() {
-        if oid == ancestor {
-            return Ok(true);
+    while !stack.is_empty() {
+        let take = stack.len().min(BATCH);
+        let candidates: Vec<Oid> = stack.drain(stack.len() - take..).collect();
+        let mut fetch = Vec::with_capacity(candidates.len());
+        for oid in candidates {
+            if oid == ancestor {
+                return Ok(true);
+            }
+            if seen.len() >= MAX_COMMIT_WALK {
+                bail!("提交历史过深，暂时无法校验快进关系");
+            }
+            if seen.insert(oid) {
+                fetch.push(oid);
+            }
         }
-        if seen.len() >= MAX_COMMIT_WALK {
-            bail!("提交历史过深，暂时无法校验快进关系");
-        }
-        if !seen.insert(oid) {
+        if fetch.is_empty() {
             continue;
         }
-        let object = store::require_object(conn, project_id, oid).await?;
-        if object.kind != ObjectKind::Commit {
-            continue;
-        }
-        for parent in super::object::commit_parents(&object.data)? {
-            stack.push(parent);
+        let found: HashMap<Oid, Object> = store::get_objects(conn, project_id, &fetch)
+            .await?
+            .into_iter()
+            .collect();
+        for oid in fetch {
+            let Some(object) = found.get(&oid) else {
+                // 与 require_object 保持同样的报错语义。
+                bail!("Git 对象不存在: {oid}");
+            };
+            if object.kind != ObjectKind::Commit {
+                continue;
+            }
+            stack.extend(super::object::commit_parents(&object.data)?);
         }
     }
     Ok(false)

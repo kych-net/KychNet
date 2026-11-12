@@ -395,7 +395,7 @@ access token 一小时内自然过期；refresh token 最长 30 天。数据库�
 - 管理端「项目」页可以从外部仓库克隆导入:填仓库地址(可自动带出项目名)、描述与可选分支,服务端走 Git smart HTTP v0 拉全量 pack,对象、分支与提交历史一并落库,不依赖系统 git 或 libgit2;
 - 导入只接受 http/https 公开仓库,地址里不能带账号密码、查询串或锚点;目标必须是公网地址,禁止重定向(避免 SSRF 与 302 绕过校验),内网自建 Git 服务器需显式设置 `KYCHNET_IMPORT_ALLOW_PRIVATE=1`;
 - 导入上限:30 个分支、10 万个对象、5000 个提交、单个 pack 128 MiB,按用户与 IP 各限流 5 次 / 10 分钟;历史里含二进制文件的仓库会被拒(站内 Git 只存 UTF-8 文本),校验在写库前完成,失败不留半个项目;
-- 创建项目时可选一个站内项目作为模板:新项目按浅克隆语义只复制模板默认分支的最新文件快照,并生成一条无父提交(提交信息记「从模板「x」创建」),不携带模板的提交历史;默认分支名沿用模板,模板已归档或尚无提交时拒绝创建;
+- 创建项目时可选一个站内项目作为模板:新项目按浅克隆语义只复制模板默认分支的最新文件快照,并生成一条无父提交(提交信息记「从模板「x」创建」),不携带模板的提交历史;默认分支名沿用模板,模板已归档或尚无提交时拒绝创建;模板里的 LFS 指针会连同 `lfs_objects` 索引与内容一起复制,内容用硬链接零拷贝共享(跨文件系统退回字节复制),两个项目各自持有链接,删除其一不影响另一个;模板缺 LFS 内容时直接拒绝创建,创建失败会清掉已链接的文件,不留孤立目录;
 - 已知限制:协议 v0 浅克隆(`--depth`)修复待 PR 发布,命令行 git 与 v2 客户端不受影响;
 - 迁移 `0009_projects` / `0010_lfs` 创建项目、对象、refs、commits、PR、讨论与 LFS 索引;
 - `kych-net gc --project <slug>` 清理不可达对象。
@@ -444,6 +444,8 @@ cd admin && pnpm install && cp .env.example .env && pnpm dev
 3. 内容站产物 `dist/` 与管理端产物由源站 nginx 直接托管:前者在 `eo.kych.net/`,后者在 `eo.kych.net/管理/`(见 [deploy/README.md](deploy/README.md)).EdgeOne 只做加速回源,不再依赖 Pages.
 4. 服务器 nginx 把 `/api/`、`/git/`、`/mcp` 等后端路径反代到 `127.0.0.1:8080`;回源时 `SNI` 固定为 `kych.net`、`Host` 为 `eo.kych.net`,所以复用主域证书.
 5. 项目 Git 对象存 PostgreSQL,LFS 文件存 `LFS_ROOT`;systemd 需要该目录的写权限.对象内容按 zlib 压缩后入库(不足 256 字节或压不动的存原样),`size` 列记原始长度;历史对象用 `kych-net db compress` 补齐压缩,可重复执行.迁移 `0020` 把 `git_objects.data` 设为 `STORAGE EXTERNAL`:保留行外存储,关掉 PostgreSQL 对已压缩 bytea 的 pglz 二次压缩;只影响新写入或被重写的行,需要一次性重写可执行 `VACUUM FULL git_objects`.push、导入与模板复制都把 pack 解析/组装、delta 还原与压缩挪到写事务外(CPU 密集部分走 `spawn_blocking`),事务内只做一次批量 INSERT,持锁时间不再随对象数线性增长.
+6. upload-pack 按 512 个对象一批增量组包:`PackBuilder` 直接把库里已压缩的 zlib 字节写进 pack,blob 不再解压 / 二次压缩,commit、tree、tag 的解析与组包放到 `spawn_blocking`;内存从「全部对象 + 完整 pack」降到「一批对象 + 完整 pack」.祖先快进校验与 REF_DELTA 基准查询也由逐条 SELECT 改为批量取.
+7. 全量 clone 的 pack 结果按「项目 + want 集合」缓存在进程内(上限 64 MiB,按插入顺序淘汰).只缓存无 have / 无 shallow / 无 filter 的干净全量 clone,增量 fetch 与浅克隆仍实时组装;ref 变更时 `store::set_ref` / `delete_ref` 立即失效该项目缓存.Git 对象按内容寻址,缓存里的 pack 内容不会陈旧,失效主要用于控制内存;缓存是进程内的,多实例部署各自持有一份.本地 1.4 万对象仓库实测:全量 clone 冷启动约 2.0 s、缓存命中约 0.25 s.
 
 ## 约定
 
