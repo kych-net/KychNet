@@ -4,7 +4,10 @@ use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use sqlx::{PgConnection, PgPool, Row};
+use std::collections::HashSet;
 use std::io::{Read, Write};
+use std::path::PathBuf;
+use std::sync::OnceLock;
 use uuid::Uuid;
 
 use super::object::{Object, ObjectKind, Oid};
@@ -12,6 +15,18 @@ use super::object::{Object, ObjectKind, Oid};
 /// 小于这个字节数就不压缩：zlib 的头尾开销约 11 字节，
 /// 小对象压完往往更大，反而多一次解压。
 const COMPRESS_MIN_BYTES: usize = 256;
+
+/// S3 磁盘对象存储。只有显式设置 `GIT_OBJECT_BACKEND=disk` 才初始化；
+/// 未初始化时所有读写路径行为与升级前完全一致，PR 可以零风险回滚。
+static DISK: OnceLock<super::disk::DiskStore> = OnceLock::new();
+
+pub fn init_disk_store(root: impl Into<PathBuf>) -> &'static super::disk::DiskStore {
+    DISK.get_or_init(|| super::disk::DiskStore::new(root))
+}
+
+pub fn disk_store() -> Option<&'static super::disk::DiskStore> {
+    DISK.get()
+}
 
 /// 按需压缩对象内容。返回 None 表示不该压缩（太小或压不动）。
 fn compress_blob(data: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -29,7 +44,7 @@ fn compress_blob(data: &[u8]) -> Result<Option<Vec<u8>>> {
 }
 
 /// 解开 zlib 流。`size` 是原始大小，用来预分配并顺带校验。
-fn decompress_blob(data: &[u8], size: i64) -> Result<Vec<u8>> {
+pub(crate) fn decompress_blob(data: &[u8], size: i64) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(size.max(0) as usize);
     ZlibDecoder::new(data)
         .read_to_end(&mut out)
@@ -85,6 +100,16 @@ pub async fn insert_prepared(
     if rows.is_empty() {
         return Ok(());
     }
+    // 磁盘权威模式：对象字节先落盘（原子 rename），再进 PG 事务。
+    // 顺序不能反——PG 提交成功而磁盘没落稳会产生无法恢复的悬空引用；
+    // 反过来只会留下不可达的孤儿 pack，repack 即可清掉。
+    // 未启用磁盘时这段完全跳过，行为与升级前一致。
+    if let Some(disk) = disk_store() {
+        let objects = super::disk::objects_from_prepared(rows)?;
+        tokio::task::spawn_blocking(move || disk.write_pack(project_id, &objects, false))
+            .await
+            .context("写入磁盘 Git 对象失败")??;
+    }
     let oids: Vec<Vec<u8>> = rows.iter().map(|r| r.oid.clone()).collect();
     let kinds: Vec<i16> = rows.iter().map(|r| r.kind).collect();
     let sizes: Vec<i64> = rows.iter().map(|r| r.size).collect();
@@ -130,7 +155,7 @@ pub async fn get_object(
     .fetch_optional(conn)
     .await?;
     let Some(row) = row else {
-        return Ok(None);
+        return disk_get_one(project_id, oid).await;
     };
     let kind: i16 = row.try_get("kind")?;
     let size: i64 = row.try_get("size")?;
@@ -144,6 +169,17 @@ pub async fn get_object(
         raw
     };
     Ok(Some(Object { kind, data }))
+}
+
+/// PG 未命中时回退到磁盘 pack。对象不可变、oid 即内容哈希，
+/// 所以缓存不需要失效协议，只可能被淘汰。
+async fn disk_get_one(project_id: Uuid, oid: Oid) -> Result<Option<Object>> {
+    let Some(disk) = disk_store() else {
+        return Ok(None);
+    };
+    tokio::task::spawn_blocking(move || disk.get(project_id, &oid))
+        .await
+        .context("读取磁盘 Git 对象失败")?
 }
 
 pub async fn require_object(
@@ -200,12 +236,14 @@ pub async fn get_objects_raw(
     .fetch_all(conn)
     .await?;
     let mut out = Vec::with_capacity(rows.len());
+    let mut found = HashSet::with_capacity(rows.len());
     for row in rows {
         let raw: Vec<u8> = row.try_get("oid")?;
         let oid = Oid::from_slice(&raw)?;
         let kind: i16 = row.try_get("kind")?;
         let kind = ObjectKind::from_i16(kind)
             .ok_or_else(|| anyhow::anyhow!("未知的 Git 对象类型: {kind}"))?;
+        found.insert(oid);
         out.push(StoredObject {
             oid,
             kind,
@@ -213,6 +251,30 @@ pub async fn get_objects_raw(
             data: row.try_get("data")?,
             compressed: row.try_get("compressed")?,
         });
+    }
+    // 冷行被 offload 删掉后会在这里 miss。磁盘对象还原后是原文，
+    // 以 compressed=false 交给 PackBuilder 重新压缩——正确性优先，
+    // 冷路径这点 CPU 换来的是热路径完全不用改。
+    if found.len() < oids.len() {
+        if let Some(disk) = disk_store() {
+            let missing: Vec<Oid> = oids
+                .iter()
+                .copied()
+                .filter(|oid| !found.contains(oid))
+                .collect();
+            let got = tokio::task::spawn_blocking(move || disk.get_many(project_id, &missing))
+                .await
+                .context("批量读取磁盘 Git 对象失败")??;
+            for (oid, object) in got {
+                out.push(StoredObject {
+                    oid,
+                    kind: object.kind,
+                    size: object.data.len() as i64,
+                    data: object.data,
+                    compressed: false,
+                });
+            }
+        }
     }
     Ok(out)
 }
@@ -329,8 +391,11 @@ pub async fn set_ref(
     .bind(&target.as_bytes()[..])
     .execute(conn)
     .await?;
-    // ref 变了，该项目的全量 clone pack 缓存必须作废。
+    // ref 变了，该项目的全量 clone pack 缓存与磁盘全量快照标记都要作废。
     super::pack_cache::invalidate_project(project_id);
+    if let Some(disk) = disk_store() {
+        disk.clear_full(project_id)?;
+    }
     Ok(())
 }
 
@@ -345,6 +410,9 @@ pub async fn delete_ref(
         .execute(conn)
         .await?;
     super::pack_cache::invalidate_project(project_id);
+    if let Some(disk) = disk_store() {
+        disk.clear_full(project_id)?;
+    }
     Ok(())
 }
 

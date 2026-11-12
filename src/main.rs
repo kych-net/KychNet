@@ -83,6 +83,24 @@ enum DbCommand {
     Migrate,
     /// 把历史遗留的未压缩 Git 对象压成 zlib（可重复执行）
     Compress,
+    /// 把项目对象导出成磁盘全量 pack（需 GIT_OBJECT_BACKEND=disk）
+    Offload {
+        /// 项目名（slug）
+        #[arg(long)]
+        project: String,
+        /// 删掉冷行，让 PG 只留默认分支 tip 快照作热缓存
+        #[arg(long)]
+        drop_cold: bool,
+    },
+    /// 把项目的磁盘 pack 合并成一个，重做全局 delta
+    Repack {
+        /// 项目名（slug）
+        #[arg(long)]
+        project: String,
+        /// 只保留 refs 可达的对象
+        #[arg(long)]
+        prune: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -204,6 +222,20 @@ async fn main() -> Result<()> {
     };
 
     let cfg = Config::from_env()?;
+    // 磁盘对象存储是显式开关：不设置时全局 OnceLock 为空，所有读写路径
+    // 都与升级前完全一致，线上可以随时回退到纯 PG。
+    if cfg.git_object_backend.eq_ignore_ascii_case("disk") {
+        let store = git::store::init_disk_store(cfg.git_root.clone());
+        tracing::info!(
+            root = %store.root().display(),
+            "已启用磁盘 Git 对象存储（packfile + idx v2）"
+        );
+    } else if !cfg.git_object_backend.eq_ignore_ascii_case("pg") {
+        anyhow::bail!(
+            "GIT_OBJECT_BACKEND 只支持 pg 或 disk，当前为 {}",
+            cfg.git_object_backend
+        );
+    }
 
     match cli.command {
         Command::Serve => api::serve(cfg).await,
@@ -222,6 +254,53 @@ async fn main() -> Result<()> {
                     let (done, skipped) =
                         crate::git::store::compress_existing_objects(&pool).await?;
                     println!("已压缩 {done} 个 Git 对象，{skipped} 个太小或压不动，保持原样");
+                    Ok(())
+                }
+                DbCommand::Offload { project, drop_cold } => {
+                    let disk = git::store::disk_store()
+                        .context("需设置 GIT_OBJECT_BACKEND=disk 才能 offload")?;
+                    let project = project::find_project_by_slug(&pool, &project)
+                        .await?
+                        .context("项目不存在")?;
+                    let stats = git::disk::offload(&pool, &project, disk, drop_cold).await?;
+                    println!(
+                        "已导出 {} 个对象到磁盘全量 pack；PG 保留热集 {} 个，删除冷行 {} 个",
+                        stats.objects_written, stats.hot_kept, stats.cold_dropped
+                    );
+                    if !drop_cold {
+                        println!(
+                            "提示：PG 仍保留全量字节（双写观察期）。确认稳定后加 --drop-cold 才真正切到 S3"
+                        );
+                    }
+                    Ok(())
+                }
+                DbCommand::Repack { project, prune } => {
+                    let disk = git::store::disk_store()
+                        .context("需设置 GIT_OBJECT_BACKEND=disk 才能 repack")?;
+                    let project = project::find_project_by_slug(&pool, &project)
+                        .await?
+                        .context("项目不存在")?;
+                    // prune 时也保护排队中的工作流快照，与 gc 的口径一致。
+                    let keep = if prune {
+                        let pending = workflow::dispatch::pending_commits(&pool)
+                            .await?
+                            .into_iter()
+                            .filter_map(|bytes| git::object::Oid::from_slice(&bytes).ok())
+                            .collect();
+                        Some(
+                            git::gc::mark_reachable(&pool, project.id, pending)
+                                .await?
+                                .0,
+                        )
+                    } else {
+                        None
+                    };
+                    let project_id = project.id;
+                    let count =
+                        tokio::task::spawn_blocking(move || disk.repack(project_id, keep.as_ref()))
+                            .await
+                            .context("repack 任务失败")??;
+                    println!("已合并为 1 个 pack，保留 {count} 个对象");
                     Ok(())
                 }
             }
