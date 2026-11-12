@@ -547,7 +547,7 @@ pub fn dispatch(args: &[String]) -> Result<Dispatch, String> {
 
     if g.version {
         return Ok(Dispatch::Print(format!(
-            "{} {} （KychNet 站点后端与管理命令行）",
+            "{} {} （站点后端与管理命令行）",
             NAME, VERSION
         )));
     }
@@ -570,7 +570,7 @@ pub fn dispatch(args: &[String]) -> Result<Dispatch, String> {
 
 pub fn help_text() -> String {
     let mut out = String::new();
-    out.push_str(&title(&format!("{} {} — KychNet 命令行", NAME, VERSION)));
+    out.push_str(&title(&format!("{} {} — 命令行", NAME, VERSION)));
     out.push('\n');
     out.push_str("中文命令连写、不加空格：动词在前、定语前置、所属用「的」、数量用中文数量词。\n");
     out.push_str("同一个二进制同时支持中文与英文命令。\n\n");

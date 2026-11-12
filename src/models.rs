@@ -81,8 +81,14 @@ impl SiteSettings {
 impl Default for SiteSettings {
     fn default() -> Self {
         Self {
-            site_name: "KychNet".into(),
-            description: "KychNet 个人站点".into(),
+            // 首次建站、还没有保存过设置时的兜底值；可被 SITE_NAME /
+            // SITE_DESCRIPTION env 覆盖，避免品牌名写死在代码里。
+            site_name: std::env::var("SITE_NAME")
+                .unwrap_or_else(|_| "个人站点".to_string())
+                .into(),
+            description: std::env::var("SITE_DESCRIPTION")
+                .unwrap_or_else(|_| "个人站点".to_string())
+                .into(),
             logo_url: String::new(),
             nav: vec![
                 NavLink {

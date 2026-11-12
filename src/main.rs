@@ -29,7 +29,7 @@ use config::Config;
 /// 中文命令先经 `cli_cn` 翻译成英文参数，再交给同一个 clap 解析器，
 /// 因此中英文共用同一条执行路径与同一个 service 层。
 #[derive(Parser)]
-#[command(name = "kych-net", version, about = "KychNet 站点后端与管理 CLI")]
+#[command(name = "kych-net", version, about = "站点后端与管理 CLI")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
