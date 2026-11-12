@@ -7,9 +7,10 @@ const ProfileView = lazy(() => import("../views/ProfileView").then((module) => (
 const ProjectsView = lazy(() => import("../views/ProjectsView").then((module) => ({ default: module.ProjectsView })));
 const SettingsView = lazy(() => import("../views/SettingsView").then((module) => ({ default: module.SettingsView })));
 const RunnersView = lazy(() => import("../views/RunnersView").then((module) => ({ default: module.RunnersView })));
+const ResourcesView = lazy(() => import("../views/ResourcesView").then((module) => ({ default: module.ResourcesView })));
 const UsersView = lazy(() => import("../views/UsersView").then((module) => ({ default: module.UsersView })));
 
-type View = "contents" | "projects" | "runners" | "invites" | "users" | "settings" | "profile";
+type View = "contents" | "projects" | "runners" | "invites" | "users" | "settings" | "profile" | "system";
 
 type Props = {
   user: User;
@@ -23,7 +24,7 @@ type Props = {
   onLogout: () => void;
 };
 
-const adminViews: View[] = ["runners", "invites", "users", "settings"];
+const adminViews: View[] = ["runners", "invites", "users", "settings", "system"];
 
 const viewMeta: Record<View, { title: string; subtitle: string }> = {
   contents: { title: "内容", subtitle: "维护页面、样式与发布状态" },
@@ -33,6 +34,7 @@ const viewMeta: Record<View, { title: string; subtitle: string }> = {
   users: { title: "用户", subtitle: "账号状态与权限" },
   settings: { title: "站点设置", subtitle: "站点信息、导航与发布" },
   profile: { title: "个人资料", subtitle: "头像、Git 令牌与安全设置" },
+  system: { title: "资源监控", subtitle: "负载、内存、磁盘与存储占用" },
 };
 
 export function Shell({
@@ -162,6 +164,7 @@ export function Shell({
         {view === "invites" && user.is_admin && <InvitesView />}
         {view === "users" && user.is_admin && <UsersView />}
         {view === "settings" && user.is_admin && <SettingsView />}
+        {view === "system" && user.is_admin && <ResourcesView />}
         {view === "profile" && (
           <ProfileView
             user={user}

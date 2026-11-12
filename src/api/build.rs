@@ -46,6 +46,11 @@ impl BuildCtl {
         }
     }
 
+    /// 产物目录路径，资源监控用来读磁盘占用。
+    pub(crate) fn out_dir(&self) -> &PathBuf {
+        &self.out_dir
+    }
+
     /// 管理端保存内容后自动编译这一页。
     ///
     /// 仍走独立子进程，避免 Typst 渲染污染常驻进程；`old` 是改路径前的旧 slug，
