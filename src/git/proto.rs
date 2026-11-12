@@ -280,7 +280,7 @@ pub fn parse_pkt_lines(data: &[u8]) -> Result<(Vec<Vec<u8>>, usize)> {
 }
 
 /// 解压一段 zlib 数据，返回解压结果与消耗的压缩字节数。
-fn inflate(data: &[u8], expected: usize) -> Result<(Vec<u8>, usize)> {
+pub(crate) fn inflate(data: &[u8], expected: usize) -> Result<(Vec<u8>, usize)> {
     let mut out = vec![0u8; expected.max(1)];
     let mut decoder = Decompress::new(true);
     loop {
@@ -306,7 +306,7 @@ fn inflate(data: &[u8], expected: usize) -> Result<(Vec<u8>, usize)> {
     Ok((out, decoder.total_in() as usize))
 }
 
-fn read_object_header(data: &[u8], mut pos: usize) -> Result<(u8, usize, usize)> {
+pub(crate) fn read_object_header(data: &[u8], mut pos: usize) -> Result<(u8, usize, usize)> {
     let first = *data
         .get(pos)
         .ok_or_else(|| anyhow::anyhow!("pack 对象头被截断"))?;
@@ -330,7 +330,7 @@ fn read_object_header(data: &[u8], mut pos: usize) -> Result<(u8, usize, usize)>
 }
 
 /// OFS_DELTA 的负偏移采用 Git 特有的变长编码。
-fn read_ofs_offset(data: &[u8], mut pos: usize, object_offset: usize) -> Result<(usize, usize)> {
+pub(crate) fn read_ofs_offset(data: &[u8], mut pos: usize, object_offset: usize) -> Result<(usize, usize)> {
     let mut byte = *data
         .get(pos)
         .ok_or_else(|| anyhow::anyhow!("OFS_DELTA 偏移被截断"))?;
@@ -442,7 +442,7 @@ pub fn parse_pack(data: &[u8]) -> Result<RawPack> {
     Ok(RawPack { entries })
 }
 
-fn read_varint(data: &[u8], mut pos: usize) -> Result<(usize, usize)> {
+pub(crate) fn read_varint(data: &[u8], mut pos: usize) -> Result<(usize, usize)> {
     let mut value = 0usize;
     let mut shift = 0u32;
     loop {
@@ -461,7 +461,7 @@ fn read_varint(data: &[u8], mut pos: usize) -> Result<(usize, usize)> {
     }
 }
 
-fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
     let (base_size, mut pos) = read_varint(delta, 0)?;
     if base_size != base.len() {
         bail!("delta 基准长度不匹配");

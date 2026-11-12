@@ -16,7 +16,7 @@ pub struct GcStats {
 }
 
 /// 从所有引用出发标记可达对象。
-async fn mark_reachable(
+pub(crate) async fn mark_reachable(
     pool: &PgPool,
     project_id: uuid::Uuid,
     extra: Vec<Oid>,

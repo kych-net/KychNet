@@ -21,6 +21,11 @@ pub struct Config {
     pub trust_proxy_headers: bool,
     /// Git LFS 二进制对象的落盘根目录。
     pub lfs_root: PathBuf,
+    /// S3 磁盘 Git 对象的根目录（packfile + `.idx`）。只有
+    /// `GIT_OBJECT_BACKEND=disk` 时才会用到，默认与升级前行为一致。
+    pub git_root: PathBuf,
+    /// Git 对象后端：`pg`（默认，PG 唯一权威）或 `disk`（双写 + 可 offload）。
+    pub git_object_backend: String,
     /// Git over SSH 服务监听地址（如 `0.0.0.0:2222`）；未设置则不启动 SSH 服务。
     pub ssh_bind: Option<String>,
     /// SSH 主机私钥文件路径，首次启动自动生成。
@@ -71,6 +76,8 @@ impl Config {
             build_out_dir: PathBuf::from(env_or("BUILD_OUT_DIR", "dist")),
             trust_proxy_headers: env_flag("TRUST_PROXY_HEADERS"),
             lfs_root: PathBuf::from(env_or("LFS_ROOT", "lfs")),
+            git_root: PathBuf::from(env_or("GIT_ROOT", "git-objects")),
+            git_object_backend: env_or("GIT_OBJECT_BACKEND", "pg"),
             // SSH 不设默认值：不显式开启就不监听，行为与升级前完全一致。
             ssh_bind: std::env::var("SSH_BIND").ok().filter(|value| !value.trim().is_empty()),
             ssh_host_key: PathBuf::from(env_or("SSH_HOST_KEY", "ssh_host_ed25519_key")),

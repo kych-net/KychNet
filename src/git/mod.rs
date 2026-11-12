@@ -1,3 +1,4 @@
+pub mod disk;
 pub mod fetch;
 pub mod gc;
 pub mod http;

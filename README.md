@@ -446,6 +446,13 @@ cd admin && pnpm install && cp .env.example .env && pnpm dev
 5. 项目 Git 对象存 PostgreSQL,LFS 文件存 `LFS_ROOT`;systemd 需要该目录的写权限.对象内容按 zlib 压缩后入库(不足 256 字节或压不动的存原样),`size` 列记原始长度;历史对象用 `kych-net db compress` 补齐压缩,可重复执行.迁移 `0020` 把 `git_objects.data` 设为 `STORAGE EXTERNAL`:保留行外存储,关掉 PostgreSQL 对已压缩 bytea 的 pglz 二次压缩;只影响新写入或被重写的行,需要一次性重写可执行 `VACUUM FULL git_objects`.push、导入与模板复制都把 pack 解析/组装、delta 还原与压缩挪到写事务外(CPU 密集部分走 `spawn_blocking`),事务内只做一次批量 INSERT,持锁时间不再随对象数线性增长.`kych-net db compress` 同样按 `(project_id, oid)` 游标分页、每批 500 行一次 `unnest` 批量 UPDATE,并在 SQL 层滤掉不足 256 字节的行,重复执行不再反复扫描小对象;批量 UPDATE 会留下 TOAST 死元组,需在运维窗口执行 `VACUUM FULL git_objects` 才能回收磁盘空间(会锁表),命令输出会给出提示.
 6. upload-pack 按 512 个对象一批增量组包:`PackBuilder` 直接把库里已压缩的 zlib 字节写进 pack,blob 不再解压 / 二次压缩,commit、tree、tag 的解析与组包放到 `spawn_blocking`;内存从「全部对象 + 完整 pack」降到「一批对象 + 完整 pack」.祖先快进校验与 REF_DELTA 基准查询也由逐条 SELECT 改为批量取.
 7. 全量 clone 的 pack 结果按「项目 + want 集合」缓存在进程内(上限 64 MiB,按插入顺序淘汰).只缓存无 have / 无 shallow / 无 filter 的干净全量 clone,增量 fetch 与浅克隆仍实时组装;ref 变更时 `store::set_ref` / `delete_ref` 立即失效该项目缓存.Git 对象按内容寻址,缓存里的 pack 内容不会陈旧,失效主要用于控制内存;缓存是进程内的,多实例部署各自持有一份.本地 1.4 万对象仓库实测:全量 clone 冷启动约 2.0 s、缓存命中约 0.25 s.
+8. 可选的**磁盘 Git 对象后端**:默认 `GIT_OBJECT_BACKEND=pg`,行为与升级前完全一致,不产生任何磁盘目录.显式设为 `disk` 并配置 `GIT_ROOT` 后,push / 导入 / 模板复制会**双写**——PG 保留 `git_objects` 行,同时把对象编成标准 packfile v2 + `.idx` v2 落到 `$GIT_ROOT/<project_id>/objects/pack/`.格式与 Git 完全兼容(`git verify-pack` / `git cat-file` / `git fsck` 可直接读),跨版本冗余用自研 OFS_DELTA 差掉(窗口 50、最大链深 50).
+   - **一致性顺序**:磁盘 pack 原子落盘 → PG 事务提交 refs / 元数据.PG 失败只会留下不可达的孤儿 pack(repack 可清),反过来会产生无法恢复的悬空引用.写路径全部收敛在 `store::insert_prepared`,读路径收敛在 `get_object` / `get_objects_raw` 的 miss 回退;refs、提交索引、PR 等元数据始终留在 PG 作唯一权威,`pg_advisory_xact_lock` 不变.
+   - **切换到 S3**:`kych-net db offload --project <slug>` 先把 PG 全量对象导出成一个全量 pack 并写好 `FULL` 标记(此时 PG 仍保留全量字节,是双写观察期);确认稳定后加 `--drop-cold`,只保留默认分支 tip 的单棵快照作热缓存,冷行删除后读路径自动回退到磁盘.模板浅克隆复制的正是 tip 快照,所以 `project.rs` 那套纯 SQL `INSERT ... SELECT` 无需改动.回滚把 pack 解回 PG 即可.
+   - **全量 clone**:`FULL` 标记存在且请求是无 have / 无 shallow / 无 filter 的干净全量 clone 时,直接把磁盘 pack 字节发出,跳过对象图遍历与组包;ref 变更会清掉标记,增量 fetch 仍走 want/have 协商.
+   - **必须 repack**:每次 push 写的 pack 自包含,OFS_DELTA 只能引用本 pack 内的偏移,历史版本链被切断后压缩率会持续退化(本地 1.4 万对象实测:1 个 pack 1.59 MiB,256 个 pack 5.08 MiB).低峰期跑 `kych-net db repack --project <slug>` 合并成单 pack;`--prune` 额外只保留 refs 可达对象(同样保护排队中的工作流快照).`db offload` / `db repack` 是低频运维命令,只提供英文形式.
+   - 本地 `kych_test` 的 14,219 对象仓库实测:`.pack` 1,670,264 B + `.idx` 399,204 B = 1.974 MiB,PG 热缓存 143 行 0.500 MiB,**合计 2.474 MiB**,相比当前逐对象 zlib 的 9.03 MiB 省 72.6%;`git verify-pack` 校验通过,13,973 / 14,219 个对象编成 delta,抽查 200 个对象与 PG 逐字节一致.
+   - 代价:磁盘成为对象字节的唯一副本,必须与 PG 在同一时间点备份;多实例部署需要共享磁盘或按 `project_id` 粘滞路由.单仓库不到几十 MiB 时不建议启用.
 
 ## 约定
 

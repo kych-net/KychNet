@@ -408,6 +408,23 @@ async fn fetch_pack(
     if let Some(hit) = key.as_ref().and_then(pack_cache::get) {
         return Ok(hit);
     }
+    // 磁盘权威且有全量快照：pack 字节原样发出，跳过对象图遍历与组包。
+    // key 为 Some 才代表「无 have / 无 shallow / 无 filter 的干净全量
+    // clone」；增量 fetch 仍须走 want/have 协商，不能偷懒发全量 pack。
+    if key.is_some() {
+        if let Some(disk) = store::disk_store() {
+            if let Some(path) = disk.full_pack(project.id) {
+                let bytes = tokio::fs::read(&path)
+                    .await
+                    .with_context(|| format!("读取全量 pack 失败: {}", path.display()))?;
+                let pack = Arc::new(bytes);
+                if let Some(key) = key.clone() {
+                    pack_cache::insert(key, pack.clone());
+                }
+                return Ok(pack);
+            }
+        }
+    }
     let pack = collect_pack(
         conn,
         project.id,
