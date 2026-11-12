@@ -327,6 +327,7 @@ async fn copy_tree_snapshot(
     let mut seen = HashSet::new();
     let mut objects = 0usize;
     let mut bytes = 0usize;
+    let mut collected: Vec<crate::git::object::Object> = Vec::new();
     while let Some(oid) = stack.pop() {
         if !seen.insert(oid) {
             continue;
@@ -353,8 +354,13 @@ async fn copy_tree_snapshot(
             crate::git::object::ObjectKind::Blob => ensure_text(&object.data)?,
             _ => bail!("模板快照里出现了非 tree/blob 对象"),
         }
-        store::put_object(conn, target, &object).await?;
+        collected.push(object);
     }
+    // 压缩与 OID 计算放到 blocking 线程，写库收敛为一次批量 INSERT。
+    let prepared = tokio::task::spawn_blocking(move || store::prepare_objects(&collected))
+        .await
+        .context("模板对象压缩任务失败")??;
+    store::insert_prepared(conn, target, &prepared).await?;
     Ok(objects)
 }
 
@@ -533,8 +539,14 @@ pub async fn import_project(
     // 全量拉 pack；refs 里指向的必须是分支顶点提交。
     let wants: Vec<Oid> = branches.iter().map(|(_, oid)| *oid).collect();
     let pack = crate::git::fetch::fetch_pack(url, wants, capabilities).await?;
-    let raw = proto::parse_pack(&pack)?;
-    let resolved = proto::resolve(&raw, &HashMap::new())?;
+    // 解析与 delta 还原是同步 CPU，放到 blocking 线程池，
+    // 避免阻塞 tokio worker。
+    let resolved = tokio::task::spawn_blocking(move || {
+        let raw = proto::parse_pack(&pack)?;
+        proto::resolve(&raw, &HashMap::new())
+    })
+    .await
+    .context("导入 pack 解析任务失败")??;
     if resolved.is_empty() {
         bail!("远端没有返回任何 Git 对象");
     }
@@ -562,6 +574,17 @@ pub async fn import_project(
             crate::git::object::ObjectKind::Tree => {}
         }
     }
+
+    // OID 计算与 zlib 压缩在事务外完成，事务里只做一次批量 INSERT。
+    // 导入上限 10 万对象，逐条 INSERT 会让事务随对象数线性变长。
+    let imported_objects = resolved.len();
+    let objects: Vec<crate::git::object::Object> = resolved
+        .into_iter()
+        .map(|(_oid, kind, data)| crate::git::object::Object { kind, data })
+        .collect();
+    let prepared = tokio::task::spawn_blocking(move || store::prepare_objects(&objects))
+        .await
+        .context("导入对象压缩任务失败")??;
 
     let mut tx = pool.begin().await?;
     // 与 create_project 一致：项目名不能撞上普通内容的路径空间。
@@ -594,18 +617,8 @@ pub async fn import_project(
         _ => error.into(),
     })?;
 
-    for (_oid, kind, data) in &resolved {
-        // OID 由对象内容算出，与 pack 里的一致，这里不需要再用它。
-        store::put_object(
-            &mut tx,
-            project.id,
-            &crate::git::object::Object {
-                kind: *kind,
-                data: data.clone(),
-            },
-        )
-        .await?;
-    }
+    // OID 由对象内容算出，与 pack 里的一致；同 OID 复用已有行。
+    store::insert_prepared(&mut tx, project.id, &prepared).await?;
     for (name, target) in &branches {
         if !valid_branch(name) {
             continue;
@@ -659,7 +672,7 @@ pub async fn import_project(
     Ok(ImportOutcome {
         project,
         branches: imported_branches,
-        objects: resolved.len(),
+        objects: imported_objects,
         commits,
     })
 }
