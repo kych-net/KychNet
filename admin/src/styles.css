@@ -3588,3 +3588,61 @@ code,
     max-width: 100%;
   }
 }
+
+/* 资源监控 */
+.res-grid {
+  display: grid;
+  gap: 0.9rem;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+}
+
+.res-card {
+  background: var(--surface, #fff);
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  padding: 0.9rem 1rem;
+  box-shadow: var(--shadow-soft);
+}
+
+.res-card h4 {
+  margin: 0 0 0.4rem;
+  font-size: 0.85rem;
+}
+
+.res-big {
+  margin: 0;
+  font-size: 1.25rem;
+  font-weight: 600;
+}
+
+.res-hint {
+  color: var(--muted, #666);
+  font-size: 0.8rem;
+}
+
+.res-path {
+  margin: 0;
+  font-size: 0.72rem;
+  color: var(--muted, #666);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.res-bar {
+  height: 8px;
+  border-radius: 4px;
+  background: rgba(127, 127, 127, 0.18);
+  overflow: hidden;
+}
+
+.res-bar-fill {
+  height: 100%;
+  border-radius: 4px;
+  background: var(--accent, #4a7dff);
+  transition: width 0.4s ease;
+}
+
+.res-bar-fill.warn {
+  background: #d9534f;
+}

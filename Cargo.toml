@@ -20,6 +20,8 @@ clap = { version = "4", features = ["derive", "env"] }
 dotenvy = "0.15"
 flate2 = "1"
 tar = "0.4"
+# 资源监控：statvfs 读磁盘用量（锁文件里已有传递依赖，不增加下载）。
+libc = "0.2"
 ureq = "2"
 ftml = "1"
 hex = "0.4"

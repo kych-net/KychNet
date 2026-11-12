@@ -227,6 +227,29 @@ export type PrDetail = PullRequest & {
   comments: PrComment[];
 };
 
+export type DiskUsage = {
+  label: string;
+  path: string;
+  used_bytes: number;
+  total_bytes: number;
+};
+
+export type SystemResources = {
+  load1: number;
+  load5: number;
+  load15: number;
+  cpu_cores: number;
+  uptime_secs: number;
+  mem_total: number;
+  mem_available: number;
+  process_rss: number;
+  disks: DiskUsage[];
+  db_bytes: number;
+  git_objects: number;
+  git_objects_bytes: number;
+  lfs_bytes: number;
+};
+
 export type CommitSummary = {
   oid: string;
   parent_oid: string | null;
@@ -647,6 +670,7 @@ export const api = {
       body: JSON.stringify({ inputs: {} }),
     }),
   projectRuns: (id: string) => request<{ items: WorkflowRun[] }>(`/projects/${id}/runs`),
+  systemResources: () => request<SystemResources>("/system/resources"),
   runners: () => request<{ items: WorkflowRunner[] }>("/runners"),
   createRunner: (name: string, labels: string[]) =>
     request<{ runner_id: string; registration_code: string }>("/runners", {

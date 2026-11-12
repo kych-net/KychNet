@@ -3075,6 +3075,7 @@ dependencies = [
  "flate2",
  "ftml",
  "hex",
+ "libc",
  "openssl",
  "pulldown-cmark",
  "rand 0.10.3",

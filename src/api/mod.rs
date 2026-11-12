@@ -40,6 +40,7 @@ pub mod content;
 pub mod git;
 pub mod pr;
 pub mod project;
+pub mod system;
 
 // 路由表集中在 serve() 里注册，把各子模块的 handler 展平到本模块作用域。
 use admin::*;
@@ -49,6 +50,7 @@ use content::*;
 use git::*;
 use pr::*;
 use project::*;
+use system::*;
 
 // `BuildCtl` 原本定义在 api.rs 顶层，workflow 等模块按 `crate::api::BuildCtl` 引用。
 pub(crate) use build::BuildCtl;
@@ -573,6 +575,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
         .route("/api/projects/{id}/move", post(project_move_file))
         .route("/api/projects/{id}/commit", post(project_commit_changes))
         .route("/api/projects/{id}/commits", get(project_commits))
+        .route("/api/system/resources", get(system_resources))
         .route("/api/projects/{id}/compare", get(project_compare))
         .route(
             "/api/projects/{id}/workflows",
