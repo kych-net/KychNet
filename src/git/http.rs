@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use sqlx::{PgConnection, PgPool};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
@@ -544,7 +544,12 @@ pub(crate) async fn upload_pack_request(
         Some(oid) => out.extend(proto::pkt_str(&format!("ACK {}\n", oid.to_hex()))),
         None => out.extend(proto::pkt_str("NAK\n")),
     }
-    out.extend(proto::build_pack(&objects));
+    // pack 组装是同步 CPU（逐对象 zlib），放到 blocking 线程池，
+    // 免得大仓库 clone 卡住 tokio worker。
+    let pack = tokio::task::spawn_blocking(move || proto::build_pack(&objects))
+        .await
+        .context("pack 组装任务失败")?;
+    out.extend(pack);
     Ok(out)
 }
 
@@ -676,10 +681,15 @@ async fn v2_fetch(conn: &mut PgConnection, project: &Project, args: &[String]) -
     )
     .await?;
 
+    // 同步 CPU 的 pack 组装放到 blocking 线程池，与 v0 路径保持一致。
+    let pack = tokio::task::spawn_blocking(move || proto::build_pack(&objects))
+        .await
+        .context("pack 组装任务失败")?;
+
     // packfile 段：ready 与 done 两条路径共用（v2 规范要求 ready 之后
     // 必须紧跟 delim 并在同一响应里带上 shallow-info / packfile 段，
     // 与真实 upload-pack 的 process_haves_and_send_acks 一致）。
-    let mut pack_sections = |out: &mut Vec<u8>| {
+    let pack_sections = |out: &mut Vec<u8>| {
         if !boundaries.is_empty() || !unshallow.is_empty() {
             out.extend(proto::pkt_str("shallow-info\n"));
             for oid in &boundaries {
@@ -691,7 +701,7 @@ async fn v2_fetch(conn: &mut PgConnection, project: &Project, args: &[String]) -
             out.extend(proto::delim());
         }
         out.extend(proto::pkt_str("packfile\n"));
-        out.extend(sideband_pack(&proto::build_pack(&objects)));
+        out.extend(sideband_pack(&pack));
     };
 
     if !request.done {
@@ -731,37 +741,56 @@ pub async fn upload_pack_v2(pool: &PgPool, project: &Project, body: &[u8]) -> Re
     }
 }
 
-async fn unpack_pack(conn: &mut PgConnection, project_id: Uuid, data: &[u8]) -> Result<usize> {
+/// 在**写事务外**把 push 的 pack 解析成待入库行。
+///
+/// 解析、delta 还原、UTF-8 校验与 zlib 压缩都是纯 CPU，过去全在持有
+/// `pg_advisory_xact_lock` 的事务里做，同项目并发 push 会互相排队。
+/// 现在只有一次只读查询（REF delta 的 base 对象）留在锁外，事务内
+/// 只做一次批量 INSERT；失败由调用方转成 `unpack <error>` 报告。
+async fn prepare_receive_pack(
+    pool: &PgPool,
+    project_id: Uuid,
+    data: Vec<u8>,
+) -> Result<Vec<store::PreparedObject>> {
     if data.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
-    let raw = proto::parse_pack(data)?;
+    let raw = tokio::task::spawn_blocking(move || proto::parse_pack(&data))
+        .await
+        .context("pack 解析任务失败")??;
+
+    // REF delta 的 base 可能已在库里；用独立只读连接取，不占写事务。
     let mut external = HashMap::new();
-    for entry in &raw.entries {
-        if let proto::RawEntry::RefDelta { base, .. } = entry {
-            if let Some(object) = store::get_object(conn, project_id, *base).await? {
-                external.insert(*base, (object.kind, object.data));
+    {
+        let mut conn = pool.acquire().await?;
+        for entry in &raw.entries {
+            if let proto::RawEntry::RefDelta { base, .. } = entry {
+                if let Some(object) = store::get_object(&mut conn, project_id, *base).await? {
+                    external.insert(*base, (object.kind, object.data));
+                }
             }
         }
     }
-    let resolved = proto::resolve(&raw, &external)?;
-    for (oid, kind, object) in &resolved {
-        match kind {
-            ObjectKind::Blob | ObjectKind::Commit | ObjectKind::Tag => ensure_text(object)?,
-            ObjectKind::Tree => {}
+
+    let objects = tokio::task::spawn_blocking(move || {
+        let resolved = proto::resolve(&raw, &external)?;
+        let mut objects = Vec::with_capacity(resolved.len());
+        for (_oid, kind, data) in resolved {
+            match kind {
+                ObjectKind::Blob | ObjectKind::Commit | ObjectKind::Tag => ensure_text(&data)?,
+                ObjectKind::Tree => {}
+            }
+            objects.push(Object { kind, data });
         }
-        store::put_object(
-            conn,
-            project_id,
-            &Object {
-                kind: *kind,
-                data: object.clone(),
-            },
-        )
-        .await?;
-        let _ = oid;
-    }
-    Ok(resolved.len())
+        Ok::<_, anyhow::Error>(objects)
+    })
+    .await
+    .context("pack 解包任务失败")??;
+
+    // 压缩同样移出写事务；返回可直接批量写入的行。
+    tokio::task::spawn_blocking(move || store::prepare_objects(&objects))
+        .await
+        .context("对象压缩任务失败")?
 }
 
 async fn is_ancestor(
@@ -893,7 +922,7 @@ pub async fn receive_pack(
     user: &User,
     body: &[u8],
 ) -> Result<ReceiveOutcome> {
-    let request = proto::parse_receive_request(body)?;
+    let mut request = proto::parse_receive_request(body)?;
     let atomic = request
         .capabilities
         .iter()
@@ -906,15 +935,22 @@ pub async fn receive_pack(
         );
     }
 
+    // 解析 / delta 还原 / 文本校验 / 压缩全部在事务外完成，
+    // 写事务里只做一次批量 INSERT，持锁时间与 pack 大小解耦。
+    let pack = std::mem::take(&mut request.pack);
+    let (unpack_error, prepared) = match prepare_receive_pack(pool, project.id, pack).await {
+        Ok(rows) => (None, rows),
+        Err(error) => (Some(error.to_string()), Vec::new()),
+    };
+
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
         .bind(project.id.to_string())
         .fetch_one(&mut *tx)
         .await?;
 
-    let mut unpack_error = None;
-    if let Err(error) = unpack_pack(&mut tx, project.id, &request.pack).await {
-        unpack_error = Some(error.to_string());
+    if !prepared.is_empty() {
+        store::insert_prepared(&mut tx, project.id, &prepared).await?;
     }
 
     // 第一轮只做校验，收集每条命令的校验结果；atomic 推送据此决定是否整体放弃。

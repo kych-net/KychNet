@@ -43,32 +43,77 @@ fn decompress_blob(data: &[u8], size: i64) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// 写入对象并返回 OID。同 OID 已存在时直接复用。
-pub async fn put_object(
+/// 已备好的入库行：OID、原始长度与压缩结果都在事务外算好。
+/// 事务里只做一次批量 INSERT，持锁时间不再随对象数线性增长。
+pub struct PreparedObject {
+    pub oid: Vec<u8>,
+    pub kind: i16,
+    pub size: i64,
+    pub data: Vec<u8>,
+    pub compressed: bool,
+}
+
+/// 纯 CPU：算 OID + 按需 zlib 压缩，不碰数据库。
+/// 批量场景适合整体放进 `spawn_blocking`，避免阻塞 tokio worker。
+pub fn prepare_objects(objects: &[Object]) -> Result<Vec<PreparedObject>> {
+    let mut out = Vec::with_capacity(objects.len());
+    for object in objects {
+        let oid = object.oid();
+        // 压缩是可选的：压不小就存原样，读取端按 compressed 列判断。
+        let (payload, compressed) = match compress_blob(&object.data)? {
+            Some(packed) => (packed, true),
+            None => (object.data.clone(), false),
+        };
+        out.push(PreparedObject {
+            oid: oid.as_bytes().to_vec(),
+            kind: object.kind as i16,
+            size: object.data.len() as i64,
+            data: payload,
+            compressed,
+        });
+    }
+    Ok(out)
+}
+
+/// 一次往返批量写入。`ON CONFLICT DO NOTHING` 与逐条 `put_object` 语义一致：
+/// 同 OID 已存在时直接复用，不覆盖已有行。
+pub async fn insert_prepared(
     conn: &mut PgConnection,
     project_id: Uuid,
-    object: &Object,
-) -> Result<Oid> {
-    let oid = object.oid();
-    // 压缩是可选的：压不小就存原样，读取端按 compressed 列判断。
-    let packed = compress_blob(&object.data)?;
-    let (payload, compressed) = match &packed {
-        Some(packed) => (packed.as_slice(), true),
-        None => (object.data.as_slice(), false),
-    };
+    rows: &[PreparedObject],
+) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let oids: Vec<Vec<u8>> = rows.iter().map(|r| r.oid.clone()).collect();
+    let kinds: Vec<i16> = rows.iter().map(|r| r.kind).collect();
+    let sizes: Vec<i64> = rows.iter().map(|r| r.size).collect();
+    let datas: Vec<Vec<u8>> = rows.iter().map(|r| r.data.clone()).collect();
+    let compressed: Vec<bool> = rows.iter().map(|r| r.compressed).collect();
     sqlx::query(
         "INSERT INTO git_objects (project_id, oid, kind, size, data, compressed)
-         VALUES ($1, $2, $3, $4, $5, $6)
+         SELECT $1, u.oid, u.kind, u.size, u.data, u.compressed
+         FROM unnest($2::bytea[], $3::smallint[], $4::bigint[], $5::bytea[], $6::boolean[])
+              AS u(oid, kind, size, data, compressed)
          ON CONFLICT (project_id, oid) DO NOTHING",
     )
     .bind(project_id)
-    .bind(&oid.as_bytes()[..])
-    .bind(object.kind as i16)
-    .bind(object.data.len() as i64)
-    .bind(payload)
+    .bind(oids)
+    .bind(kinds)
+    .bind(sizes)
+    .bind(datas)
     .bind(compressed)
     .execute(conn)
     .await?;
+    Ok(())
+}
+
+/// 写入单个对象并返回 OID。同 OID 已存在时直接复用。
+/// 批量写入请用 `prepare_objects` + `insert_prepared`。
+pub async fn put_object(conn: &mut PgConnection, project_id: Uuid, object: &Object) -> Result<Oid> {
+    let oid = object.oid();
+    let rows = prepare_objects(std::slice::from_ref(object))?;
+    insert_prepared(conn, project_id, &rows).await?;
     Ok(oid)
 }
 
@@ -378,6 +423,37 @@ pub fn check_old_oid(expected: Option<Oid>, supplied: Option<&str>) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepare_objects_keeps_oid_size_and_roundtrip() {
+        let objects = vec![
+            Object::blob(b"tiny".to_vec()),
+            Object::blob("可压缩文本行\n".repeat(300).into_bytes()),
+            Object::commit(
+                b"tree 0000000000000000000000000000000000000000\n"
+                    .repeat(20)
+                    .to_vec(),
+            ),
+        ];
+        let oids: Vec<Oid> = objects.iter().map(|o| o.oid()).collect();
+        let rows = prepare_objects(&objects).unwrap();
+        assert_eq!(rows.len(), objects.len());
+        for (i, row) in rows.iter().enumerate() {
+            // OID 必须由原始内容算出，不能由压缩后的字节算。
+            assert_eq!(row.oid, oids[i].as_bytes().to_vec());
+            assert_eq!(row.kind, objects[i].kind as i16);
+            assert_eq!(row.size, objects[i].data.len() as i64);
+            let data = if row.compressed {
+                decompress_blob(&row.data, row.size).unwrap()
+            } else {
+                row.data.clone()
+            };
+            assert_eq!(data, objects[i].data);
+        }
+        assert!(!rows[0].compressed, "小对象存原样");
+        assert!(rows[1].compressed, "大文本应压缩");
+        assert!(prepare_objects(&[]).unwrap().is_empty(), "空批次不产生行");
+    }
 
     #[test]
     fn compress_roundtrip_keeps_bytes() {
