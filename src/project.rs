@@ -1587,6 +1587,73 @@ pub async fn delete_branch(pool: &PgPool, project_id: Uuid, name: &str) -> Resul
     Ok(())
 }
 
+/// 分支对比结果：source 相对 target 领先的提交与文件差异。
+#[derive(Debug, serde::Serialize)]
+pub struct BranchCompare {
+    pub merge_base: Option<String>,
+    pub commits: Vec<CommitSummary>,
+    pub files: Vec<crate::collab::FileDiff>,
+}
+
+/// 对比两个分支：返回 source 独有的提交（在 merge_base 即停）和两分支的
+/// 文件差异。目标分支不存在或无差异时返回空集，不视为错误。
+pub async fn compare_branches(
+    pool: &PgPool,
+    project_id: Uuid,
+    source: &str,
+    target: &str,
+) -> Result<BranchCompare> {
+    if !valid_branch(source) || !valid_branch(target) {
+        bail!("非法分支名");
+    }
+    let mut conn = pool.acquire().await?;
+    let Some(source_tip) = store::resolve_branch(&mut conn, project_id, source).await? else {
+        bail!("来源分支不存在: {source}");
+    };
+    let Some(target_tip) = store::resolve_branch(&mut conn, project_id, target).await? else {
+        bail!("目标分支不存在: {target}");
+    };
+    let base = crate::collab::merge_base(&mut conn, project_id, source_tip, target_tip).await?;
+    // 领先提交：从 source tip 走父链，走到 merge_base 停。共同历史都在
+    // base 的祖先里，不会重复遍历；5000 上限与 walk_commit_oids 一致。
+    let mut seen = HashSet::new();
+    let mut stack = vec![source_tip];
+    let mut oids: Vec<Oid> = Vec::new();
+    while let Some(oid) = stack.pop() {
+        if Some(oid) == base || !seen.insert(oid) {
+            continue;
+        }
+        if oids.len() > 5000 {
+            bail!("提交历史过深，暂时无法比较");
+        }
+        let object = store::require_object(&mut conn, project_id, oid).await?;
+        if object.kind != crate::git::object::ObjectKind::Commit {
+            continue;
+        }
+        oids.push(oid);
+        stack.extend(commit_parents(&object.data)?);
+    }
+    let bytes: Vec<Vec<u8>> = oids.iter().map(|oid| oid.as_bytes().to_vec()).collect();
+    let commits = if bytes.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_as::<_, CommitSummary>(&format!(
+            "{COMMIT_SELECT} WHERE project_id = $1 AND oid = ANY($2)
+             ORDER BY committed_at DESC"
+        ))
+        .bind(project_id)
+        .bind(&bytes)
+        .fetch_all(&mut *conn)
+        .await?
+    };
+    let files = crate::collab::diff_commits(&mut conn, project_id, base, source_tip).await?;
+    Ok(BranchCompare {
+        merge_base: base.map(|oid| oid.to_hex()),
+        commits,
+        files,
+    })
+}
+
 /// 项目默认分支的完整快照，供静态构建使用。
 pub struct ProjectSnapshot {
     pub project: Project,

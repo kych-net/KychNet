@@ -420,6 +420,12 @@ pub(crate) struct CommitListQuery {
 }
 
 #[derive(Deserialize)]
+pub(crate) struct CompareQuery {
+    source: String,
+    target: String,
+}
+
+#[derive(Deserialize)]
 pub(crate) struct RevertBody {
     #[serde(rename = "ref", default = "main_branch")]
     branch: String,
@@ -583,6 +589,19 @@ pub(crate) async fn project_commit_detail(
     let Some(item) = crate::project::commit_detail(&state.pool, id, &oid).await? else {
         api_reject!(StatusCode::NOT_FOUND, "提交不存在");
     };
+    Ok(Json(json!({ "item": item })))
+}
+
+pub(crate) async fn project_compare(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+    Query(query): Query<CompareQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current_user(&state, &session).await?;
+    require_project(&state, id).await?;
+    let item =
+        crate::project::compare_branches(&state.pool, id, &query.source, &query.target).await?;
     Ok(Json(json!({ "item": item })))
 }
 

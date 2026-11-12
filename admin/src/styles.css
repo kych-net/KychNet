@@ -2155,6 +2155,11 @@ code,
   font-size: 0.9rem;
 }
 
+.collab-load-more {
+  margin-top: 0.6rem;
+  width: 100%;
+}
+
 .collab-items {
   margin: 0.8rem 0 0;
   padding: 0;
