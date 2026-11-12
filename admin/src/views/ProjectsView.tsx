@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import {
   api,
+  BranchCompare,
   CommitDetail,
   CommitSummary,
   ContentFormat,
@@ -16,6 +17,9 @@ import {
 } from "../api";
 import { CodeEditor } from "../components/CodeEditor";
 import { ProjectWorkflowsPanel } from "./WorkflowsView";
+
+/** 提交历史每次加载的页大小。 */
+const COMMIT_PAGE = 100;
 
 function formatForPath(path: string): ContentFormat {
   const extension = path.split(".").pop()?.toLowerCase();
@@ -154,12 +158,14 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
   const [importBranch, setImportBranch] = useState("");
 
   const [middleTab, setMiddleTab] = useState<"files" | "discussions" | "workflows">("files");
-  const [rightTab, setRightTab] = useState<"history" | "prs">("history");
+  const [rightTab, setRightTab] = useState<"history" | "prs" | "compare">("history");
 
   const [commits, setCommits] = useState<CommitSummary[]>([]);
   const [commitDetail, setCommitDetail] = useState<CommitDetail | null>(null);
   const [selectedCommit, setSelectedCommit] = useState<string | null>(null);
   const [newBranch, setNewBranch] = useState("");
+  // 提交历史分页：每次拉一页，往下追加。
+  const [commitsOffset, setCommitsOffset] = useState(0);
 
   const [prs, setPrs] = useState<PullRequest[]>([]);
   const [prDetail, setPrDetail] = useState<PrDetail | null>(null);
@@ -169,6 +175,12 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
   const [prSource, setPrSource] = useState("");
   const [prTarget, setPrTarget] = useState("");
   const [prComment, setPrComment] = useState("");
+
+  // 分支对比：source 相对 target 的领先提交与文件差异。
+  const [cmpSource, setCmpSource] = useState("");
+  const [cmpTarget, setCmpTarget] = useState("");
+  const [cmpResult, setCmpResult] = useState<BranchCompare | null>(null);
+  const [cmpBusy, setCmpBusy] = useState(false);
 
   const [discussions, setDiscussions] = useState<Discussion[]>([]);
   const [discussionDetail, setDiscussionDetail] = useState<DiscussionDetail | null>(null);
@@ -220,11 +232,15 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
     setCommits([]);
     setCommitDetail(null);
     setSelectedCommit(null);
+    setCommitsOffset(0);
     setNewBranch("");
     setPrs([]);
     setPrDetail(null);
     setSelectedPr(null);
     setPrSource(project.default_branch);
+    setCmpSource(project.default_branch);
+    setCmpTarget(project.default_branch);
+    setCmpResult(null);
     setPrTarget(project.default_branch);
     setDiscussions([]);
     setDiscussionDetail(null);
@@ -250,7 +266,7 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
     void loadDiscussions(selected).catch((e) => setError((e as Error).message));
   }
 
-  function switchRightTab(next: "history" | "prs") {
+  function switchRightTab(next: "history" | "prs" | "compare") {
     setRightTab(next);
     setError("");
     setNotice("");
@@ -262,11 +278,37 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
     }
   }
 
-  async function loadCommits(project: Project, ref: string) {
-    const result = await api.commits(project.id, ref, 100, 0);
-    setCommits(result.items);
+  async function loadCommits(project: Project, ref: string, append = false) {
+    const offset = append ? commitsOffset : 0;
+    const result = await api.commits(project.id, ref, COMMIT_PAGE, offset);
+    setCommits((prev) => (append ? [...prev, ...result.items] : result.items));
+    setCommitsOffset(offset + result.items.length);
     setCommitDetail(null);
     setSelectedCommit(null);
+  }
+
+  async function loadMoreCommits() {
+    if (!selected) return;
+    try {
+      await loadCommits(selected, branch, true);
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
+  async function runCompare() {
+    if (!selected || !cmpSource || !cmpTarget) return;
+    setCmpBusy(true);
+    setError("");
+    try {
+      const result = await api.compare(selected.id, cmpSource, cmpTarget);
+      setCmpResult(result.item);
+    } catch (e) {
+      setCmpResult(null);
+      setError((e as Error).message);
+    } finally {
+      setCmpBusy(false);
+    }
   }
 
   async function openCommit(oid: string) {
@@ -1399,6 +1441,13 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
                 </button>
                 <button
                   type="button"
+                  className={rightTab === "compare" ? "active" : ""}
+                  onClick={() => switchRightTab("compare")}
+                >
+                  分支对比
+                </button>
+                <button
+                  type="button"
                   className={rightTab === "prs" ? "active" : ""}
                   onClick={() => switchRightTab("prs")}
                 >
@@ -1481,6 +1530,18 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
                       ))}
                       {commits.length === 0 && <li className="hint">暂无提交。</li>}
                     </ul>
+                    {commits.length > 0 &&
+                      commits.length === commitsOffset &&
+                      commits.length % COMMIT_PAGE === 0 && (
+                        <button
+                          type="button"
+                          className="collab-load-more"
+                          onClick={() => void loadMoreCommits()}
+                          disabled={busy}
+                        >
+                          加载更多
+                        </button>
+                      )}
                   </div>
 
                   <div className="collab-detail">
@@ -1512,6 +1573,91 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
 
                         <h5>文件差异</h5>
                         <DiffList files={commitDetail.files} />
+                      </>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {rightTab === "compare" && (
+                <div className="collab-layout">
+                  <div className="collab-list">
+                    <div className="collab-create">
+                      <h4>对比分支</h4>
+                      <div className="row">
+                        <label>
+                          来源（领先方）
+                          <select value={cmpSource} onChange={(e) => setCmpSource(e.target.value)}>
+                            {branches.map((name) => (
+                              <option key={name} value={name}>
+                                {name}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <label>
+                          目标（基准方）
+                          <select value={cmpTarget} onChange={(e) => setCmpTarget(e.target.value)}>
+                            {branches.map((name) => (
+                              <option key={name} value={name}>
+                                {name}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                      </div>
+                      <button
+                        type="button"
+                        disabled={cmpBusy || !cmpSource || !cmpTarget || cmpSource === cmpTarget}
+                        onClick={() => void runCompare()}
+                      >
+                        {cmpBusy ? "对比中…" : "开始对比"}
+                      </button>
+                      {cmpSource === cmpTarget && (
+                        <p className="hint">来源与目标相同，请选择不同分支。</p>
+                      )}
+                    </div>
+
+                    {cmpResult && (
+                      <div className="collab-create">
+                        <h4>领先提交（{cmpResult.commits.length}）</h4>
+                        {cmpResult.merge_base && (
+                          <p className="hint">
+                            合并基点 {cmpResult.merge_base.slice(0, 8)}。
+                          </p>
+                        )}
+                        <ul className="collab-items">
+                          {cmpResult.commits.map((commit) => (
+                            <li key={commit.oid}>
+                              <span>{firstLine(commit.message)}</span>
+                              <small>
+                                {commit.oid.slice(0, 8)} · {commit.author_name} ·{" "}
+                                {formatTime(commit.committed_at)}
+                              </small>
+                            </li>
+                          ))}
+                          {cmpResult.commits.length === 0 && (
+                            <li className="hint">{cmpSource} 没有领先 {cmpTarget} 的提交。</li>
+                          )}
+                        </ul>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="collab-detail">
+                    {!cmpResult ? (
+                      <p className="hint">选择两个分支后开始对比。</p>
+                    ) : cmpResult.files.length === 0 ? (
+                      <p className="hint">
+                        两个分支的文件内容完全一致（可能只有空的快进关系）。
+                      </p>
+                    ) : (
+                      <>
+                        <div className="row align">
+                          <span className="project-commit-kicker">Diff</span>
+                          <strong>文件差异（{cmpResult.files.length}）</strong>
+                        </div>
+                        <DiffList files={cmpResult.files} />
                       </>
                     )}
                   </div>

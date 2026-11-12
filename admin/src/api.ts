@@ -241,6 +241,12 @@ export type CommitDetail = CommitSummary & {
   files: PrFileDiff[];
 };
 
+export type BranchCompare = {
+  merge_base: string | null;
+  commits: CommitSummary[];
+  files: PrFileDiff[];
+};
+
 export type Discussion = {
   id: string;
   project_id: string;
@@ -545,6 +551,11 @@ export const api = {
     ),
   commitDetail: (id: string, oid: string) =>
     request<{ item: CommitDetail }>(`/projects/${id}/commits/${oid}`),
+  compare: (id: string, source: string, target: string) =>
+    request<{ item: BranchCompare }>(
+      `/projects/${id}/compare?source=${encodeURIComponent(source)}` +
+        `&target=${encodeURIComponent(target)}`,
+    ),
   revertCommit: (id: string, payload: { ref: string; commit: string; message?: string }) =>
     request<{ item: { commit: string } }>(`/projects/${id}/revert`, {
       method: "POST",

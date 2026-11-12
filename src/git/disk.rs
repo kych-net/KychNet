@@ -565,6 +565,20 @@ fn idx_cache() -> &'static Mutex<HashMap<PathBuf, Arc<Idx>>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// pack 文件被删除后同步清掉两个缓存里的条目。pack 名由内容校验和决定，
+/// 不会复用，不清就是慢性泄漏。
+fn evict_caches(pack_path: &Path) {
+    let idx_path = pack_path.with_extension("idx");
+    bytes_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(pack_path);
+    idx_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&idx_path);
+}
+
 /// 临时文件 → fsync → 原子 rename。rename 后引用可见时字节必须已落稳。
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().context("目标路径没有父目录")?;
@@ -773,12 +787,26 @@ impl DiskStore {
     /// pack 复用历史版本做 delta。
     ///
     /// `keep` 传入时只保留可达对象（供 gc 使用）；为 None 时保留全部。
+    ///
+    /// 单个对象损坏只跳过并告警，不让 repack 整体失败——坏对象本来就不
+    /// 可恢复，阻断 repack 反而让其余健康对象的体积问题也一起恶化。
     pub fn repack(&self, project_id: Uuid, keep: Option<&HashSet<Oid>>) -> Result<usize> {
         let mut oids = self.list(project_id)?;
         if let Some(keep) = keep {
             oids.retain(|oid| keep.contains(oid));
         }
-        let objects: Vec<(Oid, Object)> = self.get_many(project_id, &oids)?;
+        let mut objects: Vec<(Oid, Object)> = Vec::with_capacity(oids.len());
+        let mut skipped = 0usize;
+        for oid in &oids {
+            match self.get(project_id, oid) {
+                Ok(Some(object)) => objects.push((*oid, object)),
+                Ok(None) => {}
+                Err(error) => {
+                    skipped += 1;
+                    tracing::warn!("repack 跳过损坏对象 {oid}: {error:#}");
+                }
+            }
+        }
         if objects.is_empty() {
             return Ok(0);
         }
@@ -806,7 +834,14 @@ impl DiskStore {
                 .unwrap_or("");
             if stem.starts_with("pack-") && stem != new_stem {
                 let _ = fs::remove_file(entry.path());
+                if name.ends_with(".pack") {
+                    // 文件没了，缓存条目也不能留：pack 名是校验和，不会复用。
+                    evict_caches(&entry.path());
+                }
             }
+        }
+        if skipped > 0 {
+            tracing::warn!("repack({project_id}) 完成，{} 个损坏对象被跳过", skipped);
         }
         Ok(packed.len())
     }
