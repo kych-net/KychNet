@@ -1,33 +1,57 @@
-# 前端部署（eo.kych.net）
+# 前端部署（kych.net）
 
-内容站与管理端合并在同一域名下，由 EdgeOne 加速、源站 nginx 直接托管：
+内容站、管理端与后端接口合并在**主域 `kych.net`** 下，由 EdgeOne 加速、源站 nginx 直接托管：
 
 ```
-eo.kych.net/        → /opt/kych-net/dist   内容站（后端 build 产出）
-eo.kych.net/管理/   → /opt/kych-admin      管理端 SPA（GitHub Actions 发布）
-接口               → https://kych.net      主域 API，不进本机代理
+https://kych.net/        → /opt/kych-net/dist   内容站（后端 build 产出）
+https://kych.net/管理/   → /opt/kych-admin      管理端 SPA（GitHub Actions 发布）
+https://kych.net/api/…   → 127.0.0.1:8080      后端接口（同源，不再是独立子域）
 ```
 
-旧入口 `c.kych.net`、`m.kych.net` 已停用（DNS 与源站配置均已删除）。
+EdgeOne 只做加速回源，静态文件全部由源站 nginx 托管。旧入口
+`eo.kych.net`、`c.kych.net`、`m.kych.net` 已停用：2026-11-13 实测公网 DNS
+均为 NXDOMAIN，记录已删除。
 
-## 为什么 eo.kych.net 不需要单独签证书
+## DNS 与子域现状
 
-EdgeOne 的**回源 HOST**与**回源 SNI**是两个独立配置：
+2026-11-13 通过 DoH 实测：
+
+| 名称 | 记录 | 值 | 说明 |
+| --- | --- | --- | --- |
+| `kych.net` | CNAME | `kych.net.eo.dnse0.com` | 主域接入 EdgeOne，递归返回 EO 节点 A 记录 |
+| `www.kych.net` | A | `49.232.71.240` | 直连源站，nginx 301 → `https://kych.net/` |
+| `uh.kych.net` | CNAME | `dnspod-free.beian.mydnspod.net.` | DNSPod URL 转发，见下节 |
+| `eo` / `c` / `m` / `api.kych.net` | — | 无记录（NXDOMAIN） | 历史入口，已删除 |
+
+权威 DNS 仍在 DNSPod（`phecda.dnspod.net` / `hospital.dnspod.net`），
+所以域名记录要在 DNSPod 改，EO 侧只管加速与回源配置。
+
+## 回源与证书
+
+主域直接接入 EO 后，不再需要为子域单独签证书，也不再需要拆 HOST/SNI：
 
 | 配置 | 值 | 作用 |
 | --- | --- | --- |
-| 回源地址 | `49.232.71.240:443` | 连哪台机器 |
-| 回源 SNI | `kych.net` | nginx 按它选证书，复用主域那张 |
-| 回源 HOST | `eo.kych.net` | nginx 按它选 vhost |
+| 边缘证书 | EO 托管（免费证书自动申请/续期） | 浏览器 → EO 的 HTTPS |
+| 回源地址 | `49.232.71.240:443` | EO → 源站 nginx |
+| 回源 HOST / SNI | `kych.net` | nginx 按它选证书与 vhost，复用主域那张 Let's Encrypt 证书 |
 
-nginx 先按 SNI 选证书、再按 Host 选站点，两者互不干扰，所以主域证书
-（SAN: kych.net/api/origin/www）可直接复用。填错 Host 会命中别的 vhost：
-填 `kych.net` 会被主域 API vhost 301 走，填 IP 会落到 `default_server` 返回内容站。
+实测源站行为（SNI 固定 `kych.net`）：
 
-自检命令：
+| 回源 Host | 结果 |
+| --- | --- |
+| `kych.net` | `200`，内容站首页，`Cache-Control: no-cache` |
+| `eo.kych.net` | `301` → `https://kych.net/`（旧 vhost 仅作兼容跳转） |
+
+也就是说源站现在由 `kych.net` vhost 同时托管内容站、管理端并反代后端路径，
+回源 HOST 必须填 `kych.net`。请仍与 EO 控制台的回源配置核对一次——
+旧方案曾用「SNI=`kych.net` + HOST=`eo.kych.net`」复用证书，那个组合现在会
+命中 301，导致回源重定向循环。
+
+自检命令（绕过 EO 直连源站）：
 
 ```bash
-printf 'GET / HTTP/1.1\r\nHost: eo.kych.net\r\nConnection: close\r\n\r\n' \
+printf 'GET / HTTP/1.1\r\nHost: kych.net\r\nConnection: close\r\n\r\n' \
   | openssl s_client -quiet -connect 49.232.71.240:443 -servername kych.net
 ```
 
@@ -41,6 +65,32 @@ printf 'GET / HTTP/1.1\r\nHost: eo.kych.net\r\nConnection: close\r\n\r\n' \
 
 浏览器把 `/管理/` 编码成 `/%E7%AE%A1%E7%90%86/` 发出，nginx 解码后再匹配 location，
 所以配置里直接写中文即可。
+
+## URL 转发（uh.kych.net）
+
+`uh.kych.net` 目前是 DNSPod 的**隐性 URL 转发**，目标
+`https://kych.net/项目/地狱之下/`。实测 `http://uh.kych.net/` 返回
+`Server: DNSPod URL V2.0` 的 `<frameset>` 套壳页（`<title>` 为空、地址栏不变），
+`https://uh.kych.net/` 的 443 端口直接拒绝连接。
+
+DNSPod URL 转发有两个硬限制：
+
+1. 转发前地址**只支持 HTTP，不支持 HTTPS**；转发后地址才支持 HTTP/HTTPS。
+2. 隐性转发用 iframe/frameset 嵌套而非重定向，移动端与 App 内置浏览器常白屏；
+   显性转发才是 301 重定向。
+
+因此只把记录「改成显性」只解决一半，`https://uh.kych.net` 依旧打不开——
+现在浏览器、微信、分享链接基本都会自动补 https。推荐改用 EO 做 301：
+
+1. 删除 DNSPod 的「隐性 URL」记录，改加 CNAME → `kych.net.eo.dnse0.com`，
+   **线路类型必须选「默认」**（只配单线路会导致部分用户解析不到）；
+2. 在 EO 把 `uh.kych.net` 加为加速域名并配边缘证书；
+3. 规则引擎：`HOST = uh.kych.net` → 「URL 重定向」301 到
+   `https://kych.net/项目/地狱之下/`。
+
+这样 http/https 都能跳，地址栏也变成目标地址。若继续用 DNSPod 转发，
+需在控制台为该记录「一键申请免费 SSL 证书」并改为显性 URL；免费版 URL 转发
+通常只有 2 条额度，且转发前后域名都要求已备案。
 
 ## 服务器侧一次性准备
 
@@ -56,13 +106,20 @@ install -m 644 deploy/nginx/kychnet-eo.conf /etc/nginx/conf.d/kychnet-eo.conf
 nginx -t && systemctl reload nginx
 ```
 
-## 域名切换
+> ⚠️ 仓库内的 `deploy/nginx/kychnet-eo.conf` 是旧入口时期的参考配置，
+> `server_name` 仍写 `eo.kych.net`（80 端口的 301 目标也是它）。部署到当前主域前
+> 必须改成 `kych.net`，否则 vhost 不命中。本次文档更新**未改动该配置文件**，
+> 请以服务器上的实际配置为准。
 
-`deploy/switch-to-eo.sh` 做三件事：备份 `.env` → 改写 `SITE_URL`/`ADMIN_ORIGIN`/
-`WEBAUTHN_ORIGIN` → 重启后端并重建内容站。
+## 历史：域名切换脚本
 
-执行前必须确认：nginx 已加载 `kychnet-eo.conf`、EO 上 eo.kych.net 已生效、
-DNSPod 已指向 EO。三项缺一，管理端登录会立刻失败（`ADMIN_ORIGIN` 只能指向一个域）。
+`deploy/switch-to-eo.sh` 是当初从 `c.kych.net` / `m.kych.net` 切到
+`eo.kych.net` 的一次性脚本，会把 `.env` 的 `SITE_URL` / `ADMIN_ORIGIN` /
+`WEBAUTHN_ORIGIN` 写成 `https://eo.kych.net`，然后重启后端、重建内容站。
+
+**该域名已停用，不要再执行此脚本**：`ADMIN_ORIGIN` 是 CORS 与写接口
+Origin 白名单的等值比较基准，写成已停用的域名会让管理端登录与所有写请求
+立刻失败。当前正确值是 `https://kych.net`。脚本仅作历史记录保留。
 
 重建内容站必须在 `/opt/kych-net` 目录下执行，配置靠 `dotenvy` 读当前目录的 `.env`。
 
@@ -70,14 +127,18 @@ DNSPod 已指向 EO。三项缺一，管理端登录会立刻失败（`ADMIN_ORI
 
 | 变量 | 值 | 说明 |
 | --- | --- | --- |
-| `SITE_URL` | `https://eo.kych.net` | 内容站的对外地址，决定 canonical 与「前往内容端」链接 |
-| `ADMIN_ORIGIN` | `https://eo.kych.net` | 管理端的 **origin**。CORS 与写接口的 Origin 白名单拿它做等值比较，**必须纯 scheme://host，不能带路径** |
-| `ADMIN_URL` | `https://eo.kych.net/管理/`（可省略） | 页面里「管理端」按钮的地址，允许带子路径；缺省由 `ADMIN_ORIGIN` 拼出 `/管理/` |
-| `WEBAUTHN_ORIGIN` | `https://eo.kych.net` | WebAuthn 校验的 origin |
+| `SITE_URL` | `https://kych.net` | 内容站的对外地址，决定 canonical 与「前往内容端」链接 |
+| `ADMIN_ORIGIN` | `https://kych.net` | 管理端的 **origin**。CORS 与写接口的 Origin 白名单拿它做等值比较，**必须纯 scheme://host，不能带路径** |
+| `ADMIN_URL` | `https://kych.net/管理/`（可省略） | 页面里「管理端」按钮的地址，允许带子路径；缺省由 `ADMIN_ORIGIN` 拼出 `/管理/` |
+| `WEBAUTHN_ORIGIN` | `https://kych.net` | WebAuthn 校验的 origin |
 | `WEBAUTHN_RP_ID` | `kych.net` | 通行密钥的绑定域，不要写成子域 |
 
 `ADMIN_ORIGIN` 与 `ADMIN_URL` 分开是必要的：前者参与等值比较，一旦带上 `/管理/`
-就再也匹配不上浏览器发来的 `Origin: https://eo.kych.net`，会导致所有写请求被拒。
+就再也匹配不上浏览器发来的 `Origin: https://kych.net`，会导致所有写请求被拒。
+
+> `.env.example` 已同步为 `kych.net`，但 `src/config.rs` 中 `SITE_URL` /
+> `ADMIN_ORIGIN` / `WEBAUTHN_ORIGIN` 的内置默认值仍是 `https://eo.kych.net`。
+> 部署时必须在 `.env` 显式覆盖，不要依赖默认值。
 
 ## 后端二进制发布
 
@@ -108,7 +169,6 @@ ssh root@49.232.71.240 "sudo -u kych-net bash -c 'cd /opt/kych-net && ./kych-net
 ```
 
 替换二进制不会动 `.env`；若本次改了配置项，需同步修改 `/opt/kych-net/.env` 并重启。
-重建内容站必须在 `/opt/kych-net` 下执行，配置靠 `dotenvy` 读当前目录的 `.env`。
 
 ## GitHub Secrets
 
@@ -127,26 +187,36 @@ rsync -az --delete admin/dist/ deploy-admin@49.232.71.240:/opt/kych-admin/ \
   -e "ssh -i ~/.ssh/kych-deploy"
 ```
 
+发版后如果浏览器仍看到旧页面，检查 EO 是否开了「强制缓存」：`/管理/` 与
+`index.html` 必须保持 `no-cache`，只有带 hash 的 `/管理/assets/*` 才能长缓存。
+必要时刷新 `https://kych.net/管理/` 的缓存。
+
 ## 回滚
 
 | 场景 | 做法 |
 | --- | --- |
 | 前端发版有问题 | `git revert` 后重新发布 |
-| 域名要退回 | `cp -a /opt/kych-net/.env.bak-<时间戳> /opt/kych-net/.env`，重启后端并重建内容站 |
+| 域名配置要退回 | `cp -a /opt/kych-net/.env.bak-<时间戳> /opt/kych-net/.env`，重启后端并重建内容站 |
 | nginx 配置要退回 | 配置备份在服务器 `/root/nginx-backup-<时间戳>/` |
 | EO 出问题 | 控制台暂停加速域名，或 DNS 直指 `49.232.71.240` |
 
 ## 已验证响应
 
+2026-11-13 实测（经 EO 与直连源站）：
+
 | 请求 | 结果 |
 | --- | --- |
-| `GET /` | `200`，`Cache-Control: no-cache` |
-| `GET /管理/` | `200`，`no-cache` |
-| `GET /管理/assets/<hash>.js` | `200`，`public, max-age=2592000, immutable` |
-| `GET /管理` | `301` → `/管理/` |
-| `GET /管理/任意深链接` | `200`，回退到管理端 index.html |
-| `http://` 任意已知域名 | `301` → `https://` |
-| `http://` 未知 Host | `444` 直接断开 |
+| `GET https://kych.net/` | `200`，`Cache-Control: no-cache`，内容站首页 |
+| `GET https://kych.net/管理/` | `200`，`no-cache`，管理端 SPA |
+| `GET https://kych.net/管理/assets/<hash>.js` | `200`，`public, max-age=2592000, immutable` |
+| `GET https://kych.net/项目/地狱之下/` | `200`，内容页 |
+| `GET http://www.kych.net/` | `301` → `https://kych.net/` |
+| `GET http://uh.kych.net/` | `200`，DNSPod 隐性转发 frameset 页 |
+| `GET https://uh.kych.net/` | 443 拒绝连接（URL 转发不支持 HTTPS） |
+| `eo` / `c` / `m` / `api.kych.net` | DNS NXDOMAIN |
+
+以下为 nginx 配置约定，部署后应自行复核：`GET /管理` → `301 /管理/`、
+`/管理/` 下任意深链接回退到管理端 `index.html`、未知 Host 的 80 请求返回 `444`。
 
 ## 只走 HTTPS
 
@@ -154,5 +224,5 @@ rsync -az --delete admin/dist/ deploy-admin@49.232.71.240:/opt/kych-admin/ \
 未知 Host 返回 444。**不能直接不监听 80**：证书靠 webroot 续期，
 `certbot.timer` 每天要访问该路径，关掉端口会让续期失效。
 
-浏览器侧访问 `http://eo.kych.net/` 由 EdgeOne 处理，源站管不到——
+浏览器侧访问 `http://kych.net/` 由 EdgeOne 处理，源站管不到——
 需要在 EO 控制台开启 **HTTPS 配置 → 强制 HTTPS 跳转** 才会 301。
