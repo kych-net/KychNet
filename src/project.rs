@@ -12,7 +12,7 @@ use crate::git::object::{commit_parents, encode_commit, ensure_text, identity_na
 use crate::git::proto;
 use crate::git::store;
 use crate::git::tree;
-use crate::models::User;
+use crate::models::{ContentFormat, User};
 
 /// 项目在内容站的固定命名空间。
 pub const PROJECT_NAMESPACE: &str = "项目";
@@ -177,10 +177,22 @@ fn output_stem(path: &str) -> &str {
     }
 }
 
-fn parent_dir(path: &str) -> &str {
-    match path.rsplit_once('/') {
-        Some((parent, _)) => parent,
-        None => "",
+/// 项目文件在构建产物中的输出路径（相对项目根目录）。
+/// 与 `build.rs` 的分类保持一致：页面类格式改写为 `<stem>.html`，
+/// CSS / SVG 及未知扩展名按原路径作为静态资源输出。
+fn project_output_path(path: &str) -> String {
+    let ext = path
+        .rsplit_once('.')
+        .map(|(_, ext)| ext)
+        .unwrap_or_default();
+    match ContentFormat::from_extension(ext) {
+        Some(
+            ContentFormat::Markdown
+            | ContentFormat::Html
+            | ContentFormat::Typst
+            | ContentFormat::Wikidot,
+        ) => format!("{}.html", output_stem(path)),
+        _ => path.to_string(),
     }
 }
 
@@ -215,15 +227,16 @@ fn validate_changes(changes: &[FileChange]) -> Result<()> {
     Ok(())
 }
 
-/// 同一目录下 `a.md` 与 `a.html` 会输出到同一个页面，必须提前拒绝。
+/// 只有构建后的输出路径完全相同才算冲突：
+/// `a.md` 与 `a.typ` 都会输出成 `a.html`，必须提前拒绝；
+/// `a.typ` 与 `a.css` 分别输出 `a.html` / `a.css`，可以共存。
 fn ensure_no_output_conflict(path: &str, files: &BTreeMap<String, Vec<u8>>) -> Result<()> {
-    let dir = parent_dir(path);
-    let stem = output_stem(path);
+    let target = project_output_path(path);
     for existing in files.keys() {
         if existing == path {
             continue;
         }
-        if parent_dir(existing) == dir && output_stem(existing) == stem {
+        if project_output_path(existing) == target {
             bail!("{path} 与 {existing} 会输出到同一个路径，请先删除或改名其中一个");
         }
     }
@@ -1712,6 +1725,46 @@ pub async fn commit_parent_chain(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_conflict_only_when_built_paths_match() {
+        let files = BTreeMap::from([
+            ("模板.typ".to_string(), b"= tpl".to_vec()),
+            ("模板.css".to_string(), b"body {}".to_vec()),
+            ("说明.md".to_string(), b"# doc".to_vec()),
+            ("图标.svg".to_string(), b"<svg/>".to_vec()),
+            ("notes.txt".to_string(), b"x".to_vec()),
+            ("子目录/模板.typ".to_string(), b"= sub".to_vec()),
+        ]);
+
+        // 截图里的场景：修改 .typ 时同名的 .css 是静态资源，不该拦。
+        assert!(ensure_no_output_conflict("模板.typ", &files).is_ok());
+        assert!(ensure_no_output_conflict("模板.css", &files).is_ok());
+        // 反过来新增同名静态资源也放行。
+        assert!(ensure_no_output_conflict("说明.css", &files).is_ok());
+        assert!(ensure_no_output_conflict("图标.png", &files).is_ok());
+        assert!(ensure_no_output_conflict("notes.css", &files).is_ok());
+        // 不同目录的同名页面互不干扰。
+        assert!(ensure_no_output_conflict("子目录/说明.md", &files).is_ok());
+
+        // 两个页面类文件同 stem 仍会输出成同一个 .html，必须拒绝。
+        assert!(ensure_no_output_conflict("模板.md", &files).is_err());
+        assert!(ensure_no_output_conflict("说明.typ", &files).is_err());
+        let err = ensure_no_output_conflict("说明.html", &files).unwrap_err();
+        assert!(err.to_string().contains("会输出到同一个路径"));
+        // 大小写不敏感：.TYP 也是页面类。
+        assert!(ensure_no_output_conflict("说明.TYP", &files).is_err());
+    }
+
+    #[test]
+    fn project_output_path_matches_build_rules() {
+        assert_eq!(project_output_path("模板.typ"), "模板.html");
+        assert_eq!(project_output_path("a/b/说明.md"), "a/b/说明.html");
+        assert_eq!(project_output_path("模板.css"), "模板.css");
+        assert_eq!(project_output_path("图标.svg"), "图标.svg");
+        assert_eq!(project_output_path("notes.txt"), "notes.txt");
+        assert_eq!(project_output_path("README"), "README");
+    }
 
     #[test]
     fn lfs_pointers_are_collected_and_deduplicated() {
