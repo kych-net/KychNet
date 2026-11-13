@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api, Content, ContentRevision } from "../api";
 
 type Mode =
@@ -163,12 +163,23 @@ export function RevisionPanel({
   const [expanded, setExpanded] = useState(false);
   const [busyLabel, setBusyLabel] = useState("");
 
+  // 代际守卫：快速切换内容时递增代际号，响应回来比对，
+  // 不一致就丢弃，避免陈旧列表覆盖新列表（进而回滚错版本）。
+  const loadGen = useRef(0);
+
   const load = useCallback(async (id: string) => {
-    const result = await api.revisions(id);
-    setItems(result.items);
-    setCurrentSeq(result.current_seq);
-    setBase(result.current_seq);
-    setTarget(result.items[0]?.seq ?? "");
+    const gen = ++loadGen.current;
+    try {
+      const result = await api.revisions(id);
+      if (gen !== loadGen.current) return;
+      setItems(result.items);
+      setCurrentSeq(result.current_seq);
+      setBase(result.current_seq);
+      setTarget(result.items[0]?.seq ?? "");
+    } catch (e) {
+      // 已被更新的加载取代时，陈旧请求的错误也一并丢弃。
+      if (gen === loadGen.current) throw e;
+    }
   }, []);
 
   useEffect(() => {
@@ -182,6 +193,8 @@ export function RevisionPanel({
         setError((e as Error).message);
       });
     } else {
+      // 清空选择时让仍在途的加载作废，响应回来不再写入。
+      loadGen.current += 1;
       setItems([]);
       setCurrentSeq(null);
       setBase("");

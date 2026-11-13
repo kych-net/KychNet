@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import { basicSetup } from "codemirror";
-import { Annotation, Compartment, EditorState } from "@codemirror/state";
+import { Annotation, Compartment, EditorState, type Extension } from "@codemirror/state";
 import { EditorView, keymap } from "@codemirror/view";
 import {
   HighlightStyle,
@@ -10,9 +10,6 @@ import {
 } from "@codemirror/language";
 import { tags as t } from "@lezer/highlight";
 import { indentWithTab } from "@codemirror/commands";
-import { markdown } from "@codemirror/lang-markdown";
-import { html } from "@codemirror/lang-html";
-import { css } from "@codemirror/lang-css";
 import type { ContentFormat } from "../api";
 
 type Props = {
@@ -101,16 +98,23 @@ const typstParser: StreamParser<EmptyState> = {
   tokenTable,
 };
 
-function languageFor(format: ContentFormat) {
+// 语言包按需动态 import，单独分包，不进编辑器主 chunk。
+// Wikidot / Typst 用的是本地 StreamLanguage，无需额外加载。
+async function loadLanguage(format: ContentFormat): Promise<Extension> {
   switch (format) {
-    case "markdown":
+    case "markdown": {
+      const { markdown } = await import("@codemirror/lang-markdown");
       return markdown();
+    }
     case "html":
+    case "svg": {
+      const { html } = await import("@codemirror/lang-html");
       return html();
-    case "css":
+    }
+    case "css": {
+      const { css } = await import("@codemirror/lang-css");
       return css();
-    case "svg":
-      return html();
+    }
     case "wikidot":
       return StreamLanguage.define(wikidotParser);
     case "typst":
@@ -172,6 +176,8 @@ export function CodeEditor({ value, format, onChange }: Props) {
   const viewRef = useRef<EditorView | null>(null);
   const onChangeRef = useRef(onChange);
   const languageCompartment = useRef(new Compartment()).current;
+  // 语言包加载的代际守卫：快速切换格式时丢弃过期的加载结果。
+  const languageGen = useRef(0);
 
   useEffect(() => {
     onChangeRef.current = onChange;
@@ -186,7 +192,8 @@ export function CodeEditor({ value, format, onChange }: Props) {
       extensions: [
         basicSetup,
         keymap.of([indentWithTab]),
-        languageCompartment.of(languageFor(format)),
+        // 语言包异步加载，加载完成前先以纯文本可用。
+        languageCompartment.of([]),
         syntaxHighlighting(highlightStyle),
         editorTheme,
         EditorView.lineWrapping,
@@ -227,9 +234,20 @@ export function CodeEditor({ value, format, onChange }: Props) {
   useEffect(() => {
     const view = viewRef.current;
     if (!view) return;
-    view.dispatch({
-      effects: languageCompartment.reconfigure(languageFor(format)),
-    });
+    const gen = ++languageGen.current;
+    // 先切回纯文本，避免上一格式的高亮残留；语言包加载完成后再启用。
+    view.dispatch({ effects: languageCompartment.reconfigure([]) });
+    void loadLanguage(format)
+      .then((language) => {
+        // 格式已再次切换或编辑器已销毁时，丢弃这次加载结果。
+        if (gen !== languageGen.current || viewRef.current !== view) return;
+        view.dispatch({
+          effects: languageCompartment.reconfigure(language),
+        });
+      })
+      .catch(() => {
+        // 语言包加载失败（如离线）时保持纯文本，编辑不受影响。
+      });
   }, [format, languageCompartment]);
 
   return <div ref={hostRef} className="code-editor" />;

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { marked } from "marked";
 import { api, Content, ContentFormat, editorPath } from "../api";
 import { CodeEditor } from "../components/CodeEditor";
@@ -84,6 +84,13 @@ export function ContentsView() {
   // 保存/删除会让右栏 Git 区域的版本历史重新拉取（contentId 不变时也需要）。
   const [historyKey, setHistoryKey] = useState(0);
 
+  // 实时跟踪最新的正文与路径：保存响应回来时比对提交时的快照，
+  // 判断用户是否已继续输入。渲染期同步，避免 effect 延迟带来的竞态窗口。
+  const bodyRef = useRef(body);
+  const slugRef = useRef(slug);
+  bodyRef.current = body;
+  slugRef.current = slug;
+
   useEffect(() => {
     void refresh();
   }, []);
@@ -165,6 +172,9 @@ export function ContentsView() {
   async function save(event: React.FormEvent) {
     event.preventDefault();
     setError("");
+    // 记录提交时的内容快照，响应回来时据此判断是否回写。
+    const submittedBody = body;
+    const submittedSlug = slug;
     try {
       const result = await api.saveContent({
         id: contentId ?? undefined,
@@ -175,9 +185,13 @@ export function ContentsView() {
         message: message.trim() || undefined,
       });
       // 服务端会把 /xef/index、/eoe/index.md 归一化成输出路径，这里回显源文件路径。
-      setContentId(result.item.id);
-      setSlug(editorPath(result.item));
-      setMessage("");
+      // 守卫：保存后用户已继续输入（正文或路径变了）就丢弃回写，
+      // 避免慢响应覆盖新输入；同一路径只保留一条内容，下次保存仍会命中它。
+      if (bodyRef.current === submittedBody && slugRef.current === submittedSlug) {
+        setContentId(result.item.id);
+        setSlug(editorPath(result.item));
+        setMessage("");
+      }
       setNotice(published ? "内容已保存，并已自动编译当前页" : "内容已保存（草稿，暂不生成页面）");
       await refresh();
       setHistoryKey((value) => value + 1);

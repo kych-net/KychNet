@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   api,
   BranchCompare,
@@ -146,6 +146,11 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [deletions, setDeletions] = useState<string[]>([]);
 
+  // 代际守卫：快速打开文件 / 切换分支时递增代际号，响应回来比对，
+  // 不一致就丢弃，避免慢响应覆盖新选择。文件与目录树各自独立计数。
+  const fileGen = useRef(0);
+  const treeGen = useRef(0);
+
   const [creating, setCreating] = useState(false);
   const [newSlug, setNewSlug] = useState("");
   const [newDescription, setNewDescription] = useState("");
@@ -217,6 +222,8 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
     setSelected(project);
     setBranch(project.default_branch);
     setDir("");
+    // 切换项目作废仍在途的文件加载。
+    fileGen.current += 1;
     setFile(null);
     setDraftPath("");
     setContent("");
@@ -577,10 +584,17 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
   }
 
   async function loadTree(project: Project, ref: string, path: string) {
-    const result = await api.projectTree(project.id, ref, path);
-    setItems(result.items);
-    setBranches(result.branches.length > 0 ? result.branches : [project.default_branch]);
-    setDir(path);
+    const gen = ++treeGen.current;
+    try {
+      const result = await api.projectTree(project.id, ref, path);
+      if (gen !== treeGen.current) return;
+      setItems(result.items);
+      setBranches(result.branches.length > 0 ? result.branches : [project.default_branch]);
+      setDir(path);
+    } catch (e) {
+      // 已被更新的加载取代时，陈旧请求的错误也一并丢弃。
+      if (gen === treeGen.current) throw e;
+    }
   }
 
   async function openDir(path: string) {
@@ -595,8 +609,10 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
 
   async function openFile(path: string) {
     if (!selected) return;
+    const gen = ++fileGen.current;
     try {
       const result = await api.projectFile(selected.id, branch, path);
+      if (gen !== fileGen.current) return;
       if (!result.item) {
         setError("文件不存在");
         return;
@@ -612,6 +628,7 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
       setDeletions((current) => current.filter((path) => path !== item.path));
       setError("");
     } catch (e) {
+      if (gen !== fileGen.current) return;
       setError((e as Error).message);
     }
   }
@@ -620,6 +637,7 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
     const name = window.prompt("新文件路径（相对于当前目录）", "untitled.md");
     if (!name) return;
     const path = joinPath(dir, name);
+    fileGen.current += 1;
     setFile(null);
     setDraftPath(path);
     const next = drafts[path] ?? "";
@@ -659,6 +677,7 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
       setDrafts({});
       setDeletions([]);
       setCommitMessage("");
+      fileGen.current += 1;
       setFile(null);
       setDraftPath("");
       setContent("");
@@ -684,6 +703,7 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
   function removeFile() {
     if (!file) return;
     if (!window.confirm(`将 ${file.path} 标记为删除？提交项目时生效。`)) return;
+    fileGen.current += 1;
     setDeletions((current) => Array.from(new Set([...current, file.path])));
     setDrafts((current) => {
       const next = { ...current };
@@ -701,6 +721,7 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
     if (!file) return;
     const target = window.prompt("新路径", file.path);
     if (!target || target === file.path) return;
+    fileGen.current += 1;
     setDrafts((current) => ({ ...current, [target]: content }));
     setDeletions((current) => Array.from(new Set([...current, file.path])));
     setFile(null);
@@ -1109,6 +1130,8 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
                       }
                       clearStaged();
                       setBranch(next);
+                      // 切换分支作废仍在途的文件加载。
+                      fileGen.current += 1;
                       setFile(null);
                       setDraftPath("");
                       setContent("");
@@ -1217,6 +1240,7 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
                         <button
                           type="button"
                           onClick={() => {
+                            fileGen.current += 1;
                             setFile(null);
                             setDraftPath("");
                             setContent("");
@@ -1475,6 +1499,8 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
                             }
                             clearStaged();
                             setBranch(next);
+                            // 切换分支作废仍在途的文件加载。
+                            fileGen.current += 1;
                             void loadCommits(selected, next).catch((err) =>
                               setError((err as Error).message),
                             );
