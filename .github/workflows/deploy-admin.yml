@@ -1,6 +1,6 @@
 name: deploy-admin
 
-# 管理端（m.kych.net）静态站发布：push 到 main 且改动 admin/ 时构建并同步到源站。
+# 管理端（kych.net/管理/）静态站发布：push 到 main 且改动 admin/ 时构建并同步到源站。
 # 源站由 nginx 直接托管，CDN（EdgeOne/腾讯云 CDN）回源到这里。
 on:
   push:
@@ -42,8 +42,9 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       # 生产构建必须显式给出 API origin。
-      # admin/src/api.ts 读的是 VITE_API_BASE_URL，留空时会退化成同源 /api，
-      # 而 m.kych.net 上只有静态文件、没有后端，接口会全部 404。
+      # admin/src/api.ts 读的是 VITE_API_BASE_URL，留空会退化成同源 /api；
+      # 当前管理端与 API 同域 kych.net，显式注入可避免把开发期 vite 代理
+      # 的相对路径行为带进产物。
       - name: 构建
         working-directory: admin
         env:
@@ -106,7 +107,7 @@ jobs:
       - name: 校验线上版本
         run: |
           sleep 2
-          curl -sS --max-time 20 "https://eo.kych.net/管理/" | grep -oE 'index-[A-Za-z0-9_-]+\.js' > /tmp/live.txt || true
+          curl -sS --max-time 20 "https://kych.net/管理/" | grep -oE 'index-[A-Za-z0-9_-]+\.js' > /tmp/live.txt || true
           grep -oE 'index-[A-Za-z0-9_-]+\.js' dist/index.html > /tmp/built.txt || true
           echo "构建产物: $(cat /tmp/built.txt)"
           echo "线上引用: $(cat /tmp/live.txt)"

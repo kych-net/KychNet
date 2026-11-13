@@ -17,11 +17,15 @@
 
 | 地址 | 用途 |
 | --- | --- |
-| `kych.net` | 公网 API:`/api/*`、`/git/*`、`/mcp`;裸域其余路径 301 到内容站 |
-| `eo.kych.net` | 统一前端入口:`/` 内容站、`/管理/` 管理端,EdgeOne 加速回源 `49.232.71.240` |
-| `www.kych.net` | 301 到 `eo.kych.net` |
+| `kych.net` | 统一入口,EdgeOne 加速回源源站 nginx:`/` 内容站、`/管理/` 管理端 SPA、`/api/*`、`/git/*`、`/mcp` 后端接口 |
+| `www.kych.net` | 直连源站,301 到 `https://kych.net/` |
+| `uh.kych.net` | DNSPod URL 转发到 `https://kych.net/项目/地狱之下/`,见 [deploy/README.md](deploy/README.md) |
 
-管理端的 `VITE_API_BASE_URL` 必须是 `https://kych.net`。
+`eo.kych.net` / `c.kych.net` / `m.kych.net` 为历史入口,DNS 记录已删除
+(2026-11-13 实测 NXDOMAIN)。主域直接接入 EdgeOne 后,回源 HOST/SNI 应为
+`kych.net`(以 EO 控制台回源配置为准),不再需要为子域单独签证书。
+
+管理端与 API 同域,生产构建的 `VITE_API_BASE_URL` 由 CI 固定注入 `https://kych.net`。
 
 ## 内容格式
 
@@ -39,13 +43,13 @@
 
 内容不保存单独的标题字段:页面标题直接在正文里写,例如 HTML 的 `<h1>…</h1>`、Markdown 的 `# …`、Wikidot 的 `+ …`、Typst 的 `= …`.页面 `<title>`、目录树、首页回退列表、API/MCP 的展示名统一使用源文件名.
 
-必须注意:**子域隔离本身并不能阻止攻击**。`c`(内容站) / `m`(管理端) / `kych.net`(API) 同属一个 eTLD+1(同站),`SameSite` Cookie 不会阻止同站跨源请求,CORS 也只阻止读取响应、不阻止带凭据的写请求被发出。因此后端对所有写接口增加了 Origin 白名单校验(仅放行管理端 origin),挡住内容站 XSS 冒用管理员会话发起写操作。这层防护仍以「内容作者可信」为前提;若要允许不可信作者,需要让 `api` 使用完全独立的站点(不同 eTLD+1)并对内容页加 CSP,而不是只靠子域划分。
+必须注意:**三端合并到同域后已没有跨源边界**。`kych.net` 同时承载内容站、管理端与 API(同源),`SameSite` Cookie、CORS 与写接口的 Origin 白名单(放行 `ADMIN_ORIGIN`)都只能挡住来自**其他域**的请求:内容页与管理端发出的 `Origin` 完全相同,后端无法据此区分二者。后端仍保留 Origin 校验,但它不再构成「内容站 XSS 冒用管理员会话」的隔离层。原先「子域划分 + 内容作者可信」的两层前提,现在实质只剩「内容作者可信 + 邀请注册」;若要允许不可信作者,需要把内容页放到完全独立的站点(不同 eTLD+1)并对内容页加 CSP。
 
 ## 界面
 
 - 内容端顶栏:左侧站点图标,图标右侧为目录树按钮,中间为可编辑导航链接(管理端「站点设置」维护),右侧为主题切换与管理端入口.
 - 内容端页脚备案信息:管理端「站点设置 → 备案信息」可填 ICP 备案号与公安联网备案号,配置后重建站点即在所有内容页页脚显示并链接至工信部备案系统(`beian.miit.gov.cn`)与公安机关互联网站安全管理服务平台(`beian.gov.cn`);两项留空则页脚整块不渲染,打印/PDF 也不带页脚.公安备案编号可单独填纯数字用于生成查询链接,留空时自动从备案号文本中提取最长数字段;编号始终只取数字,不会把任意文本拼进 URL.备案号属于运营主体信息,由部署者自行填写,代码与仓库不含任何具体号码.
-- 管理端顶栏:左侧站点图标,图标右侧为目录树按钮,中间为功能导航(内容/邀请码/用户/站点设置),右侧为头像菜单(用户设置/网站管理/前往内容端)与主题切换.
+- 管理端顶栏:左侧站点图标,图标右侧为目录树按钮,中间为功能导航(内容/项目/执行器/邀请码/用户/站点设置/资源监控),右侧为头像菜单(用户设置/网站管理/前往内容端)与主题切换.
 - 两端共用浅色、深色两套主题,基于 CSS 变量实现,选择持久化在 localStorage.
 - 内容站正文使用自托管的 `LXGW WenKai Screen`;管理端编辑器使用 CodeMirror 6,按格式高亮.
 - 管理端 Markdown/HTML 预览在浏览器端渲染,Wikidot 预览走服务端 ftml,统一放进无脚本 sandbox iframe.
@@ -76,7 +80,7 @@
 | 管理前端 | React + TypeScript + Vite |
 | 数据与表单 | 原生 fetch + React state |
 | 样式 | 原生 CSS |
-| 部署 | 源站 nginx 静态托管 + EdgeOne 加速回源（两者同域 `eo.kych.net`） |
+| 部署 | 源站 nginx 静态托管 + EdgeOne 加速回源（两者同域 `kych.net`） |
 | 项目/Git | PostgreSQL Git 对象 + Git smart HTTP + LFS |
 
 ## 目录结构
@@ -434,15 +438,15 @@ cargo run -- build --out dist
 cd admin && pnpm install && cp .env.example .env && pnpm dev
 ```
 
-开发时 `VITE_API_BASE_URL` 留空,`/api` 由 vite 代理转发到后端。生产构建前必须把它设为 API 服务的完整 origin(例如 `https://kych.net`),因为管理前端是独立静态站,没有同源 `/api` 可转发;后端 CORS 与写接口 Origin 白名单均以 `ADMIN_ORIGIN` 为准。
+开发时 `VITE_API_BASE_URL` 留空,`/api` 由 vite 代理转发到后端。生产构建由 CI 固定注入完整 origin `https://kych.net`(与管理端同域),避免把开发期代理行为带进产物;后端 CORS 与写接口 Origin 白名单均以 `ADMIN_ORIGIN` 为准。
 
 ## 构建与部署
 
 1. [.github/workflows/build.yml](.github/workflows/build.yml) 在 push、PR 和手动触发时运行测试,并编译 Linux 二进制;推送 `v*` 标签时自动创建 Release.
    - `x86_64-unknown-linux-gnu`:依赖系统 glibc,在 Ubuntu 26.04 x86-64 runner 上构建并 strip 符号表.
 2. 管理端保存内容后会自动编译当前页(改路径时同时删除旧产物);「站点设置 → 整站重建」或 `kych-net build --out dist` 重建全站.Typst 页面同时产出 `.pdf`.构建会先渲染到内存,全部成功后才清理旧的 `.html/.pdf` 并写入新路径(不再统一放 `posts/`),中途失败不会破坏现有站点.
-3. 内容站产物 `dist/` 与管理端产物由源站 nginx 直接托管:前者在 `eo.kych.net/`,后者在 `eo.kych.net/管理/`(见 [deploy/README.md](deploy/README.md)).EdgeOne 只做加速回源,不再依赖 Pages.
-4. 服务器 nginx 把 `/api/`、`/git/`、`/mcp` 等后端路径反代到 `127.0.0.1:8080`;回源时 `SNI` 固定为 `kych.net`、`Host` 为 `eo.kych.net`,所以复用主域证书.
+3. 内容站产物 `dist/` 与管理端产物由源站 nginx 直接托管:前者在 `https://kych.net/`,后者在 `https://kych.net/管理/`(见 [deploy/README.md](deploy/README.md)).EdgeOne 只做加速回源,不再依赖 Pages.
+4. 服务器 nginx 把 `/api/`、`/git/`、`/mcp` 等后端路径反代到 `127.0.0.1:8080`;主域 `kych.net` 直接接入 EdgeOne,回源 HOST/SNI 均为 `kych.net`,复用主域证书(旧入口 `eo.kych.net` 的 vhost 现仅作 301 兼容跳转).
 5. 项目 Git 对象存 PostgreSQL,LFS 文件存 `LFS_ROOT`;systemd 需要该目录的写权限.对象内容按 zlib 压缩后入库(不足 256 字节或压不动的存原样),`size` 列记原始长度;历史对象用 `kych-net db compress` 补齐压缩,可重复执行.迁移 `0020` 把 `git_objects.data` 设为 `STORAGE EXTERNAL`:保留行外存储,关掉 PostgreSQL 对已压缩 bytea 的 pglz 二次压缩;只影响新写入或被重写的行,需要一次性重写可执行 `VACUUM FULL git_objects`.push、导入与模板复制都把 pack 解析/组装、delta 还原与压缩挪到写事务外(CPU 密集部分走 `spawn_blocking`),事务内只做一次批量 INSERT,持锁时间不再随对象数线性增长.`kych-net db compress` 同样按 `(project_id, oid)` 游标分页、每批 500 行一次 `unnest` 批量 UPDATE,并在 SQL 层滤掉不足 256 字节的行,重复执行不再反复扫描小对象;批量 UPDATE 会留下 TOAST 死元组,需在运维窗口执行 `VACUUM FULL git_objects` 才能回收磁盘空间(会锁表),命令输出会给出提示.
 6. upload-pack 按 512 个对象一批增量组包:`PackBuilder` 直接把库里已压缩的 zlib 字节写进 pack,blob 不再解压 / 二次压缩,commit、tree、tag 的解析与组包放到 `spawn_blocking`;内存从「全部对象 + 完整 pack」降到「一批对象 + 完整 pack」.祖先快进校验与 REF_DELTA 基准查询也由逐条 SELECT 改为批量取.
 7. 全量 clone 的 pack 结果按「项目 + want 集合」缓存在进程内(上限 64 MiB,按插入顺序淘汰).只缓存无 have / 无 shallow / 无 filter 的干净全量 clone,增量 fetch 与浅克隆仍实时组装;ref 变更时 `store::set_ref` / `delete_ref` 立即失效该项目缓存.Git 对象按内容寻址,缓存里的 pack 内容不会陈旧,失效主要用于控制内存;缓存是进程内的,多实例部署各自持有一份.本地 1.4 万对象仓库实测:全量 clone 冷启动约 2.0 s、缓存命中约 0.25 s.
