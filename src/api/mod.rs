@@ -420,7 +420,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
         });
     }
 
-    let auth = Arc::new(Auth::new(&cfg.rp_id, &cfg.rp_origin)?);
+    let auth = Arc::new(Auth::new(&cfg.rp_id, &cfg.rp_origin, &cfg.webauthn_rp_name)?);
     let build_ctl = Arc::new(BuildCtl::new(cfg.build_out_dir.clone()));
     let build_queue = crate::workflow::queue::BuildQueue::start(build_ctl.clone());
 

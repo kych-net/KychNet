@@ -333,7 +333,8 @@ pub fn parse_commit(data: &[u8]) -> Result<CommitInfo> {
     let (head, message) = text.split_once("\n\n").unwrap_or((text, ""));
     let mut tree = None;
     let mut parents = Vec::new();
-    let mut author = "KychNet".to_string();
+    // 缺 author 行的历史（极少见的合成提交）显示为 unknown。
+    let mut author = "unknown".to_string();
     let mut committed_at = Utc::now();
     for line in head.lines() {
         if let Some(value) = line.strip_prefix("tree ") {
@@ -373,7 +374,7 @@ pub fn identity_name(name: &str) -> String {
         .collect();
     let cleaned = cleaned.trim();
     if cleaned.is_empty() {
-        "KychNet".to_string()
+        "unknown".to_string()
     } else {
         cleaned.to_string()
     }

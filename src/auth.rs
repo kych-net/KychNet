@@ -37,11 +37,14 @@ pub struct Auth {
 }
 
 impl Auth {
-    pub fn new(rp_id: &str, rp_origin: &str) -> Result<Self> {
+    /// `rp_name` 显示在通行密钥的凭据对话框里；空则回退 rp_id，
+    /// 不再硬编码品牌名（改一次 env 即可换品牌）。
+    pub fn new(rp_id: &str, rp_origin: &str, rp_name: &str) -> Result<Self> {
         let origin = Url::parse(rp_origin).context("WEBAUTHN_ORIGIN 不是合法 URL")?;
+        let rp_name = if rp_name.trim().is_empty() { rp_id } else { rp_name.trim() };
         let builder = WebauthnBuilder::new(rp_id, &origin)
             .map_err(|e| anyhow!("WebAuthn 配置错误: {e}"))?
-            .rp_name("KychNet");
+            .rp_name(rp_name);
         let webauthn = builder
             .build()
             .map_err(|e| anyhow!("WebAuthn 构建失败: {e}"))?;
@@ -293,14 +296,22 @@ async fn load_passkey_rows(pool: &PgPool, user_id: Uuid) -> Result<Vec<PasskeyRo
     .await?)
 }
 
-pub fn build_totp(username: &str, secret: &[u8]) -> Result<TOTP> {
+/// `issuer` 出现在验证器 App 的条目名里；传空则不带 issuer 段，
+/// 码值不受影响（TOTP 的 HMAC 只与密钥和时间有关）。
+
+/// TOTP issuer：TOTP_ISSUER env，未设置则不带 issuer 段。
+fn totp_issuer() -> String {
+    std::env::var("TOTP_ISSUER").unwrap_or_default()
+}
+
+pub fn build_totp(username: &str, secret: &[u8], issuer: &str) -> Result<TOTP> {
     TOTP::new(
         Algorithm::SHA1,
         6,
         1,
         30,
         secret.to_vec(),
-        Some("KychNet".to_string()),
+        (!issuer.trim().is_empty()).then(|| issuer.trim().to_string()),
         username.to_string(),
     )
     .map_err(|e| anyhow!("TOTP 配置失败: {e}"))
@@ -326,7 +337,7 @@ pub async fn provision_totp(
     .execute(pool)
     .await?;
 
-    let totp = build_totp(username, &bytes)?;
+    let totp = build_totp(username, &bytes, &totp_issuer())?;
     Ok((totp.get_url(), totp.get_secret_base32()))
 }
 
@@ -350,7 +361,7 @@ pub async fn totp_setup(pool: &PgPool, user_id: Uuid, username: &str) -> Result<
     .execute(pool)
     .await?;
 
-    let totp = build_totp(username, &bytes)?;
+    let totp = build_totp(username, &bytes, &totp_issuer())?;
     Ok((totp.get_url(), totp.get_secret_base32()))
 }
 
@@ -370,7 +381,7 @@ pub async fn totp_confirm(
     let Some(pending) = pending else {
         bail!("没有待确认的 TOTP 密钥，请重新生成后再验证");
     };
-    let totp = build_totp(username, &pending)?;
+    let totp = build_totp(username, &pending, &totp_issuer())?;
     if !totp.check_current(code)? {
         return Ok(false);
     }
@@ -396,6 +407,6 @@ pub async fn totp_verify(pool: &PgPool, user: &User, code: &str) -> Result<bool>
     let Some((Some(secret), Some(_))) = row else {
         return Ok(false);
     };
-    let totp = build_totp(&user.username, &secret)?;
+    let totp = build_totp(&user.username, &secret, &totp_issuer())?;
     Ok(totp.check_current(code)?)
 }

@@ -447,7 +447,7 @@ impl KychMcp {
 #[tool_handler(
     name = "kych-net",
     version = "0.3.0",
-    instructions = "KychNet 内容与项目接口。查询内容用 search_content/get_page；写内容用 save_content/delete_content；项目用 list_projects、list_project_files、read_project_file、write_project_file、delete_project_file。"
+    instructions = "本站内容与项目接口。查询内容用 search_content/get_page；写内容用 save_content/delete_content；项目用 list_projects、list_project_files、read_project_file、write_project_file、delete_project_file。"
 )]
 impl ServerHandler for KychMcp {}
 
