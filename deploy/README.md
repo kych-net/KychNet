@@ -20,7 +20,6 @@ EdgeOne 只做加速回源，静态文件全部由源站 nginx 托管。旧入�
 | --- | --- | --- | --- |
 | `kych.net` | CNAME | `kych.net.eo.dnse0.com` | 主域接入 EdgeOne，递归返回 EO 节点 A 记录 |
 | `www.kych.net` | A | `49.232.71.240` | 直连源站，nginx 301 → `https://kych.net/` |
-| `uh.kych.net` | CNAME | `dnspod-free.beian.mydnspod.net.` | DNSPod URL 转发，见下节 |
 | `eo` / `c` / `m` / `api.kych.net` | — | 无记录（NXDOMAIN） | 历史入口，已删除 |
 
 权威 DNS 仍在 DNSPod（`phecda.dnspod.net` / `hospital.dnspod.net`），
@@ -65,32 +64,6 @@ printf 'GET / HTTP/1.1\r\nHost: kych.net\r\nConnection: close\r\n\r\n' \
 
 浏览器把 `/管理/` 编码成 `/%E7%AE%A1%E7%90%86/` 发出，nginx 解码后再匹配 location，
 所以配置里直接写中文即可。
-
-## URL 转发（uh.kych.net）
-
-`uh.kych.net` 目前是 DNSPod 的**隐性 URL 转发**，目标
-`https://kych.net/项目/地狱之下/`。实测 `http://uh.kych.net/` 返回
-`Server: DNSPod URL V2.0` 的 `<frameset>` 套壳页（`<title>` 为空、地址栏不变），
-`https://uh.kych.net/` 的 443 端口直接拒绝连接。
-
-DNSPod URL 转发有两个硬限制：
-
-1. 转发前地址**只支持 HTTP，不支持 HTTPS**；转发后地址才支持 HTTP/HTTPS。
-2. 隐性转发用 iframe/frameset 嵌套而非重定向，移动端与 App 内置浏览器常白屏；
-   显性转发才是 301 重定向。
-
-因此只把记录「改成显性」只解决一半，`https://uh.kych.net` 依旧打不开——
-现在浏览器、微信、分享链接基本都会自动补 https。推荐改用 EO 做 301：
-
-1. 删除 DNSPod 的「隐性 URL」记录，改加 CNAME → `kych.net.eo.dnse0.com`，
-   **线路类型必须选「默认」**（只配单线路会导致部分用户解析不到）；
-2. 在 EO 把 `uh.kych.net` 加为加速域名并配边缘证书；
-3. 规则引擎：`HOST = uh.kych.net` → 「URL 重定向」301 到
-   `https://kych.net/项目/地狱之下/`。
-
-这样 http/https 都能跳，地址栏也变成目标地址。若继续用 DNSPod 转发，
-需在控制台为该记录「一键申请免费 SSL 证书」并改为显性 URL；免费版 URL 转发
-通常只有 2 条额度，且转发前后域名都要求已备案。
 
 ## 服务器侧一次性准备
 
@@ -211,8 +184,6 @@ rsync -az --delete admin/dist/ deploy-admin@49.232.71.240:/opt/kych-admin/ \
 | `GET https://kych.net/管理/assets/<hash>.js` | `200`，`public, max-age=2592000, immutable` |
 | `GET https://kych.net/项目/地狱之下/` | `200`，内容页 |
 | `GET http://www.kych.net/` | `301` → `https://kych.net/` |
-| `GET http://uh.kych.net/` | `200`，DNSPod 隐性转发 frameset 页 |
-| `GET https://uh.kych.net/` | 443 拒绝连接（URL 转发不支持 HTTPS） |
 | `eo` / `c` / `m` / `api.kych.net` | DNS NXDOMAIN |
 
 以下为 nginx 配置约定，部署后应自行复核：`GET /管理` → `301 /管理/`、
