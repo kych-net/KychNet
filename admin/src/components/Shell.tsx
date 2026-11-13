@@ -98,7 +98,7 @@ export function Shell({
                 className={view === item ? "active" : ""}
                 onClick={() => go(item)}
               >
-                {item === "runners" ? "执行器" : item === "invites" ? "邀请码" : item === "users" ? "用户" : "站点设置"}
+                {viewMeta[item].title}
               </button>
             ))}
         </nav>
