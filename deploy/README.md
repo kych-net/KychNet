@@ -5,6 +5,7 @@
 ```
 https://kych.net/        → /opt/kych-net/dist   内容站（后端 build 产出）
 https://kych.net/管理/   → /opt/kych-admin      管理端 SPA（GitHub Actions 发布）
+https://kych.net/编辑器/ → /opt/kych-editor     独立编辑器 SPA（GitHub Actions 发布）
 https://kych.net/api/…   → 127.0.0.1:8080      后端接口（同源，不再是独立子域）
 ```
 
@@ -65,6 +66,21 @@ printf 'GET / HTTP/1.1\r\nHost: kych.net\r\nConnection: close\r\n\r\n' \
 浏览器把 `/管理/` 编码成 `/%E7%AE%A1%E7%90%86/` 发出，nginx 解码后再匹配 location，
 所以配置里直接写中文即可。
 
+## 独立编辑器的子路径
+
+移动优先的独立编辑器挂在 `/编辑器/`，与管理端同构（`editor/vite.config.ts` 的
+`base` 默认 `/编辑器/`，nginx `location ^~ /编辑器/` alias 到 `/opt/kych-editor/`，
+深链接回退 `/编辑器/index.html`，assets 长缓存、入口 no-cache）。三点注意：
+
+1. 编辑器通过 `@admin` 别名复用 `admin/src` 的 `api.ts` / `CodeEditor.tsx` /
+   `editorCompletions.ts`，**不是**独立复制一份。这些共享文件改动会同时触发
+   管理端与编辑器两条流水线。
+2. 编辑器构建（`tsc --noEmit`）会编译上述 admin 源文件，它们的 bare import 按
+   node 解析落到 `admin/node_modules`。因此 [deploy-editor.yml](../.github/workflows/deploy-editor.yml)
+   在构建前**先装 admin 依赖、再装 editor 依赖**，只装 editor 会报「Cannot find module」。
+3. 编辑器与管理端共用同一部署账号与 `DEPLOY_HOST` / `DEPLOY_USER` / `DEPLOY_SSH_KEY`，
+   目标目录固定写死 `/opt/kych-editor/`（非敏感，无需新增 secret）。
+
 ## 服务器侧一次性准备
 
 ```bash
@@ -72,6 +88,8 @@ printf 'GET / HTTP/1.1\r\nHost: kych.net\r\nConnection: close\r\n\r\n' \
 useradd -m -s /bin/bash deploy-admin
 install -d -m 700 -o deploy-admin -g deploy-admin /home/deploy-admin/.ssh
 install -d -m 755 -o deploy-admin -g deploy-admin /opt/kych-admin
+# 编辑器与管理端共用该账号，另建编辑器产物目录并授予写权限
+install -d -m 755 -o deploy-admin -g deploy-admin /opt/kych-editor
 # 把 CI 公钥写入 authorized_keys（chmod 600）
 
 # nginx（本目录 kychnet-eo.conf）
@@ -152,7 +170,13 @@ ssh root@49.232.71.240 "sudo -u kych-net bash -c 'cd /opt/kych-net && ./kych-net
 | `DEPLOY_PATH` | `/opt/kych-admin/` |
 | `DEPLOY_SSH_KEY` | 部署私钥全文 |
 
+编辑器流水线复用 `DEPLOY_HOST` / `DEPLOY_USER` / `DEPLOY_SSH_KEY`，目标目录
+`/opt/kych-editor/` 直接写死在 workflow 里（非敏感），**不需要新增 secret**；
+`DEPLOY_PATH` 仍只用于管理端。
+
 ## 手工发版
+
+管理端：
 
 ```bash
 cd admin && VITE_API_BASE_URL=https://kych.net pnpm build
@@ -160,9 +184,17 @@ rsync -az --delete admin/dist/ deploy-admin@49.232.71.240:/opt/kych-admin/ \
   -e "ssh -i ~/.ssh/kych-deploy"
 ```
 
-发版后如果浏览器仍看到旧页面，检查 EO 是否开了「强制缓存」：`/管理/` 与
-`index.html` 必须保持 `no-cache`，只有带 hash 的 `/管理/assets/*` 才能长缓存。
-必要时刷新 `https://kych.net/管理/` 的缓存。
+编辑器（复用 admin 源码，本地两个工程的依赖都需已安装）：
+
+```bash
+cd editor && VITE_API_BASE_URL=https://kych.net pnpm build
+rsync -az --delete editor/dist/ deploy-admin@49.232.71.240:/opt/kych-editor/ \
+  -e "ssh -i ~/.ssh/kych-deploy"
+```
+
+发版后如果浏览器仍看到旧页面，检查 EO 是否开了「强制缓存」：`/管理/`、`/编辑器/`
+与各自的 `index.html` 必须保持 `no-cache`，只有带 hash 的 `assets/*` 才能长缓存。
+必要时刷新 `https://kych.net/管理/` 或 `https://kych.net/编辑器/` 的缓存。
 
 ## 回滚
 

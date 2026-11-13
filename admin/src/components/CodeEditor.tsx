@@ -10,12 +10,20 @@ import {
 } from "@codemirror/language";
 import { tags as t } from "@lezer/highlight";
 import { indentWithTab } from "@codemirror/commands";
+import { autocompletion, completionKeymap, type CompletionSource } from "@codemirror/autocomplete";
 import type { ContentFormat } from "../api";
+import { buildCompletionSource, type PageLink } from "./editorCompletions";
 
 type Props = {
   value: string;
   format: ContentFormat;
   onChange: (value: string) => void;
+  /** 暴露 EditorView 给外壳（格式工具栏直接 dispatch 命令）；卸载时回传 null。 */
+  onViewReady?: (view: EditorView | null) => void;
+  /** 正文字号（px）；移动端外壳传更大值提升可读性。 */
+  fontSize?: number;
+  /** 站内页面链接补全候选。 */
+  pages?: PageLink[];
 };
 
 // 标记「由外部 setValue 引起的文档变更」。
@@ -171,17 +179,50 @@ const editorTheme = EditorView.theme(
   { dark: false },
 );
 
-export function CodeEditor({ value, format, onChange }: Props) {
+function fontTheme(fontSize: number) {
+  return EditorView.theme({
+    "&": { fontSize: `${fontSize}px` },
+    ".cm-content": { fontSize: `${fontSize}px` },
+  });
+}
+
+export function CodeEditor({
+  value,
+  format,
+  onChange,
+  onViewReady,
+  fontSize = 14.4,
+  pages = [],
+}: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   const onChangeRef = useRef(onChange);
+  const onViewReadyRef = useRef(onViewReady);
+  const pagesRef = useRef(pages);
   const languageCompartment = useRef(new Compartment()).current;
+  const fontCompartment = useRef(new Compartment()).current;
   // 语言包加载的代际守卫：快速切换格式时丢弃过期的加载结果。
   const languageGen = useRef(0);
+  // 补全源在挂载时稳定注册（动态 reconfigure 的 languageData 不会被补全扩展拾取），
+  // provider 每次查询时按当前格式即时构建源。
+  const formatRef = useRef(format);
+  formatRef.current = format;
+  // 补全源函数必须保持身份稳定：CompletionState 按 `source == source` 复用 active
+  // 源，languageData 每次查询都重建函数会让补全状态每个事务重置、异步结果无法绑定。
+  // 外层包装只创建一次，格式与页面候选在查询时经 ref 即时读取。
+  const completionSource = useRef<CompletionSource>((context) =>
+    buildCompletionSource(formatRef.current, () => pagesRef.current)(context),
+  ).current;
 
   useEffect(() => {
     onChangeRef.current = onChange;
   }, [onChange]);
+  useEffect(() => {
+    onViewReadyRef.current = onViewReady;
+  }, [onViewReady]);
+  useEffect(() => {
+    pagesRef.current = pages;
+  }, [pages]);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -191,12 +232,22 @@ export function CodeEditor({ value, format, onChange }: Props) {
       doc: value,
       extensions: [
         basicSetup,
-        keymap.of([indentWithTab]),
+        keymap.of([...completionKeymap, indentWithTab]),
         // 语言包异步加载，加载完成前先以纯文本可用。
         languageCompartment.of([]),
+        EditorState.languageData.of(() => [{ autocomplete: completionSource }]),
+        fontCompartment.of(fontTheme(fontSize)),
+        autocompletion({ activateOnTyping: true, maxRenderedOptions: 40 }),
         syntaxHighlighting(highlightStyle),
         editorTheme,
         EditorView.lineWrapping,
+        // 移动端代码编辑：关闭自动大写/纠错/拼写检查，避免系统改写代码。
+        EditorView.contentAttributes.of({
+          autocapitalize: "off",
+          autocomplete: "off",
+          autocorrect: "off",
+          spellcheck: "false",
+        }),
         EditorView.updateListener.of((update) => {
           if (!update.docChanged) return;
           // 外部同步进来的内容不算用户编辑。
@@ -211,11 +262,13 @@ export function CodeEditor({ value, format, onChange }: Props) {
 
     const view = new EditorView({ state, parent: host });
     viewRef.current = view;
+    onViewReadyRef.current?.(view);
     return () => {
+      onViewReadyRef.current?.(null);
       view.destroy();
       viewRef.current = null;
     };
-    // 编辑器只创建一次；value / format 通过下面的 effect 更新。
+    // 编辑器只创建一次；value / format / fontSize 通过下面的 effect 更新。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -236,6 +289,7 @@ export function CodeEditor({ value, format, onChange }: Props) {
     if (!view) return;
     const gen = ++languageGen.current;
     // 先切回纯文本，避免上一格式的高亮残留；语言包加载完成后再启用。
+    // 补全源已稳定注册，按 formatRef 即时取当前格式，无需在此 reconfigure。
     view.dispatch({ effects: languageCompartment.reconfigure([]) });
     void loadLanguage(format)
       .then((language) => {
@@ -249,6 +303,12 @@ export function CodeEditor({ value, format, onChange }: Props) {
         // 语言包加载失败（如离线）时保持纯文本，编辑不受影响。
       });
   }, [format, languageCompartment]);
+
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({ effects: fontCompartment.reconfigure(fontTheme(fontSize)) });
+  }, [fontSize, fontCompartment]);
 
   return <div ref={hostRef} className="code-editor" />;
 }

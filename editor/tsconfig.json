@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "isolatedModules": true,
+    "baseUrl": ".",
+    "paths": { "@admin/*": ["../admin/src/*"] },
+    "types": ["vite/client"]
+  },
+  "include": [
+    "src",
+    "../admin/src/api.ts",
+    "../admin/src/components/CodeEditor.tsx",
+    "../admin/src/components/editorCompletions.ts"
+  ]
+}
