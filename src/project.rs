@@ -227,8 +227,10 @@ fn validate_changes(changes: &[FileChange]) -> Result<()> {
     Ok(())
 }
 
-/// 只有构建后的输出路径完全相同才算冲突：
-/// `a.md` 与 `a.typ` 都会输出成 `a.html`，必须提前拒绝；
+/// 构建后的输出路径冲突校验：
+/// `a.md` 与 `a.typ` 都会输出成 `a.html`，完全相同必须拒绝；
+/// `a.html` 与 `a.html/b.md` 是文件/目录冲突（写盘时 create_dir_all 会失败），
+/// 同样拒绝——否则整站重建会在删旧产物之后的写盘阶段失败，留下半删的站点。
 /// `a.typ` 与 `a.css` 分别输出 `a.html` / `a.css`，可以共存。
 fn ensure_no_output_conflict(path: &str, files: &BTreeMap<String, Vec<u8>>) -> Result<()> {
     let target = project_output_path(path);
@@ -236,11 +238,22 @@ fn ensure_no_output_conflict(path: &str, files: &BTreeMap<String, Vec<u8>>) -> R
         if existing == path {
             continue;
         }
-        if project_output_path(existing) == target {
+        let other = project_output_path(existing);
+        if other == target {
             bail!("{path} 与 {existing} 会输出到同一个路径，请先删除或改名其中一个");
+        }
+        if is_parent_path(&other, &target) || is_parent_path(&target, &other) {
+            bail!("{path} 与 {existing} 的输出路径存在文件/目录冲突，请先删除或改名其中一个");
         }
     }
     Ok(())
+}
+
+/// parent 是否是 child 的父目录路径（按 `/` 分段判断，不是裸字符串前缀）。
+fn is_parent_path(parent: &str, child: &str) -> bool {
+    child.len() > parent.len()
+        && child.starts_with(parent)
+        && child.as_bytes()[parent.len()] == b'/'
 }
 
 fn identity(user: &User) -> String {
@@ -604,6 +617,10 @@ pub async fn create_project(
     }
 
     tx.commit().await?;
+    // 提交后再失效一次：堵住「提交前失效 → 并发 fetch 用旧 ref 重建缓存」的窗口。
+    if let Err(error) = store::invalidate_project_caches(project.id) {
+        tracing::warn!(%error, "提交后作废项目缓存失败");
+    }
     Ok(project)
 }
 
@@ -797,6 +814,10 @@ pub async fn import_project(
     }
 
     tx.commit().await?;
+    // 提交后再失效一次：堵住「提交前失效 → 并发 fetch 用旧 ref 重建缓存」的窗口。
+    if let Err(error) = store::invalidate_project_caches(project.id) {
+        tracing::warn!(%error, "提交后作废项目缓存失败");
+    }
     let imported_branches: Vec<String> = branches
         .into_iter()
         .filter(|(name, _)| valid_branch(name))
@@ -881,6 +902,10 @@ pub async fn delete_project(pool: &PgPool, id: Uuid) -> Result<()> {
         bail!("项目不存在");
     }
     tx.commit().await?;
+    // 提交后再失效一次：堵住「提交前失效 → 并发 fetch 用旧 ref 重建缓存」的窗口。
+    if let Err(error) = store::invalidate_project_caches(id) {
+        tracing::warn!(%error, "提交后作废项目缓存失败");
+    }
     Ok(())
 }
 
@@ -1010,6 +1035,10 @@ pub async fn write_file(
     .await?;
 
     tx.commit().await?;
+    // 提交后再失效一次：堵住「提交前失效 → 并发 fetch 用旧 ref 重建缓存」的窗口。
+    if let Err(error) = store::invalidate_project_caches(project_id) {
+        tracing::warn!(%error, "提交后作废项目缓存失败");
+    }
     Ok(WriteResult {
         commit: commit.to_hex(),
         path: path.to_string(),
@@ -1103,6 +1132,10 @@ pub async fn write_file_bytes(
     .await?;
 
     tx.commit().await?;
+    // 提交后再失效一次：堵住「提交前失效 → 并发 fetch 用旧 ref 重建缓存」的窗口。
+    if let Err(error) = store::invalidate_project_caches(project_id) {
+        tracing::warn!(%error, "提交后作废项目缓存失败");
+    }
     Ok(WriteResult {
         commit: commit.to_hex(),
         path: path.to_string(),
@@ -1213,6 +1246,10 @@ pub async fn commit_changes(
         .await?;
     }
     tx.commit().await?;
+    // 提交后再失效一次：堵住「提交前失效 → 并发 fetch 用旧 ref 重建缓存」的窗口。
+    if let Err(error) = store::invalidate_project_caches(project_id) {
+        tracing::warn!(%error, "提交后作废项目缓存失败");
+    }
     Ok(BatchWriteResult {
         commit: commit.to_hex(),
         paths: metadata.into_iter().map(|(path, ..)| path).collect(),
@@ -1261,6 +1298,10 @@ pub async fn delete_file(
     )
     .await?;
     tx.commit().await?;
+    // 提交后再失效一次：堵住「提交前失效 → 并发 fetch 用旧 ref 重建缓存」的窗口。
+    if let Err(error) = store::invalidate_project_caches(project_id) {
+        tracing::warn!(%error, "提交后作废项目缓存失败");
+    }
     Ok(WriteResult {
         commit: new_commit.to_hex(),
         path: path.to_string(),
@@ -1301,7 +1342,14 @@ pub async fn move_file(
     if files.contains_key(to) {
         bail!("目标路径已存在: {to}");
     }
-    ensure_no_output_conflict(to, &files)?;
+    // 冲突检查要排除源文件本身：同 stem 换格式改名（a.md → a.typ）
+    // 输出路径相同是改名的目的，不是冲突。只克隆键，不克隆文件内容。
+    let others: BTreeMap<String, Vec<u8>> = files
+        .keys()
+        .filter(|key| *key != from)
+        .map(|key| (key.clone(), Vec::new()))
+        .collect();
+    ensure_no_output_conflict(to, &others)?;
     ensure_text(&data)?;
 
     let mut current = Some(root);
@@ -1324,6 +1372,10 @@ pub async fn move_file(
     )
     .await?;
     tx.commit().await?;
+    // 提交后再失效一次：堵住「提交前失效 → 并发 fetch 用旧 ref 重建缓存」的窗口。
+    if let Err(error) = store::invalidate_project_caches(project_id) {
+        tracing::warn!(%error, "提交后作废项目缓存失败");
+    }
     Ok(WriteResult {
         commit: new_commit.to_hex(),
         path: to.to_string(),
@@ -1545,6 +1597,10 @@ pub async fn revert_commit(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    // 提交后再失效一次：堵住「提交前失效 → 并发 fetch 用旧 ref 重建缓存」的窗口。
+    if let Err(error) = store::invalidate_project_caches(project_id) {
+        tracing::warn!(%error, "提交后作废项目缓存失败");
+    }
     Ok(RevertResult {
         commit: new_commit.to_hex(),
     })
@@ -1572,6 +1628,10 @@ pub async fn create_branch(pool: &PgPool, project_id: Uuid, name: &str, from: &s
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    // 提交后再失效一次：堵住「提交前失效 → 并发 fetch 用旧 ref 重建缓存」的窗口。
+    if let Err(error) = store::invalidate_project_caches(project_id) {
+        tracing::warn!(%error, "提交后作废项目缓存失败");
+    }
     Ok(())
 }
 
@@ -1597,6 +1657,10 @@ pub async fn delete_branch(pool: &PgPool, project_id: Uuid, name: &str) -> Resul
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    // 提交后再失效一次：堵住「提交前失效 → 并发 fetch 用旧 ref 重建缓存」的窗口。
+    if let Err(error) = store::invalidate_project_caches(project_id) {
+        tracing::warn!(%error, "提交后作废项目缓存失败");
+    }
     Ok(())
 }
 

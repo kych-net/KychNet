@@ -222,17 +222,29 @@ pub async fn record_revision(
     let (ops, added, removed) = encode_delta(old_body, new_body);
     let delta_data = serde_json::to_string(&ops)?;
 
-    // 检查点判定：距离上一篇全文的版本数达到上限，或增量编码本身
-    // 比新正文的 40% 还大（全文重写、单超长行等），都直接存全文。
-    let last_full: Option<i32> = sqlx::query_scalar(
-        "SELECT MAX(seq) FROM content_revisions
-         WHERE content_id = $1 AND kind = 'full'",
+    // 检查点判定：当前指针沿 parent 链到最近全文检查点的实际深度达到上限，
+    // 或增量编码本身比新正文的 40% 还大（全文重写、单超长行等），都直接存全文。
+    // 不能用「seq 与最新 full 的差」：回滚移动指针后，最新 full 可能根本不在
+    // 当前链上，seq 差会持续失真，链深无界增长直到重建触顶失败。
+    let chain_depth: Option<i32> = sqlx::query_scalar(
+        "WITH RECURSIVE chain AS (
+             SELECT seq, parent_seq, kind, 1 AS depth
+             FROM content_revisions WHERE content_id = $1 AND seq = $2
+             UNION ALL
+             SELECT r.seq, r.parent_seq, r.kind, c.depth + 1
+             FROM content_revisions r
+             JOIN chain c ON r.seq = c.parent_seq AND r.content_id = $1
+             WHERE c.kind <> 'full' AND c.depth < $3
+         )
+         SELECT depth FROM chain WHERE kind = 'full' ORDER BY depth LIMIT 1",
     )
     .bind(content_id)
-    .fetch_one(&mut *conn)
+    .bind(parent_seq)
+    .bind(MAX_CHAIN_LEN as i32)
+    .fetch_optional(&mut *conn)
     .await?;
-    let near_checkpoint = match last_full {
-        Some(last) => seq - last >= CHECKPOINT_INTERVAL,
+    let near_checkpoint = match chain_depth {
+        Some(depth) => depth >= CHECKPOINT_INTERVAL,
         None => true,
     };
     let delta_too_big = delta_data.len() * 100 > new_body.len() * DELTA_MAX_RATIO_PERCENT;
@@ -359,46 +371,58 @@ pub async fn diff_revisions(
     Ok(formatter.to_string())
 }
 
-/// 回滚：直接移动指针。`contents.rev_seq` 指向目标版本，正文与格式
+/// 回滚：直接移动指针。`contents.rev_seq` 指向目标版本，正文、格式与路径
 /// 同步取该版本，不产生新版本；下一次保存基于移动后的指针继续单线延伸。
+/// 返回 (更新后的内容, 回滚前的路径)：路径变化时调用方要删旧产物。
 pub async fn revert(
     pool: &sqlx::PgPool,
     content_id: Uuid,
     seq: i32,
-) -> Result<crate::models::Content> {
+) -> Result<(crate::models::Content, String)> {
     let mut tx = pool.begin().await?;
     // 锁住内容行：与保存流程同一把锁，回滚期间不会有并发保存插入增量。
-    let locked: Option<i32> =
-        sqlx::query_scalar("SELECT rev_seq FROM contents WHERE id = $1 FOR UPDATE")
+    let locked: Option<(i32, String)> =
+        sqlx::query_as("SELECT rev_seq, slug FROM contents WHERE id = $1 FOR UPDATE")
             .bind(content_id)
             .fetch_optional(&mut *tx)
             .await?;
-    let Some(_current) = locked else {
+    let Some((_current, old_slug)) = locked else {
         bail!("内容不存在");
     };
-    let format: String = sqlx::query_scalar(
-        "SELECT format FROM content_revisions WHERE content_id = $1 AND seq = $2",
+    let (format, slug): (String, String) = sqlx::query_as(
+        "SELECT format, slug FROM content_revisions WHERE content_id = $1 AND seq = $2",
     )
     .bind(content_id)
     .bind(seq)
     .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| anyhow::anyhow!("版本不存在"))?;
+    // 主页路径固定：回滚不能把 index.html 挪走，否则站点失去主页。
+    if old_slug == crate::service::HOME_SLUG && slug != crate::service::HOME_SLUG {
+        bail!("主页路径不能通过回滚改变");
+    }
     let body = reconstruct(&mut tx, content_id, seq).await?;
     let content = sqlx::query_as::<_, crate::models::Content>(
         "UPDATE contents
-         SET format = $2, body = $3, rev_seq = $4, updated_at = now()
+         SET slug = $2, format = $3, body = $4, rev_seq = $5, updated_at = now()
          WHERE id = $1
          RETURNING *",
     )
     .bind(content_id)
+    .bind(&slug)
     .bind(&format)
     .bind(&body)
     .bind(seq)
     .fetch_one(&mut *tx)
-    .await?;
+    .await
+    .map_err(|error| match &error {
+        sqlx::Error::Database(db) if db.code().as_deref() == Some("23505") => {
+            anyhow::anyhow!("回滚失败：该版本的路径已被其它内容占用")
+        }
+        _ => error.into(),
+    })?;
     tx.commit().await?;
-    Ok(content)
+    Ok((content, old_slug))
 }
 
 #[cfg(test)]

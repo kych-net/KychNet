@@ -1,5 +1,5 @@
 use anyhow::Result;
-use sqlx::{PgPool, Row};
+use sqlx::{PgConnection, PgPool, Row};
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -16,13 +16,15 @@ pub struct GcStats {
 }
 
 /// 从所有引用出发标记可达对象。
+///
+/// 调用方负责连接与锁：gc 路径必须在持有项目 advisory lock 的事务里调用，
+/// 否则标记与删除之间并发 push 提交的新对象会被误删。
 pub(crate) async fn mark_reachable(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     project_id: uuid::Uuid,
     extra: Vec<Oid>,
 ) -> Result<(HashSet<Oid>, HashSet<Oid>, HashSet<String>)> {
-    let mut conn = pool.acquire().await?;
-    let refs = store::list_refs(&mut conn, project_id).await?;
+    let refs = store::list_refs(conn, project_id).await?;
     let mut reachable = HashSet::new();
     let mut commits = HashSet::new();
     let mut lfs_oids = HashSet::new();
@@ -35,7 +37,7 @@ pub(crate) async fn mark_reachable(
         if !reachable.insert(oid) {
             continue;
         }
-        let Some(object) = store::get_object(&mut conn, project_id, oid).await? else {
+        let Some(object) = store::get_object(conn, project_id, oid).await? else {
             continue;
         };
         match object.kind {
@@ -83,18 +85,30 @@ fn tag_target(data: &[u8]) -> Result<Option<Oid>> {
 }
 
 /// 清理项目内不可达对象、孤立提交索引与无引用的 LFS 文件。
+///
+/// 标记与删除在同一个持有项目 advisory lock 的事务里完成，与 push/导入/
+/// 合并共用同一把锁：否则标记之后、删除之前并发 push 提交的新对象会被误删，
+/// 留下悬空引用。LFS 的数据库行也在事务内删，文件删除在提交后做——
+/// 锁已保证不会有并发 push 再引用这些不可达文件。
 pub async fn run(pool: &PgPool, root: &Path, project: &Project) -> Result<GcStats> {
     let pending = crate::workflow::dispatch::pending_commits(pool)
         .await?
         .into_iter()
         .filter_map(|bytes| Oid::from_slice(&bytes).ok())
         .collect();
-    let (reachable, commits, lfs_oids) = mark_reachable(pool, project.id, pending).await?;
+
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+        .bind(project.id.to_string())
+        .execute(&mut *tx)
+        .await?;
+    let (reachable, commits, lfs_oids) =
+        mark_reachable(&mut tx, project.id, pending).await?;
 
     let mut objects_removed = 0usize;
     let rows = sqlx::query("SELECT oid FROM git_objects WHERE project_id = $1")
         .bind(project.id)
-        .fetch_all(pool)
+        .fetch_all(&mut *tx)
         .await?;
     for row in rows {
         let bytes: Vec<u8> = row.try_get("oid")?;
@@ -103,7 +117,7 @@ pub async fn run(pool: &PgPool, root: &Path, project: &Project) -> Result<GcStat
             sqlx::query("DELETE FROM git_objects WHERE project_id = $1 AND oid = $2")
                 .bind(project.id)
                 .bind(&oid.as_bytes()[..])
-                .execute(pool)
+                .execute(&mut *tx)
                 .await?;
             objects_removed += 1;
         }
@@ -112,7 +126,7 @@ pub async fn run(pool: &PgPool, root: &Path, project: &Project) -> Result<GcStat
     let mut commits_removed = 0usize;
     let rows = sqlx::query("SELECT oid FROM git_commits WHERE project_id = $1")
         .bind(project.id)
-        .fetch_all(pool)
+        .fetch_all(&mut *tx)
         .await?;
     for row in rows {
         let bytes: Vec<u8> = row.try_get("oid")?;
@@ -121,7 +135,7 @@ pub async fn run(pool: &PgPool, root: &Path, project: &Project) -> Result<GcStat
             sqlx::query("DELETE FROM git_commits WHERE project_id = $1 AND oid = $2")
                 .bind(project.id)
                 .bind(&oid.as_bytes()[..])
-                .execute(pool)
+                .execute(&mut *tx)
                 .await?;
             commits_removed += 1;
         }
@@ -136,21 +150,28 @@ pub async fn run(pool: &PgPool, root: &Path, project: &Project) -> Result<GcStat
            )",
     )
     .bind(project.id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?
     .rows_affected() as usize;
 
     let mut lfs_removed = 0usize;
+    let mut lfs_files: Vec<String> = Vec::new();
     let rows = sqlx::query("SELECT oid FROM lfs_objects WHERE project_id = $1")
         .bind(project.id)
-        .fetch_all(pool)
+        .fetch_all(&mut *tx)
         .await?;
     for row in rows {
         let oid: String = row.try_get("oid")?;
         if !lfs_oids.contains(&oid) {
-            lfs::remove(pool, root, project.id, &oid).await?;
+            lfs::remove_row(&mut *tx, project.id, &oid).await?;
+            lfs_files.push(oid);
             lfs_removed += 1;
         }
+    }
+    tx.commit().await?;
+
+    for oid in &lfs_files {
+        lfs::remove_file(root, project.id, oid).await?;
     }
 
     Ok(GcStats {

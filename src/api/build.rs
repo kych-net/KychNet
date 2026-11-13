@@ -233,7 +233,14 @@ pub(crate) async fn rebuild_site(
 }
 
 /// 查询最近一次构建的状态。
-pub(crate) async fn build_status(State(state): State<AppState>) -> ApiResult<Json<BuildStatus>> {
+pub(crate) async fn build_status(
+    State(state): State<AppState>,
+    session: Session,
+) -> ApiResult<Json<BuildStatus>> {
+    // WHY: 构建日志尾部可能含路径、报错等敏感信息，旧实现无鉴权，匿名即可读；
+    // 与 rebuild_site 保持同一套管理员 + step-up 校验。
+    current_admin(&state, &session).await?;
+    require_step_up(&session).await?;
     Ok(Json(BuildStatus {
         running: state.build_ctl.running.load(Ordering::SeqCst),
         last: state.build_ctl.last.lock().await.clone(),

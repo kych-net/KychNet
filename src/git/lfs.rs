@@ -244,11 +244,26 @@ pub async fn load(
 
 /// 删除数据库记录与落盘文件（gc 使用）。
 pub async fn remove(pool: &PgPool, root: &Path, project_id: Uuid, oid: &str) -> Result<()> {
+    remove_row(pool, project_id, oid).await?;
+    remove_file(root, project_id, oid).await
+}
+
+/// 只删数据库索引行。gc 在持有项目锁的事务里调用，文件删除留到提交后。
+pub async fn remove_row(
+    conn: impl sqlx::PgExecutor<'_>,
+    project_id: Uuid,
+    oid: &str,
+) -> Result<()> {
     sqlx::query("DELETE FROM lfs_objects WHERE project_id = $1 AND oid = $2")
         .bind(project_id)
         .bind(oid)
-        .execute(pool)
+        .execute(conn)
         .await?;
+    Ok(())
+}
+
+/// 只删磁盘文件，索引行已由调用方删除。
+pub async fn remove_file(root: &Path, project_id: Uuid, oid: &str) -> Result<()> {
     let path = object_path(root, project_id, oid);
     match tokio::fs::remove_file(&path).await {
         Ok(()) => {}

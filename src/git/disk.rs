@@ -896,8 +896,10 @@ pub async fn offload(
         all.append(&mut batch);
     }
     // 磁盘里已有的对象（增量 push 写的 pack）也要一起收进全量 pack。
+    // 用 HashSet 去重：线性扫描在万级对象仓库里是 O(n²)。
+    let mut seen: HashSet<Oid> = all.iter().map(|item| item.oid).collect();
     for (oid, object) in disk.get_many(project.id, &disk.list(project.id)?)? {
-        if !all.iter().any(|item| item.oid == oid) {
+        if seen.insert(oid) {
             all.push(PackedObject {
                 oid,
                 kind: object.kind,
@@ -968,7 +970,7 @@ pub async fn auto_offload_sweep(
     let rows = sqlx::query(
         "SELECT p.slug FROM projects p
          JOIN git_objects g ON g.project_id = p.id
-         WHERE p.archived = false
+         WHERE p.archived_at IS NULL
          GROUP BY p.id, p.slug
          HAVING count(*) >= $1
          ORDER BY count(*) DESC",
@@ -1020,6 +1022,11 @@ impl DiskStore {
                 .unwrap_or("");
             if stem.starts_with("pack-") && stem != new_stem {
                 let _ = fs::remove_file(entry.path());
+                if name.ends_with(".pack") {
+                    // 与 repack 一致：文件删了，全局 bytes/idx 缓存条目也要清，
+                    // 否则自动 offload 每小时跑一次，缓存只增不减。
+                    evict_caches(&entry.path());
+                }
             }
         }
         Ok(())

@@ -7,6 +7,27 @@ use std::io::Write;
 
 use super::object::{hash_object, ObjectKind, Oid};
 
+/// 单个对象解压后的长度上限。pack 头里的 size 是攻击者可控的 varint，
+/// 不设上限时一个几十字节的恶意 pack 就能让 `vec![0; size]` 直接 abort 进程。
+/// 站内 Git 只存 UTF-8 文本，64 MiB 的单对象远超正常需要。
+pub(crate) const MAX_OBJECT_BYTES: usize = 64 * 1024 * 1024;
+
+/// 一个 pack 解压后的总量预算（按声明 size 累加）。防「每个对象都合法、
+/// 加起来撑爆内存」的解压炸弹；push body 上限 256 MiB、导入 pack 128 MiB，
+/// 压缩文本解压到 512 MiB 已非常宽松。
+const MAX_PACK_INFLATED_BYTES: usize = 512 * 1024 * 1024;
+
+/// delta 链最大深度。与磁盘后端自研 OFS_DELTA 的链深上限一致；
+/// 拓扑排序本身不怕深链，这个限制挡的是「深链 × 大对象」的 CPU 炸弹。
+const MAX_DELTA_DEPTH: usize = 50;
+
+/// 协商与推送命令的数量上限。wants/haves 最终会进 SQL 查询，
+/// 无上限时 256 MiB body 可塞数百万 OID 拖死数据库。
+const MAX_WANTS: usize = 4096;
+const MAX_HAVES: usize = 65_536;
+const MAX_SHALLOWS: usize = 4096;
+const MAX_COMMANDS: usize = 4096;
+
 /// 客户端请求解析失败（畸形 pkt-line、非法 OID 等）的标记类型。
 /// HTTP 层据此把错误映射成 400，而不是当成服务端故障返回 500。
 #[derive(Debug, thiserror::Error)]
@@ -141,6 +162,9 @@ fn parse_upload_request_inner(data: &[u8]) -> Result<UploadRequest> {
                 let text = String::from_utf8_lossy(&data[pos + 4..pos + length]);
                 let text = text.trim_end_matches('\n');
                 if let Some(rest) = text.strip_prefix("want ") {
+                    if request.wants.len() >= MAX_WANTS {
+                        bail!("want 数量超过上限 {MAX_WANTS}");
+                    }
                     let hex = rest.split(' ').next().unwrap_or_default();
                     request.wants.push(Oid::from_hex(hex)?);
                     // git 把 deepen-relative 内联在首个 want 行的能力列表里,
@@ -149,10 +173,16 @@ fn parse_upload_request_inner(data: &[u8]) -> Result<UploadRequest> {
                         request.deepen_relative = true;
                     }
                 } else if let Some(rest) = text.strip_prefix("have ") {
+                    if request.haves.len() >= MAX_HAVES {
+                        bail!("have 数量超过上限 {MAX_HAVES}");
+                    }
                     request
                         .haves
                         .push(Oid::from_hex(rest.split(' ').next().unwrap_or_default())?);
                 } else if let Some(rest) = text.strip_prefix("shallow ") {
+                    if request.shallow.len() >= MAX_SHALLOWS {
+                        bail!("shallow 数量超过上限 {MAX_SHALLOWS}");
+                    }
                     request
                         .shallow
                         .push(Oid::from_hex(rest.split(' ').next().unwrap_or_default())?);
@@ -212,6 +242,9 @@ fn parse_receive_request_inner(data: &[u8]) -> Result<ReceiveRequest> {
         let name = parts
             .next()
             .ok_or_else(|| anyhow::anyhow!("推送命令缺少引用名"))?;
+        if commands.len() >= MAX_COMMANDS {
+            bail!("推送命令数量超过上限 {MAX_COMMANDS}");
+        }
         commands.push((old, new, name.to_string()));
     }
 
@@ -280,29 +313,44 @@ pub fn parse_pkt_lines(data: &[u8]) -> Result<(Vec<Vec<u8>>, usize)> {
 }
 
 /// 解压一段 zlib 数据，返回解压结果与消耗的压缩字节数。
+///
+/// 流式解压：按 64 KiB 块增量追加，不预分配 `expected` 大小的缓冲区——
+/// `expected` 来自 pack 头，恶意声明超大值时预分配会直接 abort 进程。
+/// 产出超过声明长度立即拒绝，因此实际内存始终被 `expected` 约束。
 pub(crate) fn inflate(data: &[u8], expected: usize) -> Result<(Vec<u8>, usize)> {
-    let mut out = vec![0u8; expected.max(1)];
+    if expected > MAX_OBJECT_BYTES {
+        bail!("对象声明长度 {expected} 超过上限 {MAX_OBJECT_BYTES}");
+    }
+    let mut out = Vec::with_capacity(expected.min(64 * 1024));
     let mut decoder = Decompress::new(true);
+    let mut buf = [0u8; 64 * 1024];
     loop {
         let before_in = decoder.total_in();
         let before_out = decoder.total_out();
-        let start = (before_out as usize).min(out.len());
         let status = decoder
-            .decompress(data, &mut out[start..], FlushDecompress::Finish)
+            .decompress(
+                &data[before_in as usize..],
+                &mut buf,
+                FlushDecompress::Finish,
+            )
             .map_err(|error| anyhow::anyhow!("zlib 解压失败: {error}"))?;
+        let produced = (decoder.total_out() - before_out) as usize;
+        if out.len() + produced > expected {
+            bail!("zlib 解压产出超过对象声明长度");
+        }
+        out.extend_from_slice(&buf[..produced]);
         match status {
             Status::StreamEnd => break,
             Status::Ok | Status::BufError => {
-                if decoder.total_in() == before_in && decoder.total_out() == before_out {
+                if decoder.total_in() == before_in && produced == 0 {
                     bail!("zlib 数据不完整");
                 }
             }
         }
     }
-    if decoder.total_out() as usize != expected {
+    if out.len() != expected {
         bail!("对象长度与 pack 头记录不一致");
     }
-    out.truncate(expected);
     Ok((out, decoder.total_in() as usize))
 }
 
@@ -324,6 +372,9 @@ pub(crate) fn read_object_header(data: &[u8], mut pos: usize) -> Result<(u8, usi
         shift += 7;
         if shift > 63 {
             bail!("pack 对象长度溢出");
+        }
+        if size > MAX_OBJECT_BYTES as u64 {
+            bail!("pack 对象声明长度超过上限 {MAX_OBJECT_BYTES}");
         }
     }
     Ok((kind, size as usize, pos))
@@ -389,13 +440,25 @@ pub fn parse_pack(data: &[u8]) -> Result<RawPack> {
     if digest[..] != data[body_end..] {
         bail!("pack 校验和不匹配");
     }
+    // 每个对象至少占 1 字节头 + 最短 zlib 流，count 不可能超过体长；
+    // 用实际数据规模约束预分配，恶意声明 40 亿对象时不再 OOM。
+    if count > (body_end - 12) / 2 {
+        bail!("pack 对象数 {count} 与数据长度不符");
+    }
 
     let mut entries = Vec::with_capacity(count);
     let mut pos = 12usize;
+    let mut inflated_total = 0usize;
     for _ in 0..count {
         let offset = pos;
         let (kind, size, next) = read_object_header(data, pos)?;
         pos = next;
+        inflated_total = inflated_total
+            .checked_add(size)
+            .ok_or_else(|| anyhow::anyhow!("pack 解压总量溢出"))?;
+        if inflated_total > MAX_PACK_INFLATED_BYTES {
+            bail!("pack 解压总量超过上限 {MAX_PACK_INFLATED_BYTES}");
+        }
         match kind {
             1..=4 => {
                 let kind = ObjectKind::from_i16(kind as i16)
@@ -468,10 +531,16 @@ pub(crate) fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
     }
     let (result_size, next) = read_varint(delta, pos)?;
     pos = next;
-    let mut out = Vec::with_capacity(result_size);
+    if result_size > MAX_OBJECT_BYTES {
+        bail!("delta 结果声明长度超过上限 {MAX_OBJECT_BYTES}");
+    }
+    let mut out = Vec::with_capacity(result_size.min(64 * 1024));
     while pos < delta.len() {
         let op = delta[pos];
         pos += 1;
+        if out.len() >= result_size {
+            bail!("delta 产出超过声明长度");
+        }
         if op & 0x80 != 0 {
             let mut offset = 0usize;
             let mut size = 0usize;
@@ -525,64 +594,100 @@ pub(crate) fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
 /// 解析 pack 中的 delta 并算出每个对象的 OID。
 ///
 /// `external` 提供 pack 之外（数据库里已有）的基准对象，用于 thin pack。
+///
+/// 依赖图 + 就绪队列的拓扑解析：每个对象只在基准就绪时处理一次，
+/// 复杂度 O(n)；旧的定点迭代在 delta 链逆序排列时是 O(n²)。
+/// 同时跟踪链深，超过 `MAX_DELTA_DEPTH` 拒绝，挡深链 CPU 炸弹。
 pub fn resolve(
     pack: &RawPack,
     external: &HashMap<Oid, (ObjectKind, Vec<u8>)>,
 ) -> Result<Vec<(Oid, ObjectKind, Vec<u8>)>> {
+    use std::collections::VecDeque;
+
+    let entry_offset = |entry: &RawEntry| match entry {
+        RawEntry::Base { offset, .. }
+        | RawEntry::OfsDelta { offset, .. }
+        | RawEntry::RefDelta { offset, .. } => *offset,
+    };
+
     let mut by_offset: HashMap<usize, usize> = HashMap::new();
     for (index, entry) in pack.entries.iter().enumerate() {
-        let offset = match entry {
-            RawEntry::Base { offset, .. }
-            | RawEntry::OfsDelta { offset, .. }
-            | RawEntry::RefDelta { offset, .. } => *offset,
-        };
-        by_offset.insert(offset, index);
+        by_offset.insert(entry_offset(entry), index);
     }
 
-    let mut resolved: Vec<Option<(Oid, ObjectKind, Vec<u8>)>> =
-        vec![None; pack.entries.len()];
+    let count = pack.entries.len();
+    let mut resolved: Vec<Option<(Oid, ObjectKind, Vec<u8>)>> = vec![None; count];
+    let mut depth: Vec<usize> = vec![0; count];
     let mut by_oid: HashMap<Oid, (ObjectKind, Vec<u8>)> = external.clone();
-    let mut pending: Vec<usize> = (0..pack.entries.len()).collect();
+    // 基准就绪后要唤醒的依赖者：OFS 按 pack 内偏移，REF 按基准 OID。
+    let mut offset_waiters: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut oid_waiters: HashMap<Oid, Vec<usize>> = HashMap::new();
+    let mut ready: VecDeque<usize> = VecDeque::new();
 
-    while !pending.is_empty() {
-        let mut progress = false;
-        let mut next = Vec::new();
-        for index in pending {
-            let item: Option<(ObjectKind, Vec<u8>)> = match &pack.entries[index] {
-                RawEntry::Base { kind, data, .. } => Some((*kind, data.clone())),
-                RawEntry::OfsDelta {
-                    base_offset, delta, ..
-                } => match by_offset
-                    .get(base_offset)
-                    .and_then(|base_index| resolved[*base_index].as_ref())
-                {
-                    Some((_, kind, base)) => Some((*kind, apply_delta(base, delta)?)),
-                    None => None,
-                },
-                RawEntry::RefDelta { base, delta, .. } => match by_oid.get(base) {
-                    Some((kind, base)) => Some((*kind, apply_delta(base, delta)?)),
-                    None => None,
-                },
-            };
-            match item {
-                Some((kind, data)) => {
-                    let oid = hash_object(kind, &data);
-                    by_oid.insert(oid, (kind, data.clone()));
-                    resolved[index] = Some((oid, kind, data));
-                    progress = true;
+    for (index, entry) in pack.entries.iter().enumerate() {
+        match entry {
+            RawEntry::Base { .. } => ready.push_back(index),
+            RawEntry::OfsDelta { base_offset, .. } => {
+                if !by_offset.contains_key(base_offset) {
+                    bail!("OFS_DELTA 基准不在 pack 内");
                 }
-                None => next.push(index),
+                offset_waiters.entry(*base_offset).or_default().push(index);
+            }
+            RawEntry::RefDelta { base, .. } => {
+                if by_oid.contains_key(base) {
+                    ready.push_back(index);
+                } else {
+                    oid_waiters.entry(*base).or_default().push(index);
+                }
             }
         }
-        if next.is_empty() {
-            break;
-        }
-        if !progress {
-            bail!("pack 中 delta 的基准对象缺失");
-        }
-        pending = next;
     }
 
+    let mut done = 0usize;
+    while let Some(index) = ready.pop_front() {
+        let (kind, data) = match &pack.entries[index] {
+            RawEntry::Base { kind, data, .. } => (*kind, data.clone()),
+            RawEntry::OfsDelta {
+                base_offset, delta, ..
+            } => {
+                let base_index = by_offset[base_offset];
+                let (_, kind, base) = resolved[base_index]
+                    .as_ref()
+                    .expect("OFS 基准必先于依赖者解析");
+                (*kind, apply_delta(base, delta)?)
+            }
+            RawEntry::RefDelta { base, delta, .. } => {
+                let (kind, base_data) = by_oid.get(base).expect("REF 基准已就绪");
+                (*kind, apply_delta(base_data, delta)?)
+            }
+        };
+        let oid = hash_object(kind, &data);
+        resolved[index] = Some((oid, kind, data.clone()));
+        by_oid.insert(oid, (kind, data));
+        done += 1;
+        if let Some(waiters) = offset_waiters.remove(&entry_offset(&pack.entries[index])) {
+            for waiter in waiters {
+                depth[waiter] = depth[index] + 1;
+                if depth[waiter] > MAX_DELTA_DEPTH {
+                    bail!("delta 链深度超过上限 {MAX_DELTA_DEPTH}");
+                }
+                ready.push_back(waiter);
+            }
+        }
+        if let Some(waiters) = oid_waiters.remove(&oid) {
+            for waiter in waiters {
+                depth[waiter] = depth[index] + 1;
+                if depth[waiter] > MAX_DELTA_DEPTH {
+                    bail!("delta 链深度超过上限 {MAX_DELTA_DEPTH}");
+                }
+                ready.push_back(waiter);
+            }
+        }
+    }
+
+    if done != count {
+        bail!("pack 中 delta 的基准对象缺失");
+    }
     Ok(resolved.into_iter().flatten().collect())
 }
 
@@ -891,6 +996,140 @@ mod tests {
         assert!(request.deepen_relative);
         assert_eq!(request.deepen, Some(5));
         assert_eq!(request.shallow.len(), 1);
+    }
+
+    /// 把 OFS 偏移编码成 Git 变长格式（与 read_ofs_offset 的解码互逆）。
+    fn encode_ofs(mut offset: usize) -> Vec<u8> {
+        let mut bytes = vec![(offset & 0x7f) as u8];
+        offset >>= 7;
+        while offset > 0 {
+            offset -= 1;
+            bytes.push(((offset & 0x7f) as u8) | 0x80);
+            offset >>= 7;
+        }
+        bytes.reverse();
+        bytes
+    }
+
+    fn pack_with(count: u32, body: &[u8]) -> Vec<u8> {
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&count.to_be_bytes());
+        pack.extend_from_slice(body);
+        let digest = Sha1::digest(&pack);
+        pack.extend_from_slice(&digest);
+        pack
+    }
+
+    #[test]
+    fn rejects_oversized_object_count() {
+        // 声明 40 亿对象但 body 为空：旧实现 with_capacity 直接 OOM abort。
+        let pack = pack_with(u32::MAX, &[]);
+        assert!(parse_pack(&pack).is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_object_header() {
+        // 对象头声明 2^40 字节：旧实现 vec![0; size] 直接 OOM abort。
+        let mut body = Vec::new();
+        let mut size = 1u64 << 40;
+        let byte = (3 << 4) | (size & 0x0f) as u8;
+        size >>= 4;
+        body.push(byte | 0x80);
+        while size > 0x7f {
+            body.push((size & 0x7f) as u8 | 0x80);
+            size >>= 7;
+        }
+        body.push(size as u8);
+        body.extend_from_slice(&zlib(b"x"));
+        let pack = pack_with(1, &body);
+        assert!(parse_pack(&pack).is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_delta_result() {
+        // delta 头声明 result_size = 2^40。
+        let base = b"x".to_vec();
+        let base_oid = hash_object(ObjectKind::Blob, &base);
+        let mut delta = vec![1u8]; // base_size = 1
+        let mut size = 1u64 << 40;
+        delta.push((size & 0x7f) as u8 | 0x80);
+        size >>= 7;
+        while size > 0x7f {
+            delta.push((size & 0x7f) as u8 | 0x80);
+            size >>= 7;
+        }
+        delta.push(size as u8);
+        let mut body = Vec::new();
+        body.extend_from_slice(&object_header(7, delta.len()));
+        body.extend_from_slice(base_oid.as_bytes());
+        body.extend_from_slice(&zlib(&delta));
+        let pack = pack_with(1, &body);
+        let raw = parse_pack(&pack).unwrap();
+        assert!(resolve(&raw, &HashMap::new()).is_err());
+    }
+
+    #[test]
+    fn rejects_delta_chain_deeper_than_limit() {
+        // 51 级 OFS_DELTA 链，每级都合法，但链深超过上限。
+        let base = b"x".to_vec();
+        let delta = vec![1u8, 1, 0x90, 0x01]; // copy 1 字节，内容不变
+        let mut body = Vec::new();
+        let mut offsets = Vec::new();
+        offsets.push(12 + body.len());
+        body.extend_from_slice(&object_header(3, base.len()));
+        body.extend_from_slice(&zlib(&base));
+        for _ in 0..=MAX_DELTA_DEPTH {
+            let prev = *offsets.last().unwrap();
+            let cur = 12 + body.len();
+            body.extend_from_slice(&object_header(6, delta.len()));
+            body.extend_from_slice(&encode_ofs(cur - prev));
+            body.extend_from_slice(&zlib(&delta));
+            offsets.push(cur);
+        }
+        let pack = pack_with(offsets.len() as u32, &body);
+        let raw = parse_pack(&pack).unwrap();
+        let error = resolve(&raw, &HashMap::new()).unwrap_err();
+        assert!(error.to_string().contains("深度"), "{error}");
+    }
+
+    #[test]
+    fn resolves_reverse_ordered_ref_delta_chain() {
+        // 链 C→B→A 在 pack 里按 C、B、A 逆序排列：
+        // 拓扑解析应一轮完成，且结果与正序一致。
+        let a = b"hello world\n".to_vec();
+        let a_oid = hash_object(ObjectKind::Blob, &a);
+        let d1 = vec![12u8, 12, 0x90, 0x06, 6, b't', b'h', b'e', b'r', b'e', b'\n'];
+        let b = b"hello there\n".to_vec();
+        let b_oid = hash_object(ObjectKind::Blob, &b);
+        let d2 = vec![12u8, 12, 0x90, 0x0c]; // copy 全部 12 字节
+        let mut body = Vec::new();
+        body.extend_from_slice(&object_header(7, d2.len()));
+        body.extend_from_slice(b_oid.as_bytes());
+        body.extend_from_slice(&zlib(&d2));
+        body.extend_from_slice(&object_header(7, d1.len()));
+        body.extend_from_slice(a_oid.as_bytes());
+        body.extend_from_slice(&zlib(&d1));
+        body.extend_from_slice(&object_header(3, a.len()));
+        body.extend_from_slice(&zlib(&a));
+        let pack = pack_with(3, &body);
+        let raw = parse_pack(&pack).unwrap();
+        let resolved = resolve(&raw, &HashMap::new()).unwrap();
+        assert_eq!(resolved.len(), 3);
+        assert!(resolved.iter().any(|(oid, _, _)| *oid == b_oid));
+        assert!(resolved.iter().any(|(oid, _, _)| *oid == a_oid));
+    }
+
+    #[test]
+    fn rejects_want_flood() {
+        let want = "3".repeat(40);
+        let mut data = Vec::new();
+        for _ in 0..=MAX_WANTS {
+            data.extend(pkt_str(&format!("want {want}\n")));
+        }
+        data.extend(flush());
+        assert!(parse_upload_request(&data).is_err());
     }
 
     #[test]

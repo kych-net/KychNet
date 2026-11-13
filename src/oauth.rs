@@ -631,10 +631,31 @@ pub async fn token(State(state): State<AppState>, Form(form): Form<TokenForm>) -
             {
                 return (StatusCode::BAD_REQUEST, Json(json!({"error":"invalid_grant"}))).into_response();
             }
-            let _ = sqlx::query("UPDATE oauth_tokens SET revoked_at = now() WHERE refresh_hash = $1")
-                .bind(hash_token(&form.refresh_token))
-                .execute(&state.pool)
-                .await;
+            // WHY: 禁用账号不应还能靠 refresh 持续换新 token（与 /mcp 鉴权层的检查一致）。
+            let active: Option<(Uuid,)> =
+                sqlx::query_as("SELECT id FROM users WHERE id = $1 AND NOT disabled")
+                    .bind(user_id)
+                    .fetch_optional(&state.pool)
+                    .await
+                    .ok()
+                    .flatten();
+            if active.is_none() {
+                return (StatusCode::BAD_REQUEST, Json(json!({"error":"invalid_grant"}))).into_response();
+            }
+            // WHY: 旧实现吞错且无条件 UPDATE，并发刷新可重复换取多套 token；
+            // 条件 UPDATE + rows_affected 检查与授权码分支的防重放写法一致。
+            let revoked = sqlx::query(
+                "UPDATE oauth_tokens SET revoked_at = now() WHERE refresh_hash = $1 AND revoked_at IS NULL",
+            )
+            .bind(hash_token(&form.refresh_token))
+            .execute(&state.pool)
+            .await;
+            let Ok(revoked) = revoked else {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":"server_error"}))).into_response();
+            };
+            if revoked.rows_affected() != 1 {
+                return (StatusCode::BAD_REQUEST, Json(json!({"error":"invalid_grant"}))).into_response();
+            }
             match issue_tokens(&state.pool, user_id, &client_id, &scope, &resource).await {
                 Ok(value) => ([(header::CACHE_CONTROL, "no-store")], Json(value)).into_response(),
                 Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":"server_error","detail":error.to_string()}))).into_response(),

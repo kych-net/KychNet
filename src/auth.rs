@@ -385,14 +385,20 @@ pub async fn totp_confirm(
     if !totp.check_current(code)? {
         return Ok(false);
     }
-    sqlx::query(
+    // WHY: SELECT 与 UPDATE 之间并发的 totp_setup 可能换掉 pending_secret，
+    // 无条件提升会把没验证过的新密钥直接生效；绑定已验证的字节，不匹配就拒绝。
+    let updated = sqlx::query(
         "UPDATE totp_secrets
          SET secret = pending_secret, pending_secret = NULL, confirmed_at = now()
-         WHERE user_id = $1",
+         WHERE user_id = $1 AND pending_secret = $2",
     )
     .bind(user_id)
+    .bind(&pending)
     .execute(pool)
     .await?;
+    if updated.rows_affected() == 0 {
+        bail!("待确认的密钥已变化，请重新生成后再验证");
+    }
     Ok(true)
 }
 

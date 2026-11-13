@@ -182,11 +182,14 @@ pub struct Tree {
 }
 
 /// Git tree 条目的名字必须是单个路径段，不能为空、`.`、`..` 或包含 `/`、NUL、控制字符。
+/// 反斜杠也拒绝：构建侧 safe_output_path 把它当非法路径，若 push 放行，
+/// 整站重建会在「删旧产物之后」的写盘阶段失败，留下半删的站点。
 pub(crate) fn valid_tree_entry_name(name: &str) -> bool {
     !name.is_empty()
         && name != "."
         && name != ".."
         && !name.contains('/')
+        && !name.contains('\\')
         && !name.contains('\0')
         && !name.chars().any(|ch| ch.is_control())
 }

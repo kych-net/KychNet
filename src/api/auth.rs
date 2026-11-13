@@ -13,6 +13,8 @@ pub(crate) const TOTP_ATTEMPTS_PER_USER: (u32, u64) = (5, 900);
 /// 绑定流程里确认密钥的尝试次数；猜中一次就等于换绑成功，所以比登录更紧。
 pub(crate) const TOTP_CONFIRM_PER_USER: (u32, u64) = (5, 900);
 pub(crate) const REGISTER_PER_IP: (u32, u64) = (10, 60);
+/// Passkey step-up / 绑定每次发起都会插一行 auth_flows，按用户限流防止刷表。
+pub(crate) const PASSKEY_FLOW_PER_USER: (u32, u64) = (10, 60);
 
 #[derive(Deserialize)]
 pub(crate) struct RegisterRequest {
@@ -257,6 +259,12 @@ pub(crate) async fn step_up_passkey_start(
     session: Session,
 ) -> ApiResult<Json<serde_json::Value>> {
     let user = current_user(&state, &session).await?;
+    // WHY: 每次发起都往 auth_flows 插一行，不限流就能被登录用户无限刷表。
+    limited(
+        &state,
+        &format!("stepup:passkey:user:{}", user.id),
+        PASSKEY_FLOW_PER_USER,
+    )?;
     let (options, flow_id) = state.auth.start_authentication(&state.pool, &user).await?;
     Ok(Json(json!({ "flow_id": flow_id, "options": options })))
 }
@@ -294,6 +302,12 @@ pub(crate) async fn passkey_setup(
 ) -> ApiResult<Json<serde_json::Value>> {
     let user = current_user(&state, &session).await?;
     require_step_up(&session).await?;
+    // WHY: 绑定流程同样每次发起都插 auth_flows 行，与 step-up 发起共用额度上限。
+    limited(
+        &state,
+        &format!("passkey-setup:user:{}", user.id),
+        PASSKEY_FLOW_PER_USER,
+    )?;
     let (options, flow_id) = state.auth.start_registration(&state.pool, &user).await?;
     Ok(Json(json!({ "flow_id": flow_id, "options": options })))
 }

@@ -56,8 +56,7 @@ pub struct KychMcp {
     pool: PgPool,
     content_root: PathBuf,
     site_url: String,
-    build_out_dir: PathBuf,
-    exe: PathBuf,
+    build_ctl: std::sync::Arc<crate::api::build::BuildCtl>,
 }
 
 /// 由 MCP 鉴权层写入 HTTP request extensions，再通过 rmcp 的
@@ -82,44 +81,25 @@ impl KychMcp {
         pool: PgPool,
         content_root: PathBuf,
         site_url: String,
-        build_out_dir: PathBuf,
-        exe: PathBuf,
+        build_ctl: std::sync::Arc<crate::api::build::BuildCtl>,
     ) -> Self {
         Self {
             pool,
             content_root,
             site_url,
-            build_out_dir,
-            exe,
+            build_ctl,
         }
     }
 
     async fn run_build(&self, only: Option<&str>) -> Result<(), McpError> {
-        let mut command = tokio::process::Command::new(&self.exe);
-        command
-            .arg("build")
-            .arg("--out")
-            .arg(&self.build_out_dir)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        if let Some(slug) = only {
-            command.arg("--only").arg(slug);
-        }
-        let output = command
-            .output()
-            .await
-            .map_err(|e| McpError::internal_error(format!("构建进程启动失败: {e}"), None))?;
-        if !output.status.success() {
-            let mut text = String::from_utf8_lossy(&output.stdout).to_string();
-            text.push_str(&String::from_utf8_lossy(&output.stderr));
-            let tail: String = text.chars().rev().take(2000).collect::<String>().chars().rev().collect();
-            return Err(McpError::internal_error(
-                format!("编译失败: {tail}"),
-                None,
-            ));
-        }
-        Ok(())
+        // 走 BuildCtl 单槽：与管理端/工作流重建共用同一把并发闸，
+        // 不再有两个构建进程同时写产物目录。仍是隔离子进程——Typst
+        // 渲染崩溃或内存尖峰只损失一次构建，不波及常驻 API。
+        let result = match only {
+            Some(slug) => self.build_ctl.build_page(slug, None).await,
+            None => self.build_ctl.build_all().await,
+        };
+        result.map_err(|error| McpError::internal_error(format!("编译失败: {error}"), None))
     }
 
     async fn find_project(&self, slug: &str) -> Result<project::Project, McpError> {
@@ -300,6 +280,11 @@ impl KychMcp {
             .ok_or_else(|| McpError::invalid_params(format!("未知格式: {}", params.format), None))?;
         let (slug, format) = service::normalize_content_path(&params.slug, requested)
             .map_err(|e| McpError::invalid_params(format!("路径非法: {e}"), None))?;
+        // 与 HTTP 写接口同一道 SVG 校验，MCP 不是绕过矢量检查的旁路。
+        if format == ContentFormat::Svg {
+            crate::svg::validate_svg(params.body.as_bytes())
+                .map_err(|e| McpError::invalid_params(format!("SVG 非法: {e}"), None))?;
+        }
         let item = service::upsert_content(
             &self.pool,
             &slug,
@@ -590,7 +575,9 @@ fn excerpt(body: &str, needle: &str, context: usize) -> String {
     let total_chars = body.chars().count();
     let start = char_pos.saturating_sub(context);
     let end = (char_pos + lower_needle.chars().count() + context).min(total_chars);
-    let snippet: String = body.chars().skip(start).take(end - start).collect();
+    // İ 等字符小写后扩展为多码点，char_pos 可能超过 total_chars，
+    // end - start 会下溢； saturating_sub 退化为空摘要而不是 panic。
+    let snippet: String = body.chars().skip(start).take(end.saturating_sub(start)).collect();
     snippet.replace(['\n', '\r'], " ")
 }
 

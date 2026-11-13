@@ -61,8 +61,11 @@ pub fn valid_content_slug(slug: &str) -> bool {
     if segments.is_empty() || segments.iter().any(|s| !valid_segment(s)) {
         return false;
     }
-    // `/api` 与 `/css` 是保留命名空间，不能作为 HTML 内容页。
-    !segments[0].eq_ignore_ascii_case("api") && !segments[0].eq_ignore_ascii_case("css")
+    // `/api`、`/css` 与 `/管理` 是保留命名空间：前两者是后端接口与样式，
+    // `/管理` 被 nginx 优先匹配到管理端 SPA，内容写进去会被遮蔽。
+    !segments[0].eq_ignore_ascii_case("api")
+        && !segments[0].eq_ignore_ascii_case("css")
+        && segments[0] != "管理"
 }
 
 /// 校验原始 SVG 路径（数据库里的输出路径，例如 `media/logo.svg`）。

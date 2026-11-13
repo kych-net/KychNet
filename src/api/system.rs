@@ -123,11 +123,12 @@ fn fs_usage(path: &Path) -> anyhow::Result<(u64, u64)> {
     if code != 0 {
         anyhow::bail!("statvfs 失败: {}", path.display());
     }
+    // f_blocks/f_bavail 在 Linux 是 u64、macOS 是 u32，统一 cast 保证两平台可编译。
     let block = stat.f_frsize as u64;
-    let total = stat.f_blocks * block;
+    let total = stat.f_blocks as u64 * block;
     // f_bavail 是非 root 用户可用块；这里展示的是"还能放多少东西"，
     // 用 avail 而不是 free（free 含 root 保留块，会显得没满却写不进）。
-    let available = stat.f_bavail * block;
+    let available = stat.f_bavail as u64 * block;
     Ok((total - available, total))
 }
 

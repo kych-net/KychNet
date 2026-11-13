@@ -353,7 +353,8 @@ fn project_home_slug(project_slug: &str, files: &BTreeMap<String, Vec<u8>>) -> O
         .find(|path| {
             path.rsplit_once('.')
                 .and_then(|(_, ext)| ContentFormat::from_extension(ext))
-                .is_some_and(|format| format != ContentFormat::Css)
+                // SVG 是静态资源不是页面，选作主页链接会 404。
+                .is_some_and(|format| format != ContentFormat::Css && format != ContentFormat::Svg)
         })
         .map(|path| project_page_slug(project_slug, path))
 }
@@ -675,9 +676,25 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
     let tree_html = tree.render();
 
     // 先把所有页面渲染到内存。任何一篇 Typst 编译失败都不会触碰磁盘。
-    let mut pages = Vec::new();
-    for content in &contents {
-        let page = content
+    // 渲染是 CPU 密集操作（Typst 每篇编译 PDF + HTML 各一次），挪进
+    // spawn_blocking 避免阻塞 tokio 工作线程拖死同期 API 请求；有界并行
+    // 利用多核，上限 4 防止并发编译的内存叠加。Typst/Wikidot 结果按内容
+    // 哈希缓存，未变化的页面整站重建时不再重复编译。
+    let cache = std::sync::Arc::new(crate::render_cache::RenderCache::new(
+        crate::render_cache::cache_dir(out),
+    ));
+    let root_hash = std::sync::Arc::new(crate::render_cache::root_snapshot(&cfg.content_root));
+    let includes = std::sync::Arc::new(wikidot_includes);
+    let project_typst = std::sync::Arc::new(project_typst);
+    let project_icons = std::sync::Arc::new(project_icons);
+    let concurrency = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .min(4);
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let mut handles = Vec::new();
+    for (idx, content) in contents.iter().enumerate() {
+        let page_name = content
             .slug
             .strip_suffix(".html")
             .unwrap_or(&content.slug)
@@ -691,63 +708,120 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
             }
         };
         let filename = source_filename(&content.slug, content.format());
-        let ctx = render::DocContext {
-            page: &page,
-            title: &filename,
-            includes: &wikidot_includes,
-        };
-        let rendered = match project_typst.get(&content.slug) {
-            Some((files, main_path)) => render::render_doc_with_project(
-                content.format(),
-                &body,
-                &cfg.content_root,
-                &ctx,
-                files,
-                main_path,
-            ),
-            None => render::render_doc(content.format(), &body, &cfg.content_root, &ctx),
-        };
-        let rendered = match rendered {
-            Ok(value) => value,
-            Err(error) => {
-                tracing::warn!(slug = %content.slug, %error, "页面渲染失败，跳过该页");
-                continue;
-            }
-        };
+        let permit = semaphore.clone().acquire_owned().await?;
+        let content = content.clone();
+        let cache = cache.clone();
+        let root_hash = root_hash.clone();
+        let includes = includes.clone();
+        let project_typst = project_typst.clone();
+        let project_icons = project_icons.clone();
+        let root = cfg.content_root.clone();
+        let settings = settings.clone();
+        let admin_url = cfg.admin_url.clone();
+        let canonical = format!(
+            "{}{}",
+            cfg.site_url.trim_end_matches('/'),
+            content_url(&content.slug)
+        );
+        let tree_html = tree_html.clone();
+        handles.push(tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let ctx = render::DocContext {
+                page: &page_name,
+                title: &filename,
+                includes: &includes,
+            };
+            let project = project_typst.get(&content.slug);
+            let cache_key = match content.format() {
+                ContentFormat::Typst => match project {
+                    Some((files, main_path)) => {
+                        Some(cache.key_typst(&body, main_path, files, &root_hash))
+                    }
+                    None => Some(cache.key_typst(&body, "main.typ", &HashMap::new(), &root_hash)),
+                },
+                ContentFormat::Wikidot => Some(cache.key_wikidot(&body, &includes)),
+                _ => None,
+            };
+            let rendered = match cache_key.as_deref().and_then(|key| cache.get(key)) {
+                Some(hit) => hit,
+                None => {
+                    let result = match project {
+                        Some((files, main_path)) => render::render_doc_with_project(
+                            content.format(),
+                            &body,
+                            &root,
+                            &ctx,
+                            files,
+                            main_path,
+                        ),
+                        None => render::render_doc(content.format(), &body, &root, &ctx),
+                    };
+                    match result {
+                        Ok(value) => {
+                            if let Some(key) = &cache_key {
+                                cache.put(key, &value);
+                            }
+                            value
+                        }
+                        Err(error) => {
+                            tracing::warn!(slug = %content.slug, %error, "页面渲染失败，跳过该页");
+                            return None;
+                        }
+                    }
+                }
+            };
 
-        let date = content.updated_at.format("%Y-%m-%d").to_string();
-        let pdf_url = if rendered.pdf.is_some() {
-            format!("/{}", encode_path(&pdf_path(&content.slug)))
-        } else {
-            String::new()
-        };
-        let icon = project_icon_href(&content.slug, &project_icons);
-        let page = PageTemplate {
-            site: settings.clone(),
-            admin_url: cfg.admin_url.clone(),
-            canonical: format!("{}{}", cfg.site_url.trim_end_matches('/'), content_url(&content.slug)),
-            filename,
-            content: rendered.html,
-            pdf_url,
-            tree: tree_html.clone(),
-            styles,
-            icon,
-        };
-        let html = match page.render() {
-            Ok(value) => value,
-            Err(error) => {
-                tracing::warn!(slug = %content.slug, %error, "页面模板渲染失败，跳过该页");
-                continue;
-            }
-        };
-        pages.push(BuiltPage {
-            slug: content.slug.clone(),
-            title: source_filename(&content.slug, content.format()),
-            date,
-            html,
-            pdf: rendered.pdf,
-        });
+            let date = content.updated_at.format("%Y-%m-%d").to_string();
+            let pdf_url = if rendered.pdf.is_some() {
+                format!("/{}", encode_path(&pdf_path(&content.slug)))
+            } else {
+                String::new()
+            };
+            let icon = project_icon_href(&content.slug, &project_icons);
+            let template = PageTemplate {
+                site: settings,
+                admin_url,
+                canonical,
+                filename: filename.clone(),
+                content: rendered.html,
+                pdf_url,
+                tree: tree_html,
+                styles,
+                icon,
+            };
+            let html = match template.render() {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::warn!(slug = %content.slug, %error, "页面模板渲染失败，跳过该页");
+                    return None;
+                }
+            };
+            Some((
+                idx,
+                BuiltPage {
+                    slug: content.slug.clone(),
+                    title: filename,
+                    date,
+                    html,
+                    pdf: rendered.pdf,
+                },
+                cache_key,
+            ))
+        }));
     }
+    let mut ordered = Vec::new();
+    let mut used_keys = std::collections::HashSet::new();
+    for handle in handles {
+        if let Some((idx, page, key)) = handle.await? {
+            ordered.push((idx, page));
+            if let Some(key) = key {
+                used_keys.insert(key);
+            }
+        }
+    }
+    ordered.sort_by_key(|(idx, _)| *idx);
+    let mut pages: Vec<BuiltPage> = ordered.into_iter().map(|(_, page)| page).collect();
+    cache.sweep(&used_keys);
 
     // /项目/ 索引页由项目列表自动生成，不允许被普通内容占用。
     if !snapshots.is_empty() {
@@ -803,6 +877,40 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
         )
     };
 
+    // 清理旧产物之前预校验全部输出路径：非法路径或文件/目录冲突
+    // （a.html 与 a.html/b）在这里就失败，而不是等到「删完旧产物再写盘」
+    // 的写盘阶段才失败，留下半删的站点。
+    let mut outputs: Vec<String> = Vec::new();
+    for style in &styles {
+        outputs.push(style.slug.clone());
+    }
+    for (slug, _) in &project_styles {
+        outputs.push(slug.clone());
+    }
+    for (slug, _) in &project_assets {
+        outputs.push(slug.clone());
+    }
+    for (slug, _) in &raw_assets {
+        outputs.push(slug.clone());
+    }
+    for page in &pages {
+        outputs.push(page.slug.clone());
+        if page.pdf.is_some() {
+            outputs.push(pdf_path(&page.slug));
+        }
+    }
+    outputs.push(service::HOME_SLUG.to_string());
+    for slug in &outputs {
+        safe_output_path(out, slug)?;
+    }
+    outputs.sort();
+    outputs.dedup();
+    for pair in outputs.windows(2) {
+        if pair[1].starts_with(&format!("{}/", pair[0])) {
+            bail!("输出路径存在文件/目录冲突: {} 与 {}", pair[0], pair[1]);
+        }
+    }
+
     // 全部渲染成功后才清理旧产物：删除内容、改路径后，旧 .html / .pdf 不再残留。
     // 只删除本程序生成的文件，保留目录里可能存在的其它资源。
     std::fs::create_dir_all(out)?;
@@ -836,7 +944,23 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
             make_public(&pdf_target, false)?;
         }
     }
+    // 项目资产（SVG/未知扩展名文件）按原路径输出，可能撞上页面产物：
+    // 仓库里的 x.pdf 会覆盖 x.typ 编译出的 PDF。页面产物优先，冲突资产跳过。
+    let page_outputs: std::collections::HashSet<String> = pages
+        .iter()
+        .flat_map(|page| {
+            let mut paths = vec![page.slug.clone()];
+            if page.pdf.is_some() {
+                paths.push(pdf_path(&page.slug));
+            }
+            paths
+        })
+        .collect();
     for (slug, data) in &project_assets {
+        if page_outputs.contains(slug) {
+            tracing::warn!(slug = %slug, "项目资产与页面产物路径冲突，跳过该资产");
+            continue;
+        }
         write_raw(out, slug, data)?;
     }
     for (slug, data) in &raw_assets {
@@ -869,15 +993,6 @@ pub async fn run_one(
         && !service::valid_svg_slug(only)
     {
         bail!("非法内容路径: {only}");
-    }
-    if let Some(old) = remove {
-        if old != only
-            && (service::valid_content_slug(old)
-                || service::valid_style_slug(old)
-                || service::valid_svg_slug(old))
-        {
-            remove_output(out, old)?;
-        }
     }
 
     let settings = service::get_settings(pool).await?;
@@ -934,6 +1049,9 @@ pub async fn run_one(
     let tree_html = tree.render();
 
     let Some(content) = contents.iter().find(|content| content.slug == only) else {
+        if only == service::HOME_SLUG {
+            bail!("主页不能被删除或取消发布");
+        }
         remove_output(out, only)?;
         return Ok(());
     };
@@ -950,8 +1068,27 @@ pub async fn run_one(
         title: &filename,
         includes: &wikidot_includes,
     };
-    let rendered = render::render_doc(content.format(), &body, &cfg.content_root, &ctx)
-        .with_context(|| format!("渲染 {} 失败", content.slug))?;
+    // 与整站构建共用渲染缓存：保存未变化格式/正文的页面时直接命中。
+    let cache = crate::render_cache::RenderCache::new(crate::render_cache::cache_dir(out));
+    let cache_key = match content.format() {
+        ContentFormat::Typst => {
+            let root_hash = crate::render_cache::root_snapshot(&cfg.content_root);
+            Some(cache.key_typst(&body, "main.typ", &HashMap::new(), &root_hash))
+        }
+        ContentFormat::Wikidot => Some(cache.key_wikidot(&body, &wikidot_includes)),
+        _ => None,
+    };
+    let rendered = match cache_key.as_deref().and_then(|key| cache.get(key)) {
+        Some(hit) => hit,
+        None => {
+            let value = render::render_doc(content.format(), &body, &cfg.content_root, &ctx)
+                .with_context(|| format!("渲染 {} 失败", content.slug))?;
+            if let Some(key) = &cache_key {
+                cache.put(key, &value);
+            }
+            value
+        }
+    };
     let pdf_url = if rendered.pdf.is_some() {
         format!("/{}", encode_path(&pdf_path(&content.slug)))
     } else {
@@ -969,6 +1106,17 @@ pub async fn run_one(
         icon: String::new(),
     }
     .render()?;
+
+    // 渲染成功后才删旧路径：改名 + 渲染失败时旧页面还在，不会丢页。
+    if let Some(old) = remove {
+        if old != only
+            && (service::valid_content_slug(old)
+                || service::valid_style_slug(old)
+                || service::valid_svg_slug(old))
+        {
+            remove_output(out, old)?;
+        }
+    }
 
     std::fs::create_dir_all(out)?;
     make_public(out, true)?;

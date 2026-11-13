@@ -437,6 +437,16 @@ pub async fn set_ref(
     .execute(conn)
     .await?;
     // ref 变了，该项目的全量 clone pack 缓存与磁盘全量快照标记都要作废。
+    // 这里在事务提交前先作废一次兜底；调用方在 commit 之后必须再调
+    // `invalidate_project_caches`，否则并发 fetch 可能在窗口内用旧 ref
+    // 重建缓存，留下陈旧的全量 clone。
+    invalidate_project_caches(project_id)?;
+    Ok(())
+}
+
+/// 作废项目的全量 clone pack 缓存与磁盘全量快照标记。
+/// ref 更新事务**提交后**必须再调用一次（提交前的调用只是兜底）。
+pub fn invalidate_project_caches(project_id: Uuid) -> Result<()> {
     super::pack_cache::invalidate_project(project_id);
     if let Some(disk) = disk_store() {
         disk.clear_full(project_id)?;
@@ -454,10 +464,7 @@ pub async fn delete_ref(
         .bind(name)
         .execute(conn)
         .await?;
-    super::pack_cache::invalidate_project(project_id);
-    if let Some(disk) = disk_store() {
-        disk.clear_full(project_id)?;
-    }
+    invalidate_project_caches(project_id)?;
     Ok(())
 }
 

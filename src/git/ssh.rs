@@ -399,6 +399,12 @@ fn parse_exec(command: &str) -> Option<(Service, String)> {
     // git 客户端总是给路径加引号；裸路径（手工测试）也接受。
     let path = match rest.trim() {
         value if value.len() >= 2 && (value.starts_with('\'') || value.starts_with('"')) => {
+            let quote = value.chars().next().expect("已检查非空");
+            // 闭引号缺失时不能按字节切尾：末尾若是多字节字符会切在
+            // 字符中间直接 panic。
+            if !value.ends_with(quote) {
+                return None;
+            }
             value[1..value.len() - 1].to_string()
         }
         value => value.trim().to_string(),
@@ -637,6 +643,9 @@ async fn read_pkt_lines<R: AsyncRead + Unpin>(
             return Ok(out);
         }
         out.extend(proto::pkt(&payload));
+        if out.len() > MAX_PKT_SESSION_BYTES {
+            bail!("pkt-line 会话数据超过上限 {MAX_PKT_SESSION_BYTES}");
+        }
     }
 }
 
@@ -833,6 +842,14 @@ where
 const PUSH_IDLE_TIMEOUT_SECS: u64 = 3;
 const PUSH_MAX_IDLE_ROUNDS: u32 = 10;
 
+/// SSH push 的 pack 总量上限，与 HTTP 侧 GIT_MAX_BODY_BYTES 对齐。
+/// 没有它，已认证客户端持续发送就能把接收缓冲撑到无限大。
+const MAX_PUSH_BYTES: usize = 256 * 1024 * 1024;
+
+/// 单次 pkt-line 协商段（命令/want/have）的总量上限。
+/// 正常协商远小于此；haves 上限 65536 条 × 49 字节也才 ~3 MiB。
+const MAX_PKT_SESSION_BYTES: usize = 8 * 1024 * 1024;
+
 /// 检查数据末尾是不是一个完整 packfile 的 SHA-1 trailer。
 ///
 /// Git pack 的最后 20 字节是前面所有字节的 SHA-1。客户端不关闭写端时，
@@ -903,6 +920,9 @@ where
                 Ok(Ok(0)) => break,
                 Ok(Ok(count)) => {
                     rest.extend_from_slice(&buf[..count]);
+                    if rest.len() > MAX_PUSH_BYTES {
+                        bail!("推送 pack 超过上限 {MAX_PUSH_BYTES} 字节");
+                    }
                     idle_rounds = 0;
                 }
                 Ok(Err(error)) => return Err(error.into()),

@@ -695,8 +695,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
         state_pool_for_mcp.clone(),
         cfg.content_root.clone(),
         cfg.site_url.clone(),
-        cfg.build_out_dir.clone(),
-        std::env::current_exe()?,
+        build_ctl.clone(),
     );
     let app = app.merge(crate::mcp::router(
         mcp_state,

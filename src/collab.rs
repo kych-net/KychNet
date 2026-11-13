@@ -927,6 +927,10 @@ pub async fn merge_pr(
     .await?;
 
     tx.commit().await?;
+    // 提交后再失效一次：堵住「提交前失效 → 并发 fetch 用旧 ref 重建缓存」的窗口。
+    if let Err(error) = store::invalidate_project_caches(project_id) {
+        tracing::warn!(%error, "提交后作废项目缓存失败");
+    }
     let mut conn = pool.acquire().await?;
     let pr = fetch_pr(&mut conn, project_id, number)
         .await?

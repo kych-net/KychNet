@@ -1,8 +1,9 @@
+use rand::seq::SliceRandom;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// 允许同时跟踪的 key 数量上限。超过后按「最早到期的四分之一」淘汰。
+/// 允许同时跟踪的 key 数量上限。超过后随机淘汰四分之一。
 ///
 /// 有这个上限才不会反过来变成 DoS：限流器自己不能被海量不同 key 撑爆。
 const MAX_KEYS: usize = 20_000;
@@ -37,7 +38,7 @@ impl RateLimiter {
         if slots.len() >= MAX_KEYS {
             evict_expired(&mut slots, now);
             if slots.len() >= MAX_KEYS {
-                evict_oldest(&mut slots);
+                evict_random(&mut slots);
             }
         }
 
@@ -74,15 +75,16 @@ fn evict_expired(slots: &mut HashMap<String, Window>, now: Instant) {
     slots.retain(|_, window| now < window.until);
 }
 
-/// 表满且没有过期项时，淘汰最早到期的四分之一，给新 key 腾位置。
-fn evict_oldest(slots: &mut HashMap<String, Window>) {
-    let mut order: Vec<(Instant, String)> = slots
-        .iter()
-        .map(|(key, window)| (window.until, key.clone()))
-        .collect();
-    order.sort_unstable();
-    let remove = (order.len() / 4).max(1);
-    for (_, key) in order.into_iter().take(remove) {
+/// 表满且没有过期项时，随机淘汰四分之一，给新 key 腾位置。
+///
+/// WHY: 旧实现按「最早到期」淘汰，分布式洪水用海量短窗口新键就能把受害者
+/// 较早创建的长窗口计数器确定性地挤出表，使限流形同虚设；随机淘汰让攻击者
+/// 无法瞄准特定 key，只能靠概率碰运气。
+fn evict_random(slots: &mut HashMap<String, Window>) {
+    let mut keys: Vec<String> = slots.keys().cloned().collect();
+    keys.shuffle(&mut rand::thread_rng());
+    let remove = (keys.len() / 4).max(1);
+    for key in keys.into_iter().take(remove) {
         slots.remove(&key);
     }
 }
@@ -134,5 +136,19 @@ mod tests {
             limiter.check(&format!("flood-{i}"), 100, Duration::from_secs(60));
         }
         assert!(limiter.len() <= MAX_KEYS, "限流器自身被撑爆: {}", limiter.len());
+    }
+
+    #[test]
+    fn eviction_removes_a_quarter_of_keys() {
+        let now = Instant::now();
+        let mut slots = HashMap::new();
+        for i in 0..100 {
+            slots.insert(
+                format!("k{i}"),
+                Window { count: 1, until: now + Duration::from_secs(60) },
+            );
+        }
+        evict_random(&mut slots);
+        assert_eq!(slots.len(), 75, "应随机淘汰四分之一");
     }
 }

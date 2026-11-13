@@ -248,10 +248,12 @@ pub(crate) async fn content_revision_revert(
     Path((id, seq)): Path<(Uuid, i32)>,
 ) -> ApiResult<Json<serde_json::Value>> {
     current_user(&state, &session).await?;
-    let content = crate::history::revert(&state.pool, id, seq)
+    let (content, old_slug) = crate::history::revert(&state.pool, id, seq)
         .await
         .map_err(|error| ApiError::with_status(StatusCode::NOT_FOUND, format!("{error}")))?;
-    if let Err(error) = state.build_ctl.build_page(&content.slug, None).await {
+    // 回滚恢复了旧路径时，旧路径的产物要一并删除。
+    let remove = (old_slug != content.slug).then_some(old_slug.as_str());
+    if let Err(error) = state.build_ctl.build_page(&content.slug, remove).await {
         return Err(ApiError::with_status(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("已回滚，但自动编译失败：{error}"),

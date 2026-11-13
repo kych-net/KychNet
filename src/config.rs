@@ -71,8 +71,8 @@ impl Config {
         // ADMIN_ORIGIN 会被 CORS 与写接口的 Origin 校验直接比较，必须是纯
         // origin（带路径会永远匹配不上），所以页面里可点击的管理端地址另用
         // ADMIN_URL，默认由 ADMIN_ORIGIN 拼出。
-        let site_url = env_or("SITE_URL", "https://eo.kych.net");
-        let admin_origin = env_or("ADMIN_ORIGIN", "https://eo.kych.net");
+        let site_url = env_or("SITE_URL", "https://kych.net");
+        let admin_origin = env_or("ADMIN_ORIGIN", "https://kych.net");
         let admin_url = env_or(
             "ADMIN_URL",
             &format!("{}/管理/", admin_origin.trim_end_matches('/')),
@@ -87,7 +87,7 @@ impl Config {
             // RP ID 是凭据的绑定域：写成子域的话，日后管理端再换域
             // 就会让已注册的通行密钥全部失效。
             rp_id: env_or("WEBAUTHN_RP_ID", "kych.net"),
-            rp_origin: env_or("WEBAUTHN_ORIGIN", "https://eo.kych.net"),
+            rp_origin: env_or("WEBAUTHN_ORIGIN", "https://kych.net"),
             webauthn_rp_name: env_or("WEBAUTHN_RP_NAME", ""),
             content_root: PathBuf::from(env_or("CONTENT_ROOT", "content")),
             build_out_dir: PathBuf::from(env_or("BUILD_OUT_DIR", "dist")),

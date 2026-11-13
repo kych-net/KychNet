@@ -106,7 +106,7 @@
 │   ├── workflow/        # 工作流执行(runner 派发、事件出箱)
 │   ├── cli_cn.rs        # 中文输出格式化(CLI)
 │   └── git/             # PostgreSQL Git、LFS、smart HTTP
-├── plugins/             # 6 个内置 MCP 服务器插件
+├── plugins/             # 内置 MCP 客户端插件（dsh-mcp-kychnet）
 ├── templates/           # Askama 模板(layout / index / page)
 ├── migrations/          # SQLx 迁移(当前 0001–0020)
 └── admin/               # 管理前端(独立 Vite 工程)
@@ -474,6 +474,6 @@ cd admin && pnpm install && cp .env.example .env && pnpm dev
 - 模板与 API 共用同一套领域模型,避免两端口径漂移.
 - Typst 在当前进程内编译,由 `VirtualPath::resolve(root)` 加 canonicalize 双重校验把文件读取限制在 `CONTENT_ROOT` 内,避免内容作者通过 `#include` 读到构建机上的任意文件;父目录校验之外还会对目标文件本身做 `symlink_metadata` 判断,内容目录里的符号链接一律拒绝(否则 `link.png -> /etc/passwd` 会被 `fs::read` 跟进去).生产仍建议放进断网容器并加 CPU/内存限额,构建机上的 `.env` 与云凭据不要落在可读目录.
 - Wikidot 由 [ftml](https://docs.rs/ftml) 渲染,`[[include]]` 在构建时从数据库预取 Wikidot 页面并限制 8 层递归;`ftml` 是 AGPL-3.0,因此本项目也按 AGPL-3.0 分发,见 `LICENSE`.
-- 编译缓存尚未实现;目前每篇 Typst 内容会分别编译 `PagedDocument`(出 PDF)与 `HtmlDocument`(出 HTML)各一次.
+- Typst/Wikidot 编译产物按内容哈希缓存在输出目录同级的 `.kychnet-render-cache/`(键覆盖正文、项目文件快照、内容目录磁盘快照与 include 集合),整站重建只重编变化的页面;每轮构建结束清理未使用条目.渲染在 `spawn_blocking` 里有界并行(上限 4),不再阻塞 tokio 工作线程.
 - 静态产物保持平台中立:只用相对路径、不写死域名,重定向与 404 由 nginx 配置.
 - 静态资源使用哈希文件名并长缓存,HTML 短缓存;压缩交给 CDN.

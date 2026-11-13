@@ -13,6 +13,7 @@ mod oauth;
 mod project;
 mod rate;
 mod render;
+mod render_cache;
 mod service;
 mod svg;
 mod workflow;
@@ -293,11 +294,12 @@ async fn main() -> Result<()> {
                             .into_iter()
                             .filter_map(|bytes| git::object::Oid::from_slice(&bytes).ok())
                             .collect();
-                        Some(
-                            git::gc::mark_reachable(&pool, project.id, pending)
+                        Some({
+                            let mut conn = pool.acquire().await?;
+                            git::gc::mark_reachable(&mut conn, project.id, pending)
                                 .await?
-                                .0,
-                        )
+                                .0
+                        })
                     } else {
                         None
                     };

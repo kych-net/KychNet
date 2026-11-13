@@ -42,6 +42,11 @@ fn contains_dangerous_css(value: &str) -> bool {
         .chars()
         .filter(|ch| !ch.is_whitespace())
         .collect();
+    // WHY: CSS 转义（如 `\75rl(` 解码后就是 `url(`）能绕过下面的字面匹配；
+    // 头像 CSS 没有合法转义需求，见到反斜杠直接拒绝。
+    if compact.contains('\\') {
+        return true;
+    }
     if compact.contains("@import") || compact.contains("expression(") {
         return true;
     }
@@ -199,6 +204,14 @@ mod tests {
         for svg in cases {
             assert!(validate_svg(svg.as_bytes()).is_err(), "应拒绝 {svg}");
         }
+    }
+
+    #[test]
+    fn rejects_css_escape_bypass() {
+        // `\75` 是 'u' 的 CSS 十六进制转义，浏览器解码后 `\75rl(` 就是 url(，
+        // 只按字面 "url(" 匹配会被绕过。
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10" fill="\75rl(https://evil.com/x)"/></svg>"#;
+        assert!(validate_svg(svg.as_bytes()).is_err());
     }
 
     #[test]
