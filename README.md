@@ -19,7 +19,6 @@
 | --- | --- |
 | `kych.net` | 统一入口,EdgeOne 加速回源源站 nginx:`/` 内容站、`/管理/` 管理端 SPA、`/api/*`、`/git/*`、`/mcp` 后端接口 |
 | `www.kych.net` | 直连源站,301 到 `https://kych.net/` |
-| `uh.kych.net` | DNSPod URL 转发到 `https://kych.net/项目/地狱之下/`,见 [deploy/README.md](deploy/README.md) |
 
 `eo.kych.net` / `c.kych.net` / `m.kych.net` 为历史入口,DNS 记录已删除
 (2026-11-13 实测 NXDOMAIN)。主域直接接入 EdgeOne 后,回源 HOST/SNI 应为
