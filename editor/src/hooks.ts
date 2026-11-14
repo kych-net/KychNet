@@ -53,19 +53,35 @@ export function useAutosave(
   const timer = useRef<number | null>(null);
   const saveRef = useRef(save);
   saveRef.current = save;
+  // 串行保存：同一时刻只允许一个请求在飞。保存期间又有新编辑时只记一个
+  // 「待保存」标记，当前请求完成后再存最新一次——并发保存会让慢请求把
+  // 较新的内容覆盖回旧版本。
+  const inFlight = useRef(false);
+  const pending = useRef(false);
 
   const flush = useCallback(async () => {
     if (timer.current) {
       window.clearTimeout(timer.current);
       timer.current = null;
     }
+    if (inFlight.current) {
+      pending.current = true;
+      return;
+    }
+    inFlight.current = true;
     setStatus("saving");
     try {
-      await saveRef.current();
+      do {
+        pending.current = false;
+        await saveRef.current();
+        // 保存期间用户又改了：立刻再存一次，直到没有新的待保存标记。
+      } while (pending.current);
       setStatus("saved");
       if (draftKey) localStorage.removeItem(draftKey);
     } catch {
       setStatus("error");
+    } finally {
+      inFlight.current = false;
     }
   }, [draftKey]);
 

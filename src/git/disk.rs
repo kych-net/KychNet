@@ -34,7 +34,7 @@ use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use sha1::{Digest, Sha1};
 use sqlx::{PgPool, Row};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -555,9 +555,19 @@ impl PackFile {
     }
 }
 
-fn bytes_cache() -> &'static Mutex<HashMap<PathBuf, Arc<Vec<u8>>>> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<Vec<u8>>>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+/// pack 字节缓存上限（64 MiB 的独立仓库通常远小于这个量级）。
+const BYTES_CACHE_LIMIT: usize = 256 * 1024 * 1024;
+/// 索引缓存上限（按「条目数 / 256」粗略计费）。
+const IDX_CACHE_LIMIT: usize = 512;
+
+fn idx_cache() -> &'static Mutex<BoundedCache<Idx>> {
+    static CACHE: OnceLock<Mutex<BoundedCache<Idx>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(BoundedCache::new(IDX_CACHE_LIMIT)))
+}
+
+fn bytes_cache() -> &'static Mutex<BoundedCache<Vec<u8>>> {
+    static CACHE: OnceLock<Mutex<BoundedCache<Vec<u8>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(BoundedCache::new(BYTES_CACHE_LIMIT)))
 }
 
 /// 项目级 pack 清单缓存：目录 mtime 未变就复用上次的扫描结果。
@@ -590,54 +600,75 @@ fn build_pack_index(packs: &PackList) -> PackIndex {
     index
 }
 
-fn idx_cache() -> &'static Mutex<HashMap<PathBuf, Arc<Idx>>> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<Idx>>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+/// 有界的 LRU 缓存：超限时按插入顺序淘汰最旧的条目。
+///
+/// 之前用的是无上限的 `HashMap`，多个大仓库长期运行会把所有 pack 的
+/// 字节与索引都留在内存里。淘汰只影响下次读取时重新加载，已在使用的
+/// `Arc` 不受影响。
+struct BoundedCache<V> {
+    /// 条目本身连同它的「成本」（字节数或索引条目数）一起存，
+    /// 淘汰时才能准确扣减。
+    entries: HashMap<PathBuf, (Arc<V>, usize)>,
+    order: VecDeque<PathBuf>,
+    used: usize,
+    limit: usize,
 }
 
-/// pack 文件被删除后同步清掉两个缓存里的条目。pack 名由内容校验和决定，
-/// 不会复用，不清就是慢性泄漏。
-fn evict_caches(pack_path: &Path) {
-    let idx_path = pack_path.with_extension("idx");
-    bytes_cache()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(pack_path);
-    idx_cache()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&idx_path);
-}
-
-/// 临时文件 → fsync → 原子 rename。rename 后引用可见时字节必须已落稳。
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path.parent().context("目标路径没有父目录")?;
-    fs::create_dir_all(parent).with_context(|| format!("创建目录失败: {}", parent.display()))?;
-    let tmp = parent.join(format!(
-        ".tmp-{}-{}-{}",
-        path.file_name().unwrap_or_default().to_string_lossy(),
-        std::process::id(),
-        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    {
-        let mut file =
-            File::create(&tmp).with_context(|| format!("创建临时文件失败: {}", tmp.display()))?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-    }
-    match fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = fs::remove_file(&tmp);
-            // 另一个进程刚好写完同内容：视为成功。
-            if path.is_file() {
-                Ok(())
-            } else {
-                Err(error).with_context(|| format!("写入文件失败: {}", path.display()))
-            }
+impl<V> BoundedCache<V> {
+    fn new(limit: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            used: 0,
+            limit,
         }
     }
+
+    fn get(&mut self, key: &Path) -> Option<Arc<V>> {
+        let (value, _) = self.entries.get(key)?;
+        let value = value.clone();
+        // 命中后移到队尾，保持 LRU 语义。
+        self.order.retain(|item| item.as_path() != key);
+        self.order.push_back(key.to_path_buf());
+        Some(value)
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+        self.used = 0;
+    }
+
+    fn remove(&mut self, key: &Path) {
+        if let Some((_, cost)) = self.entries.remove(key) {
+            self.order.retain(|item| item.as_path() != key);
+            self.used = self.used.saturating_sub(cost);
+        }
+    }
+
+    fn insert(&mut self, key: PathBuf, value: Arc<V>, cost: usize) {
+        if cost > self.limit {
+            // 单个条目比整个缓存上限还大，缓存它没有意义。
+            return;
+        }
+        if let Some((_, old_cost)) = self.entries.remove(&key) {
+            self.order.retain(|item| item != &key);
+            self.used = self.used.saturating_sub(old_cost);
+        }
+        while self.used + cost > self.limit {
+            let Some(evicted) = self.order.pop_front() else {
+                break;
+            };
+            if let Some((_, evicted_cost)) = self.entries.remove(&evicted) {
+                self.used = self.used.saturating_sub(evicted_cost);
+            }
+        }
+        self.used += cost;
+        self.order.push_back(key.clone());
+        self.entries.insert(key, (value, cost));
+    }
 }
+
 
 #[derive(Debug, Clone)]
 pub struct DiskStore {
@@ -763,7 +794,7 @@ impl DiskStore {
                     Some(hit) => hit.clone(),
                     None => {
                         let parsed = Arc::new(Idx::parse(&fs::read(&idx_path)?)?);
-                        cache.insert(idx_path.clone(), parsed.clone());
+                        cache.insert(idx_path.clone(), parsed.clone(), 1 + parsed.oids.len() / 256);
                         parsed
                     }
                 }
@@ -774,7 +805,7 @@ impl DiskStore {
                     Some(hit) => hit.clone(),
                     None => {
                         let loaded = Arc::new(fs::read(&pack_path)?);
-                        cache.insert(pack_path.clone(), loaded.clone());
+                        cache.insert(pack_path.clone(), loaded.clone(), loaded.len());
                         loaded
                     }
                 }
@@ -1353,5 +1384,49 @@ mod tests {
         bytes_cache().lock().unwrap().clear();
         assert!(store.get(project, &packed.oid).is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+
+/// 让某个 pack 的字节与索引缓存失效（重写/删除 pack 后调用）。
+fn evict_caches(pack_path: &Path) {
+    let idx_path = pack_path.with_extension("idx");
+    bytes_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(pack_path);
+    idx_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&idx_path);
+}
+
+/// 临时文件 → fsync → 原子 rename。rename 后引用可见时字节必须已落稳。
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().context("目标路径没有父目录")?;
+    fs::create_dir_all(parent).with_context(|| format!("创建目录失败: {}", parent.display()))?;
+    let tmp = parent.join(format!(
+        ".tmp-{}-{}-{}",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    {
+        let mut file =
+            File::create(&tmp).with_context(|| format!("创建临时文件失败: {}", tmp.display()))?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    match fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = fs::remove_file(&tmp);
+            // 另一个进程刚好写完同内容：视为成功。
+            if path.is_file() {
+                Ok(())
+            } else {
+                Err(error).with_context(|| format!("写入文件失败: {}", path.display()))
+            }
+        }
     }
 }

@@ -1,7 +1,8 @@
 //! 管理端资源监控：只读的系统与存储统计。
 //!
-//! 全部指标按需现读（/proc、statvfs、PG），不缓存不采样——管理端手动
-//! 打开才查，10 秒轮询的频率对一台个人站服务器没有压力。
+//! 指标按需现读（/proc、statvfs、PG），但结果做 30 秒短缓存：
+//! `git_objects` 计数与 LFS 目录遍历要扫库扫盘，多个管理员同时打开或
+//! 刷新页面时不该各自重算一遍。
 
 use serde::Serialize;
 use sqlx::Row;
@@ -10,7 +11,7 @@ use std::path::Path;
 
 use super::*;
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub(crate) struct DiskUsage {
     pub label: String,
     pub path: String,
@@ -18,7 +19,7 @@ pub(crate) struct DiskUsage {
     pub total_bytes: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub(crate) struct SystemResources {
     pub load1: f64,
     pub load5: f64,
@@ -39,11 +40,40 @@ pub(crate) struct SystemResources {
     pub lfs_bytes: u64,
 }
 
+/// 资源统计的短缓存：30 秒内的重复请求直接复用上次结果。
+fn resource_cache() -> &'static std::sync::Mutex<Option<(std::time::Instant, SystemResources)>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<Option<(std::time::Instant, SystemResources)>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+const RESOURCE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub(crate) async fn system_resources(
     State(state): State<AppState>,
     session: Session,
 ) -> ApiResult<Json<SystemResources>> {
     current_admin(&state, &session).await?;
+
+    if let Ok(cache) = resource_cache().lock() {
+        if let Some((at, cached)) = cache.as_ref() {
+            if at.elapsed() < RESOURCE_CACHE_TTL {
+                return Ok(Json(cached.clone()));
+            }
+        }
+    }
+
+    let fresh = compute_resources(&state).await;
+    if let Ok(fresh) = &fresh {
+        if let Ok(mut cache) = resource_cache().lock() {
+            *cache = Some((std::time::Instant::now(), fresh.clone()));
+        }
+    }
+    Ok(Json(fresh?))
+}
+
+async fn compute_resources(state: &AppState) -> ApiResult<SystemResources> {
 
     let mut disks = vec![
         ("内容库".into(), state.content_root.clone()),
@@ -92,7 +122,7 @@ pub(crate) async fn system_resources(
     let load = proc_loadavg().unwrap_or((0.0, 0.0, 0.0));
     let mem = proc_meminfo().unwrap_or((0, 0));
 
-    Ok(Json(SystemResources {
+    Ok(SystemResources {
         load1: load.0,
         load5: load.1,
         load15: load.2,
@@ -108,7 +138,7 @@ pub(crate) async fn system_resources(
         git_objects,
         git_objects_bytes: git_objects_bytes.max(0),
         lfs_bytes,
-    }))
+    })
 }
 
 /// statvfs 读挂载点用量。路径不存在或跨文件系统读失败时返回 Err，
