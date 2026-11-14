@@ -16,7 +16,7 @@ use crate::render::Rendered;
 
 /// 渲染逻辑或依赖引擎（typst/ftml）行为变化时手动递增，使旧缓存整体失效。
 /// 包版本也参与键计算，常规依赖升级随 Cargo.lock 自动失效。
-const CACHE_VERSION: &str = "3"; // 3: 内嵌图片改为引用项目原路径，旧缓存需重建
+const CACHE_VERSION: &str = "4"; // 4: Typst 环境改为进程级共享，键语义不变但需重建
 
 pub struct RenderCache {
     dir: PathBuf,

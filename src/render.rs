@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use sha2::{Digest, Sha256};
 use typst::diag::{FileError, FileResult};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use typst::foundations::{Bytes, Datetime};
 use typst::LibraryExt;
 use typst_html::HtmlDocument;
@@ -227,6 +227,40 @@ fn render_markdown(body: &str) -> String {
     output
 }
 
+/// 所有文档共用的 Typst 环境：字体索引 + Library。
+///
+/// 之前每渲染一篇文档都要遍历全部内置字体建一次 `FontBook`、再建一次
+/// `Library`。这些内容与文档无关，进程内建一次即可——站点有几十个 Typst
+/// 页面时，这部分是纯重复开销。
+struct TypstEnv {
+    book: LazyHash<FontBook>,
+    fonts: Vec<Font>,
+    library: LazyHash<Library>,
+}
+
+fn typst_env() -> &'static TypstEnv {
+    static ENV: OnceLock<TypstEnv> = OnceLock::new();
+    ENV.get_or_init(|| {
+        let mut book = FontBook::new();
+        let mut fonts = Vec::new();
+        for data in typst_assets::fonts() {
+            let bytes = Bytes::new(data);
+            for font in Font::iter(bytes) {
+                book.push(font.info().clone());
+                fonts.push(font);
+            }
+        }
+        let library = Library::builder()
+            .with_features(std::iter::once(Feature::Html).collect())
+            .build();
+        TypstEnv {
+            book: LazyHash::new(book),
+            fonts,
+            library: LazyHash::new(library),
+        }
+    })
+}
+
 struct TypstWorld {
     root: PathBuf,
     /// `@preview/...` 外部包缓存根目录；结构为 <namespace>/<name>/<version>/。
@@ -235,9 +269,7 @@ struct TypstWorld {
     source: Source,
     /// 项目仓库文件，key 是相对项目根的路径。与同项目的其他页面共享。
     files: ProjectFiles,
-    book: LazyHash<FontBook>,
-    fonts: Vec<Font>,
-    library: LazyHash<Library>,
+    env: &'static TypstEnv,
 }
 
 impl TypstWorld {
@@ -256,29 +288,13 @@ impl TypstWorld {
             .map(PathBuf::from)
             .unwrap_or_else(|| root.join("typst-packages"));
 
-        let mut book = FontBook::new();
-        let mut fonts = Vec::new();
-        for data in typst_assets::fonts() {
-            let bytes = Bytes::new(data);
-            for font in Font::iter(bytes) {
-                book.push(font.info().clone());
-                fonts.push(font);
-            }
-        }
-
-        let library = Library::builder()
-            .with_features(std::iter::once(Feature::Html).collect())
-            .build();
-
         Self {
             root: root.to_path_buf(),
             package_root,
             main,
             source,
             files: Arc::clone(files),
-            book: LazyHash::new(book),
-            fonts,
-            library: LazyHash::new(library),
+            env: typst_env(),
         }
     }
 
@@ -455,11 +471,11 @@ impl TypstWorld {
 
 impl World for TypstWorld {
     fn library(&self) -> &LazyHash<Library> {
-        &self.library
+        &self.env.library
     }
 
     fn book(&self) -> &LazyHash<FontBook> {
-        &self.book
+        &self.env.book
     }
 
     fn main(&self) -> FileId {
@@ -503,7 +519,7 @@ impl World for TypstWorld {
     }
 
     fn font(&self, index: usize) -> Option<Font> {
-        self.fonts.get(index).cloned()
+        self.env.fonts.get(index).cloned()
     }
 
     fn today(&self, _offset: Option<typst::foundations::Duration>) -> Option<Datetime> {
