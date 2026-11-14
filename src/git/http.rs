@@ -1,3 +1,4 @@
+use axum::body::Bytes;
 use anyhow::{bail, Context, Result};
 use sqlx::{PgConnection, PgPool};
 use std::collections::{HashMap, HashSet};
@@ -282,7 +283,11 @@ async fn collect_pack(
     filter_blob_none: bool,
     deepen: bool,
 ) -> Result<Vec<u8>> {
-    let direct: HashSet<Oid> = wants.iter().copied().collect();
+    // 每批 spawn_blocking 都要用到这三个集合，逐批 clone 是纯浪费；
+    // 包成 Arc 后只复制引用计数。
+    let exclude: Arc<HashSet<Oid>> = Arc::new(exclude.clone());
+    let shallow: Arc<HashSet<Oid>> = Arc::new(shallow.clone());
+    let direct: Arc<HashSet<Oid>> = Arc::new(wants.iter().copied().collect());
     let mut seen = HashSet::new();
     let mut stack: Vec<Oid> = wants.to_vec();
     let mut builder = proto::PackBuilder::new();
@@ -307,9 +312,9 @@ async fn collect_pack(
             continue;
         }
         let rows = store::get_objects_raw(conn, project_id, &fetch).await?;
-        let excluded = exclude.clone();
-        let shallow_set = shallow.clone();
-        let direct_set = direct.clone();
+        let excluded = Arc::clone(&exclude);
+        let shallow_set = Arc::clone(&shallow);
+        let direct_set = Arc::clone(&direct);
         let (next_builder, children) = tokio::task::spawn_blocking(
             move || -> Result<(proto::PackBuilder, Vec<Oid>)> {
                 let mut builder = builder;
@@ -403,11 +408,21 @@ async fn fetch_pack(
     request: &proto::UploadRequest,
     exclude: &HashSet<Oid>,
     shallow: &HashSet<Oid>,
-) -> Result<Arc<Vec<u8>>> {
+) -> Result<Arc<Bytes>> {
     let key = pack_cache::key_for(project.id, request);
     if let Some(hit) = key.as_ref().and_then(pack_cache::get) {
         return Ok(hit);
     }
+    // 同一 key 的并发 clone 只让一个去组包，其余等它填好缓存后直接复用。
+    let _inflight = match &key {
+        Some(key) => Some(pack_cache::inflight_lock(key).lock_owned().await),
+        None => None,
+    };
+    if let Some(hit) = key.as_ref().and_then(pack_cache::get) {
+        // 等锁期间别人已经组好包了。
+        return Ok(hit);
+    }
+
     // 磁盘权威且有全量快照：pack 字节原样发出，跳过对象图遍历与组包。
     // key 为 Some 才代表「无 have / 无 shallow / 无 filter 的干净全量
     // clone」；增量 fetch 仍须走 want/have 协商，不能偷懒发全量 pack。
@@ -417,7 +432,7 @@ async fn fetch_pack(
                 let bytes = tokio::fs::read(&path)
                     .await
                     .with_context(|| format!("读取全量 pack 失败: {}", path.display()))?;
-                let pack = Arc::new(bytes);
+                let pack = Arc::new(Bytes::from(bytes));
                 if let Some(key) = key.clone() {
                     pack_cache::insert(key, pack.clone());
                 }
@@ -435,7 +450,7 @@ async fn fetch_pack(
         request.deepen.is_some(),
     )
     .await?;
-    let pack = Arc::new(pack);
+    let pack = Arc::new(Bytes::from(pack));
     if let Some(key) = key {
         pack_cache::insert(key, pack.clone());
     }
@@ -613,7 +628,14 @@ fn sideband_pack(data: &[u8]) -> Vec<u8> {
 }
 
 /// v0 upload-pack。
-pub async fn upload_pack(pool: &PgPool, project: &Project, body: &[u8]) -> Result<Vec<u8>> {
+/// upload_pack 的返回：协商头部与 pack 分开放，
+/// 让上层可以直接把 pack 作为 Bytes 写出，避免整块复制进响应缓冲。
+pub struct PackResponse {
+    pub head: Vec<u8>,
+    pub pack: Arc<Bytes>,
+}
+
+pub async fn upload_pack(pool: &PgPool, project: &Project, body: &[u8]) -> Result<PackResponse> {
     let request = proto::parse_upload_request(body)?;
     upload_pack_request(pool, project, &request).await
 }
@@ -627,11 +649,11 @@ pub(crate) async fn upload_pack_request(
     pool: &PgPool,
     project: &Project,
     request: &proto::UploadRequest,
-) -> Result<Vec<u8>> {
+) -> Result<PackResponse> {
     let mut out = Vec::new();
     if request.wants.is_empty() {
         out.extend(proto::pkt_str("NAK\n"));
-        return Ok(out);
+        return Ok(PackResponse { head: out, pack: Arc::new(Bytes::new()) });
     }
     let mut conn = pool.acquire().await?;
     let (common, exclude) =
@@ -661,11 +683,11 @@ pub(crate) async fn upload_pack_request(
     // "bad line length character: PACK"。
     if !request.done {
         if request.haves.is_empty() {
-            return Ok(out);
+            return Ok(PackResponse { head: out, pack: Arc::new(Bytes::new()) });
         }
         if common.is_empty() {
             out.extend(proto::pkt_str("NAK\n"));
-            return Ok(out);
+            return Ok(PackResponse { head: out, pack: Arc::new(Bytes::new()) });
         }
         for oid in &common {
             out.extend(proto::pkt_str(&format!("ACK {} common\n", oid.to_hex())));
@@ -673,7 +695,7 @@ pub(crate) async fn upload_pack_request(
         let last = common.last().expect("common 非空");
         out.extend(proto::pkt_str(&format!("ACK {} ready\n", last.to_hex())));
         out.extend(proto::pkt_str("NAK\n"));
-        return Ok(out);
+        return Ok(PackResponse { head: out, pack: Arc::new(Bytes::new()) });
     }
 
     // `done` 轮:ACK/NAK 后紧跟 packfile。
@@ -682,8 +704,7 @@ pub(crate) async fn upload_pack_request(
         Some(oid) => out.extend(proto::pkt_str(&format!("ACK {}\n", oid.to_hex()))),
         None => out.extend(proto::pkt_str("NAK\n")),
     }
-    out.extend_from_slice(&pack);
-    Ok(out)
+    Ok(PackResponse { head: out, pack })
 }
 
 /// v2 `ls-refs`。
@@ -820,7 +841,7 @@ async fn v2_fetch(conn: &mut PgConnection, project: &Project, args: &[String]) -
             out.extend(proto::delim());
         }
         out.extend(proto::pkt_str("packfile\n"));
-        out.extend(sideband_pack(pack.as_slice()));
+        out.extend(sideband_pack(pack.as_ref()));
     };
 
     if !request.done {

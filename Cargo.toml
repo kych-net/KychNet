@@ -13,6 +13,9 @@ vendored-openssl = ["dep:openssl", "openssl/vendored"]
 anyhow = "1"
 askama = "0.12"
 axum = "0.8"
+# 仅用于把 Git pack 分块写进响应体（Body::from_stream）。
+# axum 自身已依赖 futures-util，这里只是显式声明。
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 base32 = "0.5"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }

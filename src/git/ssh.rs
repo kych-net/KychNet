@@ -774,10 +774,14 @@ where
             // 分支，SSH v0 克隆根本收不到 pack（客户端只看到 EOF）。
             acc.done = true;
             let out = crate::git::http::upload_pack_request(pool, project, &acc).await?;
-            // deepen 与 done 同轮时浅边界还没发过，原样发回完整响应；
-            // 否则只发 packfile（协商轮的控制行已经发过了）。
+            // deepen 与 done 同轮时浅边界还没发过，原样发回 head；
+            // 否则只发 pack（协商轮的控制行已经发过了）。
             let preserve_shallow = shallow_pending && acc.deepen.is_some();
-            stream.write_all(done_response(&out, preserve_shallow)).await?;
+            if preserve_shallow {
+                stream.write_all(&out.head).await?;
+            }
+            // pack 单独写：避免把它拼进 head 缓冲，白白多占一份内存。
+            stream.write_all(out.pack.as_ref()).await?;
             stream.flush().await?;
             return Ok(());
         }
@@ -792,7 +796,7 @@ where
         if send_shallow {
             shallow_pending = false;
         }
-        if out.is_empty() {
+        if out.head.is_empty() {
             // HTTP 是无状态 RPC，回空就表示这一轮没有共同提交；SSH 是
             // 有状态会话，客户端发完一轮会阻塞等应答，补一个 NAK 作为
             // 轮次分隔。deepen 首轮的 out 含 shallow 段 + flush，不会
@@ -800,7 +804,7 @@ where
             let nak = proto::pkt_str("NAK\n");
             stream.write_all(&nak).await?;
         } else {
-            stream.write_all(&out).await?;
+            stream.write_all(&out.head).await?;
         }
         stream.flush().await?;
     }

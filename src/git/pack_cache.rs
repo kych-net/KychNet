@@ -5,6 +5,7 @@
 //! 全量 clone」——增量 fetch 的 want/have 组合太多，缓存命中率极低，
 //! 仍然走实时组装。ref 一变就整体失效，见 `store::set_ref` / `delete_ref`。
 
+use axum::body::Bytes;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 use uuid::Uuid;
@@ -41,7 +42,7 @@ pub fn key_for(project_id: Uuid, request: &UploadRequest) -> Option<CacheKey> {
 }
 
 struct Cache {
-    entries: HashMap<CacheKey, Arc<Vec<u8>>>,
+    entries: HashMap<CacheKey, Arc<Bytes>>,
     order: VecDeque<CacheKey>,
     bytes: usize,
 }
@@ -55,7 +56,7 @@ impl Cache {
         }
     }
 
-    fn insert(&mut self, key: CacheKey, value: Arc<Vec<u8>>, limit: usize) {
+    fn insert(&mut self, key: CacheKey, value: Arc<Bytes>, limit: usize) {
         if value.len() > limit {
             return;
         }
@@ -97,11 +98,11 @@ fn global() -> &'static Mutex<Cache> {
     CACHE.get_or_init(|| Mutex::new(Cache::new()))
 }
 
-pub fn get(key: &CacheKey) -> Option<Arc<Vec<u8>>> {
+pub fn get(key: &CacheKey) -> Option<Arc<Bytes>> {
     global().lock().ok()?.entries.get(key).cloned()
 }
 
-pub fn insert(key: CacheKey, value: Arc<Vec<u8>>) {
+pub fn insert(key: CacheKey, value: Arc<Bytes>) {
     if let Ok(mut cache) = global().lock() {
         cache.insert(key, value, MAX_BYTES);
     }
@@ -132,9 +133,9 @@ mod tests {
         let other = Uuid::new_v4();
         let a = key(project, 1);
         let b = key(other, 2);
-        let payload = Arc::new(vec![7u8; 100]);
+        let payload = Arc::new(Bytes::from(vec![7u8; 100]));
         cache.insert(a.clone(), payload.clone(), 1000);
-        cache.insert(b.clone(), Arc::new(vec![8u8; 100]), 1000);
+        cache.insert(b.clone(), Arc::new(Bytes::from(vec![8u8; 100])), 1000);
         assert!(Arc::ptr_eq(cache.entries.get(&a).unwrap(), &payload));
         assert_eq!(cache.bytes, 200);
 
@@ -151,13 +152,13 @@ mod tests {
         let project = Uuid::new_v4();
         let first = key(project, 1);
         let second = key(project, 2);
-        cache.insert(first.clone(), Arc::new(vec![1u8; 60]), 100);
-        cache.insert(second.clone(), Arc::new(vec![2u8; 60]), 100);
+        cache.insert(first.clone(), Arc::new(Bytes::from(vec![1u8; 60])), 100);
+        cache.insert(second.clone(), Arc::new(Bytes::from(vec![2u8; 60])), 100);
         assert!(!cache.entries.contains_key(&first));
         assert!(cache.entries.contains_key(&second));
         assert_eq!(cache.bytes, 60);
         // 覆盖同 key 不能重复计字节。
-        cache.insert(second.clone(), Arc::new(vec![3u8; 30]), 100);
+        cache.insert(second.clone(), Arc::new(Bytes::from(vec![3u8; 30])), 100);
         assert_eq!(cache.bytes, 30);
         assert_eq!(cache.order.len(), 1);
     }
@@ -179,4 +180,29 @@ mod tests {
         request.done = false;
         assert!(key_for(project, &request).is_none());
     }
+}
+
+/// 同一 key 的「进行中组包」锁。
+///
+/// 多个客户端同时 clone 同一个项目时，缓存都是未命中，会各自完整组包
+/// 一遍（遍历对象图 + 解压 + 重新压缩 + 算 SHA-1）。这里让同一个 key
+/// 的组包串行化，后来者在拿到锁后先复查缓存，命中就直接复用。
+fn inflight() -> &'static Mutex<HashMap<CacheKey, Arc<tokio::sync::Mutex<()>>>> {
+    static INFLIGHT: OnceLock<Mutex<HashMap<CacheKey, Arc<tokio::sync::Mutex<()>>>>> =
+        OnceLock::new();
+    INFLIGHT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 取（或创建）某个 key 的组包锁。
+pub fn inflight_lock(key: &CacheKey) -> Arc<tokio::sync::Mutex<()>> {
+    let mut map = inflight().lock().unwrap_or_else(|e| e.into_inner());
+    map.entry(key.clone())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+/// ref 变化或项目删除时顺带把锁表里的条目清掉，避免无限增长。
+pub fn forget_inflight(project_id: Uuid) {
+    let mut map = inflight().lock().unwrap_or_else(|e| e.into_inner());
+    map.retain(|key, _| key.project_id != project_id);
 }

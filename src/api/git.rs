@@ -101,6 +101,30 @@ pub(crate) fn git_binary(content_type: &'static str, body: Vec<u8>) -> Response 
         .into_response()
 }
 
+/// 与 `git_binary` 相同，但把「协商头部 + pack」分块写出。
+///
+/// pack 缓存里存的是 `Bytes`，克隆它只增加引用计数；如果拼成一个 Vec，
+/// 大仓库 clone 时会额外占用一份与 pack 等大的内存。
+pub(crate) fn git_binary_split(
+    content_type: &'static str,
+    data: crate::git::http::PackResponse,
+) -> Response {
+    let head = axum::body::Bytes::from(data.head);
+    let pack = data.pack.as_ref().clone();
+    let stream = futures_util::stream::iter([
+        Ok::<_, std::io::Error>(head),
+        Ok::<_, std::io::Error>(pack),
+    ]);
+    (
+        [
+            (header::CONTENT_TYPE, HeaderValue::from_static(content_type)),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-cache")),
+        ],
+        axum::body::Body::from_stream(stream),
+    )
+        .into_response()
+}
+
 pub(crate) fn git_json(content_type: &'static str, body: Vec<u8>) -> Response {
     (
         [
@@ -629,13 +653,22 @@ pub(crate) async fn git_http_post(
             }
         }
         "git-upload-pack" => {
-            let body = if wants_v2(&headers) {
-                crate::git::http::upload_pack_v2(&state.pool, &project, &body).await
-            } else {
-                crate::git::http::upload_pack(&state.pool, &project, &body).await
-            };
+            if wants_v2(&headers) {
+                return match crate::git::http::upload_pack_v2(&state.pool, &project, &body).await {
+                    Ok(data) => git_binary("application/x-git-upload-pack-result", data),
+                    Err(error)
+                        if error
+                            .downcast_ref::<crate::git::proto::MalformedRequest>()
+                            .is_some() =>
+                    {
+                        git_plain(StatusCode::BAD_REQUEST, &error.to_string())
+                    }
+                    Err(error) => git_plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+                };
+            }
+            let body = crate::git::http::upload_pack(&state.pool, &project, &body).await;
             match body {
-                Ok(data) => git_binary("application/x-git-upload-pack-result", data),
+                Ok(data) => git_binary_split("application/x-git-upload-pack-result", data),
                 Err(error)
                     if error
                         .downcast_ref::<crate::git::proto::MalformedRequest>()

@@ -560,6 +560,36 @@ fn bytes_cache() -> &'static Mutex<HashMap<PathBuf, Arc<Vec<u8>>>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// 项目级 pack 清单缓存：目录 mtime 未变就复用上次的扫描结果。
+///
+/// `packs()` 之前每次都要 `read_dir` 并对每个 pack 重新组一遍 Vec；
+/// 一次 fetch 会调用它很多次（每个对象一次），多 pack 项目因此反复扫目录。
+type PackList = Vec<(PathBuf, Arc<PackFile>)>;
+type PackIndex = HashMap<Oid, (usize, u32)>;
+type PackCacheEntry = (std::time::SystemTime, Arc<PackList>, Arc<PackIndex>);
+
+fn pack_list_cache() -> &'static Mutex<HashMap<Uuid, PackCacheEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<Uuid, PackCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 从一批 pack 的 idx 建「OID → (pack 下标, offset)」的跨 pack 索引。
+///
+/// 否则每次读对象都要遍历所有 pack、每个 pack 各做一次二分。
+/// 多 pack 项目（增量 push 累积后）这里能省掉成倍的比较。
+fn build_pack_index(packs: &PackList) -> PackIndex {
+    let mut index = PackIndex::new();
+    for (pack_pos, (_, pack)) in packs.iter().enumerate() {
+        for (i, oid) in pack.idx.oids.iter().enumerate() {
+            // 同一个 OID 可能出现在多个 pack（repack 前后并存），留第一个即可。
+            index
+                .entry(*oid)
+                .or_insert((pack_pos, pack.idx.offsets[i]));
+        }
+    }
+    index
+}
+
 fn idx_cache() -> &'static Mutex<HashMap<PathBuf, Arc<Idx>>> {
     static CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<Idx>>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -686,8 +716,22 @@ impl DiskStore {
     }
 
     /// 列出所有完整的 pack pair（有 `.pack` 没 `.idx` 的视为未完成写入）。
+    ///
+    /// 结果按「pack 目录 mtime」缓存：新增/删除 pack 会改变目录 mtime，
+    /// 缓存自然失效；内容不变的重复调用直接返回上一次的清单。
     fn packs(&self, project_id: Uuid) -> Result<Vec<(PathBuf, Arc<PackFile>)>> {
         let dir = self.pack_dir(project_id);
+        let dir_mtime = fs::metadata(&dir)
+            .and_then(|meta| meta.modified())
+            .ok();
+        if let Some(mtime) = dir_mtime {
+            let cache = pack_list_cache().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((cached_mtime, cached, _)) = cache.get(&project_id) {
+                if *cached_mtime == mtime {
+                    return Ok((**cached).clone());
+                }
+            }
+        }
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
@@ -732,39 +776,64 @@ impl DiskStore {
             };
             out.push((pack_path, Arc::new(PackFile { bytes, idx })));
         }
+        if let Some(mtime) = dir_mtime {
+            let index = Arc::new(build_pack_index(&out));
+            let mut cache = pack_list_cache().lock().unwrap_or_else(|e| e.into_inner());
+            cache.insert(project_id, (mtime, Arc::new(out.clone()), index));
+        }
         Ok(out)
     }
 
-    pub fn get(&self, project_id: Uuid, oid: &Oid) -> Result<Option<Object>> {
-        for (_, pack) in self.packs(project_id)? {
-            let Some(offset) = pack.idx.lookup(oid) else {
-                continue;
-            };
-            let (kind, data) = pack.object_at(offset, 0)?;
-            // 内容寻址：重算 OID 必须匹配，损坏的字节不能静默返回。
-            if &hash_object(kind, &data) != oid {
-                bail!("磁盘 Git 对象校验失败: {oid}");
+    /// 取「pack 清单 + 跨 pack OID 索引」，索引与清单共用同一个 mtime 缓存。
+    fn packs_indexed(&self, project_id: Uuid) -> Result<(PackList, Arc<PackIndex>)> {
+        let packs = self.packs(project_id)?;
+        let dir = self.pack_dir(project_id);
+        let dir_mtime = fs::metadata(&dir).and_then(|meta| meta.modified()).ok();
+        if let Some(mtime) = dir_mtime {
+            let cache = pack_list_cache().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((cached_mtime, _, index)) = cache.get(&project_id) {
+                if *cached_mtime == mtime {
+                    let index = index.clone();
+                    drop(cache);
+                    return Ok((packs, index));
+                }
             }
-            return Ok(Some(Object { kind, data }));
         }
-        Ok(None)
+        let index = Arc::new(build_pack_index(&packs));
+        Ok((packs, index))
+    }
+
+    pub fn get(&self, project_id: Uuid, oid: &Oid) -> Result<Option<Object>> {
+        let (packs, index) = self.packs_indexed(project_id)?;
+        let Some((pack_pos, offset)) = index.get(oid).copied() else {
+            return Ok(None);
+        };
+        let Some((_, pack)) = packs.get(pack_pos) else {
+            return Ok(None);
+        };
+        let (kind, data) = pack.object_at(offset, 0)?;
+        // 内容寻址：重算 OID 必须匹配，损坏的字节不能静默返回。
+        if &hash_object(kind, &data) != oid {
+            bail!("磁盘 Git 对象校验失败: {oid}");
+        }
+        Ok(Some(Object { kind, data }))
     }
 
     pub fn get_many(&self, project_id: Uuid, oids: &[Oid]) -> Result<Vec<(Oid, Object)>> {
-        let packs = self.packs(project_id)?;
+        let (packs, index) = self.packs_indexed(project_id)?;
         let mut out = Vec::with_capacity(oids.len());
         for oid in oids {
-            for (_, pack) in &packs {
-                let Some(offset) = pack.idx.lookup(oid) else {
-                    continue;
-                };
-                let (kind, data) = pack.object_at(offset, 0)?;
-                if &hash_object(kind, &data) != oid {
-                    bail!("磁盘 Git 对象校验失败: {oid}");
-                }
-                out.push((*oid, Object { kind, data }));
-                break;
+            let Some((pack_pos, offset)) = index.get(oid).copied() else {
+                continue;
+            };
+            let Some((_, pack)) = packs.get(pack_pos) else {
+                continue;
+            };
+            let (kind, data) = pack.object_at(offset, 0)?;
+            if &hash_object(kind, &data) != oid {
+                bail!("磁盘 Git 对象校验失败: {oid}");
             }
+            out.push((*oid, Object { kind, data }));
         }
         Ok(out)
     }

@@ -3074,6 +3074,7 @@ dependencies = [
  "dotenvy",
  "flate2",
  "ftml",
+ "futures-util",
  "hex",
  "libc",
  "openssl",
