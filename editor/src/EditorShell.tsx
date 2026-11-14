@@ -60,6 +60,8 @@ export function EditorShell({
       slug,
       format,
       body,
+      // 必须原样传回：后端把「缺省」解释为置空，漏传会清掉已有的自定义 head。
+      head: page.head ?? "",
       published,
       message: "",
     });

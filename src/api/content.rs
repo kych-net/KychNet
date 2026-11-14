@@ -35,8 +35,10 @@ pub(crate) struct ContentRequest {
     format: String,
     body: String,
     /// 页面自定义 <head> 内容。仅对能渲染成 HTML 的格式生效，管理员可写。
+    /// 缺省（`None`）表示「不修改」，保留库里的旧值——这样旧客户端
+    /// 或只改正文的保存不会把已配置的 meta/link/script 清空。
     #[serde(default)]
-    head: String,
+    head: Option<String>,
     #[serde(default)]
     published: bool,
     /// 可选的版本说明，落入精简版历史；缺省为空。
@@ -103,12 +105,12 @@ pub(crate) async fn save_content(
     //   /eoe/index.md -> eoe/index.html
     // 同一路径只有一条记录，因此 .html/.md/.typ 天然互斥。
     let (slug, format) = service::normalize_content_path(&req.slug, format)?;
-    // 自定义 head 只对会产出 HTML 页面的格式有意义；css/svg 直接丢弃，
-    // 免得内容作者以为写了会生效。
-    let head = if format.renders_html() {
-        validate_page_head(&req.head)?
-    } else {
-        String::new()
+    // 自定义 head 只对会产出 HTML 页面的格式有意义；css/svg 显式置空，
+    // 免得内容作者以为写了会生效。未提供该字段时保持 None（不修改）。
+    let head: Option<String> = match req.head.as_deref() {
+        Some(raw) if format.renders_html() => Some(validate_page_head(raw)?),
+        Some(_) => Some(String::new()),
+        None => None,
     };
     if format == crate::models::ContentFormat::Svg {
         crate::svg::validate_svg(req.body.as_bytes())?;
@@ -134,7 +136,7 @@ pub(crate) async fn save_content(
             &slug,
             format.as_str(),
             &req.body,
-            &head,
+            head.as_deref(),
             req.published,
             user.id,
             req.message.trim(),
@@ -146,7 +148,7 @@ pub(crate) async fn save_content(
             &slug,
             format.as_str(),
             &req.body,
-            &head,
+            head.as_deref(),
             req.published,
             user.id,
             req.message.trim(),

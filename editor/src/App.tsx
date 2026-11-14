@@ -97,6 +97,7 @@ export function App() {
       slug,
       format,
       body: "",
+      head: "",
       published: false,
       created_at: "",
       updated_at: "",

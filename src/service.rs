@@ -632,7 +632,8 @@ pub async fn update_content(
     slug: &str,
     format: &str,
     body: &str,
-    head: &str,
+    // None 表示调用方没提供这个字段 → 保留库里的旧值，不清空。
+    head: Option<&str>,
     published: bool,
     author_id: Uuid,
     message: &str,
@@ -662,7 +663,8 @@ pub async fn update_content(
     let result = if let Some(rev_seq) = new_rev_seq {
         sqlx::query_as::<_, Content>(
             "UPDATE contents
-             SET slug = $2, format = $3, body = $4, head = $5, published = $6,
+             SET slug = $2, format = $3, body = $4,
+                 head = COALESCE($5, head), published = $6,
                  rev_seq = $7, updated_at = now()
              WHERE id = $1
              RETURNING *",
@@ -679,7 +681,8 @@ pub async fn update_content(
     } else {
         sqlx::query_as::<_, Content>(
             "UPDATE contents
-             SET slug = $2, format = $3, body = $4, head = $5, published = $6,
+             SET slug = $2, format = $3, body = $4,
+                 head = COALESCE($5, head), published = $6,
                  updated_at = now()
              WHERE id = $1
              RETURNING *",
@@ -713,7 +716,8 @@ pub async fn upsert_content(
     slug: &str,
     format: &str,
     body: &str,
-    head: &str,
+    // None 表示保留旧值（新建时为空）。
+    head: Option<&str>,
     published: bool,
     author_id: Uuid,
     message: &str,
@@ -739,7 +743,8 @@ pub async fn upsert_content(
         if let Some(rev_seq) = new_rev_seq {
             sqlx::query_as::<_, Content>(
                 "UPDATE contents
-                 SET format = $2, body = $3, head = $4, published = $5,
+                 SET format = $2, body = $3,
+                     head = COALESCE($4, head), published = $5,
                      rev_seq = $6, updated_at = now()
                  WHERE id = $1
                  RETURNING *",
@@ -755,7 +760,8 @@ pub async fn upsert_content(
         } else {
             sqlx::query_as::<_, Content>(
                 "UPDATE contents
-                 SET format = $2, body = $3, head = $4, published = $5,
+                 SET format = $2, body = $3,
+                     head = COALESCE($4, head), published = $5,
                      updated_at = now()
                  WHERE id = $1
                  RETURNING *",
@@ -771,7 +777,7 @@ pub async fn upsert_content(
     } else {
         let content = sqlx::query_as::<_, Content>(
             "INSERT INTO contents (id, slug, format, body, head, published, rev_seq)
-             VALUES ($1, $2, $3, $4, $5, $6, 1)
+             VALUES ($1, $2, $3, $4, COALESCE($5, ''), $6, 1)
              RETURNING *",
         )
         .bind(Uuid::new_v4())
