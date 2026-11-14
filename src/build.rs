@@ -940,8 +940,22 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
             std::fs::create_dir_all(parent)?;
             make_parent_dirs_public(out, parent)?;
         }
-        std::fs::write(&target, &page.html)?;
+        // Typst 导出的 HTML 会把图片内嵌成 data URI，这里落成同目录的
+        // 独立文件，既减小 HTML 体积，也让浏览器能缓存这些图。
+        let (html, inline_assets) = crate::render::extract_inline_assets(&page.html);
+        std::fs::write(&target, &html)?;
         make_public(&target, false)?;
+        if !inline_assets.is_empty() {
+            let dir = target.parent().unwrap_or(out);
+            for (name, data) in &inline_assets {
+                let asset_path = dir.join(name);
+                // 文件名带内容哈希，已存在就说明是同一张图，直接跳过。
+                if !asset_path.exists() {
+                    std::fs::write(&asset_path, data)?;
+                    make_public(&asset_path, false)?;
+                }
+            }
+        }
         if let Some(pdf) = &page.pdf {
             let pdf_target = safe_output_path(out, &pdf_path(&page.slug))?;
             if let Some(parent) = pdf_target.parent() {
@@ -1134,8 +1148,20 @@ pub async fn run_one(
         std::fs::create_dir_all(parent)?;
         make_parent_dirs_public(out, parent)?;
     }
-    std::fs::write(&target, html)?;
+    // 与整站构建一致：内嵌 data URI 的图片落成同目录独立文件。
+    let (html, inline_assets) = crate::render::extract_inline_assets(&html);
+    std::fs::write(&target, &html)?;
     make_public(&target, false)?;
+    if !inline_assets.is_empty() {
+        let dir = target.parent().unwrap_or(out);
+        for (name, data) in &inline_assets {
+            let asset_path = dir.join(name);
+            if !asset_path.exists() {
+                std::fs::write(&asset_path, data)?;
+                make_public(&asset_path, false)?;
+            }
+        }
+    }
     if let Some(pdf) = rendered.pdf {
         let pdf_target = safe_output_path(out, &pdf_path(&content.slug))?;
         if let Some(parent) = pdf_target.parent() {
