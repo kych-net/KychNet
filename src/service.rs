@@ -632,6 +632,7 @@ pub async fn update_content(
     slug: &str,
     format: &str,
     body: &str,
+    head: &str,
     published: bool,
     author_id: Uuid,
     message: &str,
@@ -661,8 +662,8 @@ pub async fn update_content(
     let result = if let Some(rev_seq) = new_rev_seq {
         sqlx::query_as::<_, Content>(
             "UPDATE contents
-             SET slug = $2, format = $3, body = $4, published = $5,
-                 rev_seq = $6, updated_at = now()
+             SET slug = $2, format = $3, body = $4, head = $5, published = $6,
+                 rev_seq = $7, updated_at = now()
              WHERE id = $1
              RETURNING *",
         )
@@ -670,6 +671,7 @@ pub async fn update_content(
         .bind(slug)
         .bind(format)
         .bind(body)
+        .bind(head)
         .bind(published)
         .bind(rev_seq)
         .fetch_one(&mut *tx)
@@ -677,7 +679,8 @@ pub async fn update_content(
     } else {
         sqlx::query_as::<_, Content>(
             "UPDATE contents
-             SET slug = $2, format = $3, body = $4, published = $5, updated_at = now()
+             SET slug = $2, format = $3, body = $4, head = $5, published = $6,
+                 updated_at = now()
              WHERE id = $1
              RETURNING *",
         )
@@ -685,6 +688,7 @@ pub async fn update_content(
         .bind(slug)
         .bind(format)
         .bind(body)
+        .bind(head)
         .bind(published)
         .fetch_one(&mut *tx)
         .await
@@ -709,6 +713,7 @@ pub async fn upsert_content(
     slug: &str,
     format: &str,
     body: &str,
+    head: &str,
     published: bool,
     author_id: Uuid,
     message: &str,
@@ -734,13 +739,15 @@ pub async fn upsert_content(
         if let Some(rev_seq) = new_rev_seq {
             sqlx::query_as::<_, Content>(
                 "UPDATE contents
-                 SET format = $2, body = $3, published = $4, rev_seq = $5, updated_at = now()
+                 SET format = $2, body = $3, head = $4, published = $5,
+                     rev_seq = $6, updated_at = now()
                  WHERE id = $1
                  RETURNING *",
             )
             .bind(id)
             .bind(format)
             .bind(body)
+            .bind(head)
             .bind(published)
             .bind(rev_seq)
             .fetch_one(&mut *tx)
@@ -748,27 +755,30 @@ pub async fn upsert_content(
         } else {
             sqlx::query_as::<_, Content>(
                 "UPDATE contents
-                 SET format = $2, body = $3, published = $4, updated_at = now()
+                 SET format = $2, body = $3, head = $4, published = $5,
+                     updated_at = now()
                  WHERE id = $1
                  RETURNING *",
             )
             .bind(id)
             .bind(format)
             .bind(body)
+            .bind(head)
             .bind(published)
             .fetch_one(&mut *tx)
             .await?
         }
     } else {
         let content = sqlx::query_as::<_, Content>(
-            "INSERT INTO contents (id, slug, format, body, published, rev_seq)
-             VALUES ($1, $2, $3, $4, $5, 1)
+            "INSERT INTO contents (id, slug, format, body, head, published, rev_seq)
+             VALUES ($1, $2, $3, $4, $5, $6, 1)
              RETURNING *",
         )
         .bind(Uuid::new_v4())
         .bind(slug)
         .bind(format)
         .bind(body)
+        .bind(head)
         .bind(published)
         .fetch_one(&mut *tx)
         .await?;

@@ -34,6 +34,9 @@ pub(crate) struct ContentRequest {
     slug: String,
     format: String,
     body: String,
+    /// 页面自定义 <head> 内容。仅对能渲染成 HTML 的格式生效，管理员可写。
+    #[serde(default)]
+    head: String,
     #[serde(default)]
     published: bool,
     /// 可选的版本说明，落入精简版历史；缺省为空。
@@ -100,6 +103,13 @@ pub(crate) async fn save_content(
     //   /eoe/index.md -> eoe/index.html
     // 同一路径只有一条记录，因此 .html/.md/.typ 天然互斥。
     let (slug, format) = service::normalize_content_path(&req.slug, format)?;
+    // 自定义 head 只对会产出 HTML 页面的格式有意义；css/svg 直接丢弃，
+    // 免得内容作者以为写了会生效。
+    let head = if format.renders_html() {
+        validate_page_head(&req.head)?
+    } else {
+        String::new()
+    };
     if format == crate::models::ContentFormat::Svg {
         crate::svg::validate_svg(req.body.as_bytes())?;
     }
@@ -124,6 +134,7 @@ pub(crate) async fn save_content(
             &slug,
             format.as_str(),
             &req.body,
+            &head,
             req.published,
             user.id,
             req.message.trim(),
@@ -135,6 +146,7 @@ pub(crate) async fn save_content(
             &slug,
             format.as_str(),
             &req.body,
+            &head,
             req.published,
             user.id,
             req.message.trim(),
@@ -260,4 +272,24 @@ pub(crate) async fn content_revision_revert(
         ));
     }
     Ok(Json(json!({ "item": content })))
+}
+
+/// 校验并规整页面自定义 <head> 内容。
+///
+/// 这段内容是管理员手写的原始 HTML，原样注入模板，因此只需挡住会破坏
+/// 文档结构的情况：出现 `</head>` 闭合标签、或整体长度失控。
+fn validate_page_head(raw: &str) -> anyhow::Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    if trimmed.to_ascii_lowercase().contains("</head") {
+        anyhow::bail!("自定义 head 里不能出现 </head> 闭合标签");
+    }
+    // 32 KiB 足够放 meta / link / script，再大基本是误操作。
+    const MAX_HEAD_BYTES: usize = 32 * 1024;
+    if trimmed.len() > MAX_HEAD_BYTES {
+        anyhow::bail!("自定义 head 超过 {} KiB 上限", MAX_HEAD_BYTES / 1024);
+    }
+    Ok(trimmed.to_string())
 }

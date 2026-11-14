@@ -65,6 +65,8 @@ export type Content = {
   slug: string;
   format: ContentFormat;
   body: string;
+  /** 页面自定义 <head>：仅管理员可写，只对会产出 HTML 的格式生效。 */
+  head: string;
   published: boolean;
   created_at: string;
   updated_at: string;
@@ -437,6 +439,7 @@ export const api = {
     slug: string;
     format: ContentFormat;
     body: string;
+    head?: string;
     published: boolean;
     message?: string;
   }) =>

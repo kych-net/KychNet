@@ -290,6 +290,8 @@ impl KychMcp {
             &slug,
             format.as_str(),
             &params.body,
+            // MCP 写入不支持自定义 head：那是管理端的专属能力。
+            "",
             params.published,
             author_id,
             "",

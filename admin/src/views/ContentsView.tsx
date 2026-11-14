@@ -22,6 +22,13 @@ function formatLabel(format: ContentFormat): string {
   }
 }
 
+/// 会产出 HTML 页面的格式才支持自定义 <head>；css / svg 是静态资源，没有页面结构。
+function rendersHtml(format: ContentFormat): boolean {
+  return (
+    format === "markdown" || format === "html" || format === "wikidot" || format === "typst"
+  );
+}
+
 function extensionFor(format: ContentFormat): string {
   return format === "markdown" ? ".md" : format === "typst" ? ".typ" : format === "wikidot" ? ".wj" : format === "css" ? ".css" : format === "svg" ? ".svg" : ".html";
 }
@@ -73,6 +80,8 @@ export function ContentsView() {
   const [slug, setSlug] = useState("");
   const [format, setFormat] = useState<ContentFormat>("markdown");
   const [body, setBody] = useState("");
+  // 页面自定义 <head>：只有会产出 HTML 的格式才显示这个编辑区。
+  const [head, setHead] = useState("");
   const [published, setPublished] = useState(false);
   const [message, setMessage] = useState("");
   const [previewOn, setPreviewOn] = useState(true);
@@ -181,6 +190,7 @@ export function ContentsView() {
         slug,
         format,
         body,
+        head,
         published,
         message: message.trim() || undefined,
       });
@@ -216,6 +226,7 @@ export function ContentsView() {
     setSlug(editorPath(item));
     setFormat(item.format);
     setBody(item.body);
+    setHead(item.head ?? "");
     setPublished(item.published);
     setMessage("");
   }
@@ -237,6 +248,7 @@ export function ContentsView() {
     setSlug("");
     setFormat("markdown");
     setBody("");
+    setHead("");
     setPublished(false);
     setMessage("");
     setError("");
@@ -334,6 +346,27 @@ export function ContentsView() {
           <div className={`editor-workbench ${previewOn && previewSupported ? "with-preview" : ""}`}>
             <div className="editor-pane">
               <CodeEditor value={body} format={format} onChange={setBody} />
+              {rendersHtml(format) && (
+                <details className="head-editor" open={head.trim() !== ""}>
+                  <summary>
+                    页面 &lt;head&gt; 自定义
+                    <span className="hint">
+                      {head.trim() ? `已设置 ${head.trim().length} 字符` : "未设置"}
+                    </span>
+                  </summary>
+                  <p className="hint">
+                    原样注入到 &lt;/head&gt; 之前，可写 meta、link、script 等标签；
+                    只影响当前这一页。css / svg 类内容没有页面结构，不提供此项。
+                  </p>
+                  <textarea
+                    className="head-editor-input"
+                    value={head}
+                    spellCheck={false}
+                    placeholder={'<meta name="robots" content="noindex" />'}
+                    onChange={(event) => setHead(event.target.value)}
+                  />
+                </details>
+              )}
             </div>
             {previewOn && previewSupported && (
               <div className="preview-pane">
@@ -445,6 +478,7 @@ export function ContentsView() {
                 setSlug(editorPath(item));
                 setFormat(item.format);
                 setBody(item.body);
+                setHead(item.head ?? "");
                 setPublished(item.published);
                 setNotice(`已回滚到版本 ${item.rev_seq}`);
                 setHistoryKey((value) => value + 1);

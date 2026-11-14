@@ -21,6 +21,8 @@ struct IndexTemplate {
     styles: Vec<String>,
     /// 项目页专属图标；为空时 layout 回退站点默认图标。
     icon: String,
+    /// 内容页自定义 <head>，原样注入；自动生成的页面为空。
+    head: String,
 }
 
 struct PostLink {
@@ -42,6 +44,8 @@ struct PageTemplate {
     styles: Vec<String>,
     /// 项目页专属图标；为空时 layout 回退站点默认图标。
     icon: String,
+    /// 内容页自定义 <head>，原样注入；自动生成的页面为空。
+    head: String,
 }
 
 /// 一篇已经渲染完成的页面，先留在内存里，等全部成功后再统一落盘。
@@ -633,6 +637,7 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
                         slug: slug.clone(),
                         format: format.as_str().to_string(),
                         body,
+                        head: String::new(),
                         published: true,
                         created_at: snapshot.committed_at,
                         updated_at: snapshot.committed_at,
@@ -788,6 +793,7 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
                 tree: tree_html,
                 styles,
                 icon,
+                head: content.head.clone(),
             };
             let html = match template.render() {
                 Ok(value) => value,
@@ -837,6 +843,7 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
             tree: tree_html.clone(),
             styles: Vec::new(),
             icon: String::new(),
+            head: String::new(),
         }
         .render()?;
         pages.push(BuiltPage {
@@ -872,6 +879,7 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
                 tree: tree_html.clone(),
                 styles: Vec::new(),
                 icon: String::new(),
+                head: String::new(),
             }
             .render()?,
         )
@@ -1104,6 +1112,7 @@ pub async fn run_one(
         tree: tree_html,
         styles,
         icon: String::new(),
+        head: content.head.clone(),
     }
     .render()?;
 
@@ -1256,6 +1265,7 @@ mod tests {
             tree: tree.clone(),
             styles: Vec::new(),
             icon: String::new(),
+            head: String::new(),
         };
         let html = index.render().unwrap();
         assert!(html.contains("第一篇"));
@@ -1271,6 +1281,7 @@ mod tests {
             tree,
             styles: Vec::new(),
             icon: String::new(),
+            head: String::new(),
         };
         let html = page.render().unwrap();
         assert!(html.contains("<p>正文</p>"));
@@ -1290,6 +1301,7 @@ mod tests {
             tree: tree.clone(),
             styles: Vec::new(),
             icon: String::new(),
+            head: String::new(),
         };
         let plain = index.render().unwrap();
         assert!(
@@ -1309,6 +1321,7 @@ mod tests {
             tree,
             styles: Vec::new(),
             icon: String::new(),
+            head: String::new(),
         };
         let html = page.render().unwrap();
         assert!(html.contains("京ICP备12345678号-1"));
@@ -1337,6 +1350,7 @@ mod tests {
             slug: slug.to_string(),
             format: "markdown".into(),
             body: String::new(),
+            head: String::new(),
             published: true,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),

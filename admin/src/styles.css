@@ -3646,3 +3646,57 @@ code,
 .res-bar-fill.warn {
   background: #d9534f;
 }
+
+/* ---------- 页面 <head> 自定义编辑区 ---------- */
+.head-editor {
+  margin-top: 0.75rem;
+  padding-top: 0.6rem;
+  border-top: 1px solid var(--border);
+}
+
+.head-editor summary {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  cursor: pointer;
+  font-size: 0.85rem;
+  color: var(--text);
+  list-style: none;
+}
+
+.head-editor summary::-webkit-details-marker {
+  display: none;
+}
+
+.head-editor summary::before {
+  content: "▸";
+  color: var(--muted);
+  transition: transform 0.15s ease;
+}
+
+.head-editor[open] summary::before {
+  transform: rotate(90deg);
+}
+
+.head-editor .hint {
+  margin: 0.4rem 0 0.5rem;
+}
+
+.head-editor-input {
+  width: 100%;
+  min-height: 6rem;
+  padding: 0.6rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.82rem;
+  line-height: 1.6;
+  resize: vertical;
+}
+
+.head-editor-input:focus {
+  outline: 2px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  outline-offset: 1px;
+}

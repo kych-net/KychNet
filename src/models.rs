@@ -130,6 +130,16 @@ pub enum ContentFormat {
 }
 
 impl ContentFormat {
+    /// 这种格式是否会产出一个带 <head> 的 HTML 页面。
+    ///
+    /// css / svg 作为静态资源原样输出，没有页面结构，因此不支持自定义 head。
+    pub fn renders_html(self) -> bool {
+        matches!(
+            self,
+            Self::Markdown | Self::Html | Self::Typst | Self::Wikidot
+        )
+    }
+
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "markdown" => Some(Self::Markdown),
@@ -187,6 +197,9 @@ pub struct Content {
     pub format: String,
     pub body: String,
     pub published: bool,
+    /// 页面自定义 <head> 内容（原样注入，仅管理员可写；不参与版本历史）。
+    #[serde(default)]
+    pub head: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     /// 当前版本指针：指向 `content_revisions` 里正在展示的版本。
