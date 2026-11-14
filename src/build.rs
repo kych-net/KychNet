@@ -55,6 +55,8 @@ struct BuiltPage {
     date: String,
     html: String,
     pdf: Option<Vec<u8>>,
+    /// 渲染阶段从 Typst DOM 里拆出来的图片（文件名 → 内容）。
+    assets: Vec<(String, Vec<u8>)>,
 }
 
 /// 目录树节点。目录和文件分开存：目录名没有扩展名，文件名保留源格式扩展名。
@@ -810,6 +812,7 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
                     date,
                     html,
                     pdf: rendered.pdf,
+                    assets: rendered.assets,
                 },
                 cache_key,
             ))
@@ -850,6 +853,7 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
             slug: index_slug,
             title: "项目".to_string(),
             date: String::new(),
+            assets: Vec::new(),
             html,
             pdf: None,
         });
@@ -940,20 +944,18 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
             std::fs::create_dir_all(parent)?;
             make_parent_dirs_public(out, parent)?;
         }
-        // Typst 导出的 HTML 会把图片内嵌成 data URI，这里落成同目录的
-        // 独立文件，既减小 HTML 体积，也让浏览器能缓存这些图。
+        // 图片资产有两个来源：Typst 渲染阶段已在 DOM 层拆出的（page.assets），
+        // 以及正文里手写的 data URI（markdown / html 内容，这里兜底提取）。
         let (html, inline_assets) = crate::render::extract_inline_assets(&page.html);
         std::fs::write(&target, &html)?;
         make_public(&target, false)?;
-        if !inline_assets.is_empty() {
-            let dir = target.parent().unwrap_or(out);
-            for (name, data) in &inline_assets {
-                let asset_path = dir.join(name);
-                // 文件名带内容哈希，已存在就说明是同一张图，直接跳过。
-                if !asset_path.exists() {
-                    std::fs::write(&asset_path, data)?;
-                    make_public(&asset_path, false)?;
-                }
+        let dir = target.parent().unwrap_or(out);
+        for (name, data) in page.assets.iter().chain(inline_assets.iter()) {
+            let asset_path = dir.join(name);
+            // 文件名带内容哈希，已存在就说明是同一张图，直接跳过。
+            if !asset_path.exists() {
+                std::fs::write(&asset_path, data)?;
+                make_public(&asset_path, false)?;
             }
         }
         if let Some(pdf) = &page.pdf {
@@ -1152,14 +1154,12 @@ pub async fn run_one(
     let (html, inline_assets) = crate::render::extract_inline_assets(&html);
     std::fs::write(&target, &html)?;
     make_public(&target, false)?;
-    if !inline_assets.is_empty() {
-        let dir = target.parent().unwrap_or(out);
-        for (name, data) in &inline_assets {
-            let asset_path = dir.join(name);
-            if !asset_path.exists() {
-                std::fs::write(&asset_path, data)?;
-                make_public(&asset_path, false)?;
-            }
+    let asset_dir = target.parent().unwrap_or(out);
+    for (name, data) in rendered.assets.iter().chain(inline_assets.iter()) {
+        let asset_path = asset_dir.join(name);
+        if !asset_path.exists() {
+            std::fs::write(&asset_path, data)?;
+            make_public(&asset_path, false)?;
         }
     }
     if let Some(pdf) = rendered.pdf {

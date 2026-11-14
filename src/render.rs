@@ -28,6 +28,9 @@ use crate::models::ContentFormat;
 pub struct Rendered {
     pub html: String,
     pub pdf: Option<Vec<u8>>,
+    /// 与 HTML 同目录输出的附带资产（目前是 Typst 导出的图片）。
+    /// 文件名已带内容哈希，`html` 里的 src 已指向这些名字。
+    pub assets: Vec<(String, Vec<u8>)>,
 }
 
 /// 渲染一页 Wikidot 所需的上下文。
@@ -80,10 +83,12 @@ pub fn render_doc_with_project(
         ContentFormat::Markdown => Ok(Rendered {
             html: render_markdown(body),
             pdf: None,
+            assets: Vec::new(),
         }),
         ContentFormat::Html => Ok(Rendered {
             html: body.to_string(),
             pdf: None,
+            assets: Vec::new(),
         }),
         ContentFormat::Typst => render_typst(body, root, files, main_path),
         ContentFormat::Wikidot => render_wikidot(body, ctx),
@@ -91,6 +96,7 @@ pub fn render_doc_with_project(
         ContentFormat::Svg => Ok(Rendered {
             html: body.to_string(),
             pdf: None,
+            assets: Vec::new(),
         }),
         ContentFormat::Css => bail!("CSS 文件不是页面，不能走页面渲染"),
     }
@@ -190,6 +196,7 @@ fn render_wikidot(body: &str, ctx: &DocContext) -> Result<Rendered> {
     Ok(Rendered {
         html: output.body,
         pdf: None,
+        assets: Vec::new(),
     })
 }
 
@@ -497,15 +504,20 @@ fn render_typst(
     let pdf = typst_pdf::pdf(&paged, &typst_pdf::PdfOptions::default())
         .map_err(|errors| anyhow::anyhow!("Typst PDF 导出失败: {:?}", errors))?;
 
-    let html_doc = typst::compile::<HtmlDocument>(&world)
+    let mut html_doc = typst::compile::<HtmlDocument>(&world)
         .output
         .map_err(|errors| anyhow::anyhow!("Typst HTML 编译失败: {errors:?}"))?;
+    // 在序列化之前把 `image` 元素内嵌的 data URI 换成独立文件名。
+    // Typst 的导出规则（IMAGE_RULE）无条件调 `to_base64_url()`，且
+    // HtmlOptions 没有开关；直接在 DOM 上改属性比事后扫字符串更可靠。
+    let assets = extract_dom_images(html_doc.root_mut());
     let full = typst_html::html(&html_doc, &typst_html::HtmlOptions::default())
         .map_err(|errors| anyhow::anyhow!("Typst HTML 导出失败: {:?}", errors))?;
 
     Ok(Rendered {
         html: extract_typst_fragment(&full),
         pdf: Some(pdf),
+        assets,
     })
 }
 
@@ -656,6 +668,67 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&base).ok();
+    }
+}
+
+/// 遍历 Typst 的 HTML DOM，把 `<img src="data:image/...">` 换成独立文件名。
+///
+/// 返回 `[(文件名, 内容)]`，文件名带内容哈希，天然去重；
+/// 元素的 `src` 属性会被就地改写为这个文件名。
+fn extract_dom_images(root: &mut typst_html::HtmlElement) -> Vec<(String, Vec<u8>)> {
+    let mut assets: Vec<(String, Vec<u8>)> = Vec::new();
+    visit_html_element(root, &mut assets);
+    assets
+}
+
+fn visit_html_element(elem: &mut typst_html::HtmlElement, assets: &mut Vec<(String, Vec<u8>)>) {
+    if elem.tag == typst_html::tag::img {
+        if let Some(src) = elem.attrs.get(typst_html::attr::src).cloned() {
+            if let Some((mime, bytes)) = decode_data_uri(&src) {
+                let digest = Sha256::digest(&bytes);
+                let file = format!("media-{}.{}", hex::encode(&digest[..6]), mime_ext(&mime));
+                if !assets.iter().any(|(existing, _)| existing == &file) {
+                    assets.push((file.clone(), bytes));
+                }
+                if let Some(slot) = elem.attrs.get_mut(typst_html::attr::src) {
+                    *slot = file.into();
+                }
+                return;
+            }
+        }
+    }
+    for child in elem.children.make_mut().iter_mut() {
+        if let typst_html::HtmlNode::Element(inner) = child {
+            visit_html_element(inner, assets);
+        }
+    }
+}
+
+/// 解析 `data:image/<mime>;base64,<payload>`，返回 (mime, 解码后的字节)。
+fn decode_data_uri(src: &str) -> Option<(String, Vec<u8>)> {
+    use base64::Engine as _;
+
+    let rest = src.strip_prefix("data:")?;
+    let comma = rest.find(',')?;
+    let meta = &rest[..comma];
+    let mime = meta.strip_suffix(";base64")?.to_string();
+    if !mime.starts_with("image/") {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&rest[comma + 1..])
+        .ok()?;
+    Some((mime, bytes))
+}
+
+fn mime_ext(mime: &str) -> &'static str {
+    match mime {
+        "image/svg+xml" => "svg",
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        _ => "bin",
     }
 }
 
