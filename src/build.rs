@@ -574,18 +574,24 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
     let snapshots = crate::project::snapshots(pool).await?;
     let mut project_styles = Vec::new();
     let mut project_assets = Vec::new();
-    let mut project_typst: HashMap<String, (HashMap<String, Vec<u8>>, String)> = HashMap::new();
+    let mut project_typst: HashMap<String, (render::ProjectFiles, String)> = HashMap::new();
     let mut project_links = Vec::new();
     /// 项目 slug -> 图标 URL（/项目/<slug>/icon.svg）。
     let mut project_icons: HashMap<String, String> = HashMap::new();
     let mut seen_slugs: HashSet<String> = contents.iter().map(|item| item.slug.clone()).collect();
 
     for snapshot in &snapshots {
-        let files_map: HashMap<String, Vec<u8>> = snapshot
-            .files
-            .iter()
-            .map(|(path, data)| (path.clone(), data.clone()))
-            .collect();
+        // 每个文件的内容在这里复制**一次**，之后所有引用同一份 Bytes；
+        // 同项目下的多个页面共享同一个 Arc，不再各自复制整份快照。
+        let files_map: render::ProjectFiles = std::sync::Arc::new(
+            snapshot
+                .files
+                .iter()
+                .map(|(path, data)| {
+                    (path.clone(), typst::foundations::Bytes::new(data.clone()))
+                })
+                .collect(),
+        );
         // 项目图标：优先用仓库根目录的自定义 SVG，否则按项目名生成字母图标。
         // 输出成固定的 icon.svg，供项目页面 <link rel="icon"> 使用。
         let icon_href = format!(
@@ -662,7 +668,7 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
                         rev_seq: 0,
                     });
                     if format == ContentFormat::Typst {
-                        project_typst.insert(slug, (files_map.clone(), path.clone()));
+                        project_typst.insert(slug, (std::sync::Arc::clone(&files_map), path.clone()));
                     }
                 }
                 None => {
@@ -758,9 +764,14 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
             let cache_key = match content.format() {
                 ContentFormat::Typst => match project {
                     Some((files, main_path)) => {
-                        Some(cache.key_typst(&body, main_path, files, &root_hash))
+                        Some(cache.key_typst(&body, main_path, &render::files_digest(files), &root_hash))
                     }
-                    None => Some(cache.key_typst(&body, "main.typ", &HashMap::new(), &root_hash)),
+                    None => Some(cache.key_typst(
+                        &body,
+                        "main.typ",
+                        &render::files_digest(&std::sync::Arc::new(HashMap::new())),
+                        &root_hash,
+                    )),
                 },
                 ContentFormat::Wikidot => Some(cache.key_wikidot(&body, &includes)),
                 _ => None,
@@ -1100,7 +1111,13 @@ pub async fn run_one(
     let cache_key = match content.format() {
         ContentFormat::Typst => {
             let root_hash = crate::render_cache::root_snapshot(&cfg.content_root);
-            Some(cache.key_typst(&body, "main.typ", &HashMap::new(), &root_hash))
+            // 单页构建不加载项目文件，摘要按空集合算。
+            Some(cache.key_typst(
+                &body,
+                "main.typ",
+                &render::files_digest(&std::sync::Arc::new(HashMap::new())),
+                &root_hash,
+            ))
         }
         ContentFormat::Wikidot => Some(cache.key_wikidot(&body, &wikidot_includes)),
         _ => None,

@@ -1,9 +1,9 @@
 import { useState } from "react";
-import { Content, sourcePath } from "../api";
+import { ContentSummary, sourcePath } from "../api";
 
 type FileNode = {
   name: string;
-  content: Content;
+  content: ContentSummary;
 };
 
 type Node = {
@@ -11,7 +11,7 @@ type Node = {
   files: FileNode[];
 };
 
-function buildTree(items: Content[]): Node {
+function buildTree(items: ContentSummary[]): Node {
   const root: Node = { dirs: {}, files: [] };
   for (const item of items) {
     const parts = item.slug.split("/");
@@ -30,7 +30,7 @@ function buildTree(items: Content[]): Node {
 type DirProps = {
   name: string;
   node: Node;
-  onEdit: (content: Content) => void;
+  onEdit: (content: ContentSummary) => void;
 };
 
 function DirNode({ name, node, onEdit }: DirProps) {
@@ -73,8 +73,8 @@ function DirNode({ name, node, onEdit }: DirProps) {
 }
 
 type Props = {
-  items: Content[];
-  onEdit: (content: Content) => void;
+  items: ContentSummary[];
+  onEdit: (content: ContentSummary) => void;
 };
 
 export function DirTree({ items, onEdit }: Props) {

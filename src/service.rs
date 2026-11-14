@@ -604,6 +604,30 @@ pub async fn list_contents(pool: &PgPool) -> Result<Vec<Content>> {
     )
 }
 
+/// 列表摘要：只取元数据与正文长度，不读正文本体。
+pub async fn list_content_summaries(
+    pool: &PgPool,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<crate::models::ContentSummary>> {
+    let limit = limit.clamp(1, 500);
+    Ok(sqlx::query_as::<_, crate::models::ContentSummary>(
+        "SELECT id, slug, format, published, created_at, updated_at, rev_seq,
+                octet_length(body)::bigint AS size
+         FROM contents ORDER BY updated_at DESC LIMIT $1 OFFSET $2",
+    )
+    .bind(limit)
+    .bind(offset.max(0))
+    .fetch_all(pool)
+    .await?)
+}
+
+pub async fn count_contents(pool: &PgPool) -> Result<i64> {
+    Ok(sqlx::query_scalar("SELECT count(*) FROM contents")
+        .fetch_one(pool)
+        .await?)
+}
+
 pub async fn list_published(pool: &PgPool) -> Result<Vec<Content>> {
     Ok(sqlx::query_as::<_, Content>(
         "SELECT * FROM contents WHERE published = TRUE ORDER BY created_at DESC",

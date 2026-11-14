@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { marked } from "marked";
-import { api, Content, ContentFormat, editorPath } from "../api";
+import { api, Content, ContentFormat, ContentSummary, editorPath, sourcePath } from "../api";
 import { CodeEditor } from "../components/CodeEditor";
 import { DirTree } from "../components/DirTree";
 import { RevisionPanel } from "../components/RevisionPanel";
@@ -72,7 +72,7 @@ function previewDocument(html: string): string {
 }
 
 export function ContentsView() {
-  const [items, setItems] = useState<Content[]>([]);
+  const [items, setItems] = useState<ContentSummary[]>([]);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
 
@@ -82,6 +82,8 @@ export function ContentsView() {
   const [body, setBody] = useState("");
   // 页面自定义 <head>：只有会产出 HTML 的格式才显示这个编辑区。
   const [head, setHead] = useState("");
+  // 切换内容时的代际号：慢响应回来时若已切走就丢弃。
+  const editGeneration = useRef(0);
   const [published, setPublished] = useState(false);
   const [message, setMessage] = useState("");
   const [previewOn, setPreviewOn] = useState(true);
@@ -172,7 +174,7 @@ export function ContentsView() {
 
   async function refresh() {
     try {
-      setItems((await api.contents()).items);
+      setItems((await api.contentSummaries()).items);
     } catch (e) {
       setError((e as Error).message);
     }
@@ -221,14 +223,25 @@ export function ContentsView() {
     }
   }
 
-  function edit(item: Content) {
+  async function edit(item: ContentSummary) {
     setContentId(item.id);
-    setSlug(editorPath(item));
+    setSlug(sourcePath(item));
     setFormat(item.format);
-    setBody(item.body);
-    setHead(item.head ?? "");
     setPublished(item.published);
     setMessage("");
+    // 列表只有摘要：正文与 head 在这里按需取。
+    // 用代际号防止慢响应覆盖用户已经切到的另一篇。
+    const generation = ++editGeneration.current;
+    try {
+      const { item: full } = await api.content(item.id);
+      if (editGeneration.current !== generation) return;
+      setBody(full.body);
+      setHead(full.head ?? "");
+      setSlug(editorPath(full));
+    } catch (error) {
+      if (editGeneration.current !== generation) return;
+      setError((error as Error).message);
+    }
   }
 
   function changeFormat(next: ContentFormat) {
@@ -236,7 +249,7 @@ export function ContentsView() {
     setSlug((current) => current.replace(/\.(html|md|typ|wj|svg)$/i, extensionFor(next)));
   }
 
-  function editFromTree(item: Content) {
+  function editFromTree(item: ContentSummary) {
     edit(item);
     // 从目录打开文件后回到编辑器视图。
     setMobilePane("editor");

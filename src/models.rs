@@ -207,6 +207,23 @@ pub struct Content {
     pub rev_seq: i32,
 }
 
+/// 内容列表用的摘要：不含正文与自定义 head。
+///
+/// 列表页只需要路径/格式/时间，正文按需单条获取；这样一次列表请求
+/// 不会把整站正文都读出来（大站点这里是数十 MB 的数据库读取与 JSON）。
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct ContentSummary {
+    pub id: Uuid,
+    pub slug: String,
+    pub format: String,
+    pub published: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub rev_seq: i32,
+    /// 正文字节长度，供列表显示与排序参考。
+    pub size: i64,
+}
+
 /// 单篇内容的单线历史版本。`kind = full` 时 `data` 是整段正文，
 /// `kind = delta` 时 `data` 是相对 `parent_seq` 版本的行级增量（JSON 操作序列）。
 #[derive(Debug, Clone, Serialize, FromRow)]

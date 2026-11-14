@@ -4,20 +4,53 @@ use super::*;
 pub(crate) async fn contents(
     State(state): State<AppState>,
     session: Session,
+    Query(query): Query<ContentsQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     current_user(&state, &session).await?;
-    let items: Vec<serde_json::Value> = service::list_contents(&state.pool)
+    if !query.summary {
+        // 兼容旧调用：完整列表（含正文）。
+        let items: Vec<serde_json::Value> = service::list_contents(&state.pool)
+            .await?
+            .into_iter()
+            .map(|content| {
+                let mut value = json!(content);
+                if let Some(object) = value.as_object_mut() {
+                    object.insert("filename".to_string(), json!(content.filename()));
+                }
+                value
+            })
+            .collect();
+        return Ok(Json(json!({ "items": items })));
+    }
+    let limit = query.limit.unwrap_or(100);
+    let offset = query.offset.unwrap_or(0);
+    let items = service::list_content_summaries(&state.pool, limit, offset).await?;
+    let total = service::count_contents(&state.pool).await?;
+    Ok(Json(json!({ "items": items, "total": total })))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ContentsQuery {
+    /// `1` 表示只要摘要（不含正文与 head），并配合 limit/offset 分页。
+    #[serde(default)]
+    summary: bool,
+    #[serde(default)]
+    limit: Option<i64>,
+    #[serde(default)]
+    offset: Option<i64>,
+}
+
+/// 单条内容全文：列表只给摘要，编辑时按需取正文。
+pub(crate) async fn content_one(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current_user(&state, &session).await?;
+    let content = service::find_content_by_id(&state.pool, id)
         .await?
-        .into_iter()
-        .map(|content| {
-            let mut value = json!(content);
-            if let Some(object) = value.as_object_mut() {
-                object.insert("filename".to_string(), json!(content.filename()));
-            }
-            value
-        })
-        .collect();
-    Ok(Json(json!({ "items": items })))
+        .context("内容不存在")?;
+    Ok(Json(json!({ "item": content, "filename": content.filename() })))
 }
 
 #[derive(Deserialize)]

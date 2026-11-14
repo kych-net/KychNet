@@ -561,7 +561,10 @@ pub async fn serve(cfg: Config) -> Result<()> {
         .route("/api/passkey/setup/finish", post(passkey_setup_finish))
         .route("/api/contents", get(contents).post(save_content))
         .route("/api/preview", post(preview_content))
-        .route("/api/contents/{id}", delete(delete_content))
+        .route(
+            "/api/contents/{id}",
+            get(content_one).delete(delete_content),
+        )
         .route("/api/contents/{id}/revisions", get(content_revisions))
         .route("/api/contents/{id}/revisions/{seq}", get(content_revision_body))
         .route(

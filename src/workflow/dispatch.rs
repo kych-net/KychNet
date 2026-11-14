@@ -200,9 +200,10 @@ async fn discover_definitions(
     workflow_dir: &str,
 ) -> Result<Vec<String>> {
     let prefix = format!("{}/", workflow_dir.trim_end_matches('/'));
-    let files = tree::read_files(conn, project_id, commit).await?;
+    // 只需要文件名：用 list_paths 遍历 tree 即可，不必把每个 blob 解压出来。
+    let files = tree::list_paths(conn, project_id, commit).await?;
     let mut out: Vec<String> = files
-        .into_keys()
+        .into_iter()
         .filter(|p| {
             let lower = p.to_ascii_lowercase();
             p.starts_with(&prefix) && (lower.ends_with(".yml") || lower.ends_with(".yaml"))

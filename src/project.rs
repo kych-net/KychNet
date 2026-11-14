@@ -232,9 +232,12 @@ fn validate_changes(changes: &[FileChange]) -> Result<()> {
 /// `a.html` 与 `a.html/b.md` 是文件/目录冲突（写盘时 create_dir_all 会失败），
 /// 同样拒绝——否则整站重建会在删旧产物之后的写盘阶段失败，留下半删的站点。
 /// `a.typ` 与 `a.css` 分别输出 `a.html` / `a.css`，可以共存。
-fn ensure_no_output_conflict(path: &str, files: &BTreeMap<String, Vec<u8>>) -> Result<()> {
+fn ensure_no_output_conflict(
+    path: &str,
+    files: &std::collections::BTreeSet<String>,
+) -> Result<()> {
     let target = project_output_path(path);
-    for existing in files.keys() {
+    for existing in files {
         if existing == path {
             continue;
         }
@@ -989,15 +992,18 @@ pub async fn write_file(
     lock_project(&mut tx, project_id).await?;
 
     let parent = store::resolve_branch(&mut tx, project_id, branch).await?;
-    let files = match parent {
-        Some(commit) => tree::read_files(&mut tx, project_id, commit).await?,
-        None => BTreeMap::new(),
+    // 只取目标文件的 OID 与全仓库的路径集合：既做 base_oid 校验又做输出
+    // 冲突检查，但不再把每个 blob 都解压一遍（仓库大时这是主要开销）。
+    let existing_oid = match parent {
+        Some(commit) => tree::find_blob_oid(&mut tx, project_id, commit, path).await?,
+        None => None,
     };
-    let existing_oid = files
-        .get(path)
-        .map(|data| crate::git::object::hash_object(crate::git::object::ObjectKind::Blob, data));
     store::check_old_oid(existing_oid, base_oid)?;
-    ensure_no_output_conflict(path, &files)?;
+    let paths = match parent {
+        Some(commit) => tree::list_paths(&mut tx, project_id, commit).await?,
+        None => std::collections::BTreeSet::new(),
+    };
+    ensure_no_output_conflict(path, &paths)?;
 
     let blob = tree::write_blob(&mut tx, project_id, content.as_bytes()).await?;
     let root = match parent {
@@ -1086,15 +1092,16 @@ pub async fn write_file_bytes(
     let mut tx = pool.begin().await?;
     lock_project(&mut tx, project_id).await?;
     let parent = store::resolve_branch(&mut tx, project_id, branch).await?;
-    let files = match parent {
-        Some(commit) => tree::read_files(&mut tx, project_id, commit).await?,
-        None => BTreeMap::new(),
+    let existing_oid = match parent {
+        Some(commit) => tree::find_blob_oid(&mut tx, project_id, commit, path).await?,
+        None => None,
     };
-    let existing_oid = files
-        .get(path)
-        .map(|old| crate::git::object::hash_object(crate::git::object::ObjectKind::Blob, old));
     store::check_old_oid(existing_oid, base_oid)?;
-    ensure_no_output_conflict(path, &files)?;
+    let paths = match parent {
+        Some(commit) => tree::list_paths(&mut tx, project_id, commit).await?,
+        None => std::collections::BTreeSet::new(),
+    };
+    ensure_no_output_conflict(path, &paths)?;
 
     let blob = tree::write_blob(&mut tx, project_id, &blob_bytes).await?;
     let root = match parent {
@@ -1198,7 +1205,8 @@ pub async fn commit_changes(
                 Some(old_oid),
             ));
         } else {
-            ensure_no_output_conflict(&change.path, &files)?;
+            let existing_paths: std::collections::BTreeSet<String> = files.keys().cloned().collect();
+            ensure_no_output_conflict(&change.path, &existing_paths)?;
             let content = change.content.as_deref().unwrap_or_default();
             let blob = tree::write_blob(&mut tx, project_id, content.as_bytes()).await?;
             let existed = files.contains_key(&change.path);
@@ -1338,17 +1346,14 @@ pub async fn move_file(
     let Some((blob, data)) = tree::find_file(&mut tx, project_id, commit, from).await? else {
         bail!("文件不存在: {from}");
     };
-    let files = tree::read_files(&mut tx, project_id, commit).await?;
-    if files.contains_key(to) {
+    let all_paths = tree::list_paths(&mut tx, project_id, commit).await?;
+    if all_paths.contains(to) {
         bail!("目标路径已存在: {to}");
     }
     // 冲突检查要排除源文件本身：同 stem 换格式改名（a.md → a.typ）
-    // 输出路径相同是改名的目的，不是冲突。只克隆键，不克隆文件内容。
-    let others: BTreeMap<String, Vec<u8>> = files
-        .keys()
-        .filter(|key| *key != from)
-        .map(|key| (key.clone(), Vec::new()))
-        .collect();
+    // 输出路径相同是改名的目的，不是冲突。
+    let others: std::collections::BTreeSet<String> =
+        all_paths.into_iter().filter(|key| key != from).collect();
     ensure_no_output_conflict(to, &others)?;
     ensure_text(&data)?;
 
@@ -1578,8 +1583,9 @@ pub async fn revert_commit(
     if changes.is_empty() {
         bail!("该提交没有可还原的改动");
     }
+    let current_paths: std::collections::BTreeSet<String> = current.keys().cloned().collect();
     for path in current.keys() {
-        ensure_no_output_conflict(path, &current)?;
+        ensure_no_output_conflict(path, &current_paths)?;
     }
 
     let root = tree::build_from_files(&mut tx, project_id, &current).await?;
@@ -1792,14 +1798,17 @@ mod tests {
 
     #[test]
     fn output_conflict_only_when_built_paths_match() {
-        let files = BTreeMap::from([
-            ("模板.typ".to_string(), b"= tpl".to_vec()),
-            ("模板.css".to_string(), b"body {}".to_vec()),
-            ("说明.md".to_string(), b"# doc".to_vec()),
-            ("图标.svg".to_string(), b"<svg/>".to_vec()),
-            ("notes.txt".to_string(), b"x".to_vec()),
-            ("子目录/模板.typ".to_string(), b"= sub".to_vec()),
-        ]);
+        let files: std::collections::BTreeSet<String> = [
+            "模板.typ",
+            "模板.css",
+            "说明.md",
+            "图标.svg",
+            "notes.txt",
+            "子目录/模板.typ",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
 
         // 截图里的场景：修改 .typ 时同名的 .css 是静态资源，不该拦。
         assert!(ensure_no_output_conflict("模板.typ", &files).is_ok());

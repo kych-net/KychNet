@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use sha2::{Digest, Sha256};
 use typst::diag::{FileError, FileResult};
+use std::sync::Arc;
 use typst::foundations::{Bytes, Datetime};
 use typst::LibraryExt;
 use typst_html::HtmlDocument;
@@ -24,6 +25,29 @@ use typst::utils::LazyHash;
 use typst::{Feature, Library, World};
 
 use crate::models::ContentFormat;
+
+/// 一个项目的文件快照：路径 → 内容。
+///
+/// 用 `Arc` + `Bytes` 两层共享：同一项目下所有页面复用同一份快照，
+/// 每个文件的内容也不在页面之间复制（`Bytes` 克隆只是引用计数）。
+pub type ProjectFiles = Arc<HashMap<String, Bytes>>;
+
+/// 计算文件快照的内容摘要（路径 + 内容），供渲染缓存键复用。
+///
+/// 之前每个页面在查缓存前都要对全项目文件排序并逐字节哈希一遍；
+/// 一个项目几十个页面就是几十次重复计算。改为每个项目算一次。
+pub fn files_digest(files: &ProjectFiles) -> String {
+    let mut paths: Vec<&String> = files.keys().collect();
+    paths.sort();
+    let mut h = Sha256::new();
+    for path in paths {
+        h.update(path.as_bytes());
+        h.update(b"\0");
+        h.update(&files[path]);
+        h.update(b"\0");
+    }
+    hex::encode(h.finalize())
+}
 
 pub struct Rendered {
     pub html: String,
@@ -63,7 +87,7 @@ pub fn render_doc(
     root: &Path,
     ctx: &DocContext,
 ) -> Result<Rendered> {
-    render_doc_with_project(format, body, root, ctx, &HashMap::new(), "main.typ", "")
+    render_doc_with_project(format, body, root, ctx, &Arc::new(HashMap::new()), "main.typ", "")
 }
 
 /// 渲染项目文件。`files` 是项目根下的完整文件快照，Typst 的相对 include
@@ -73,7 +97,7 @@ pub fn render_doc_with_project(
     body: &str,
     root: &Path,
     ctx: &DocContext,
-    files: &HashMap<String, Vec<u8>>,
+    files: &ProjectFiles,
     main_path: &str,
     // 项目在站点里的 URL 基址（如 `/项目/地狱之下`）；空串表示非项目页。
     // Typst 内嵌图片若能在项目文件里找到同内容文件，就引用它而不是另存。
@@ -209,8 +233,8 @@ struct TypstWorld {
     package_root: PathBuf,
     main: FileId,
     source: Source,
-    /// 项目仓库文件，key 是相对项目根的路径。
-    files: HashMap<String, Vec<u8>>,
+    /// 项目仓库文件，key 是相对项目根的路径。与同项目的其他页面共享。
+    files: ProjectFiles,
     book: LazyHash<FontBook>,
     fonts: Vec<Font>,
     library: LazyHash<Library>,
@@ -221,7 +245,7 @@ impl TypstWorld {
         body: &str,
         root: &Path,
         main_path: &str,
-        files: &HashMap<String, Vec<u8>>,
+        files: &ProjectFiles,
     ) -> Self {
         let main = FileId::new(RootedPath::new(
             VirtualRoot::Project,
@@ -251,7 +275,7 @@ impl TypstWorld {
             package_root,
             main,
             source,
-            files: files.clone(),
+            files: Arc::clone(files),
             book: LazyHash::new(book),
             fonts,
             library: LazyHash::new(library),
@@ -259,7 +283,7 @@ impl TypstWorld {
     }
 
     /// 项目仓库文件优先于磁盘内容目录。
-    fn memory_file(&self, id: FileId) -> Option<&Vec<u8>> {
+    fn memory_file(&self, id: FileId) -> Option<&Bytes> {
         // 包文件不能落到项目仓库的同名路径上（例如 typst.toml）。
         if matches!(id.root(), VirtualRoot::Package(_)) {
             return None;
@@ -466,7 +490,8 @@ impl World for TypstWorld {
             return Ok(Bytes::new(self.source.text().as_bytes().to_vec()));
         }
         if let Some(data) = self.memory_file(id) {
-            return Ok(Bytes::new(data.to_vec()));
+            // Bytes 克隆是引用计数，不再复制文件内容。
+            return Ok(data.clone());
         }
         let path = if matches!(id.root(), VirtualRoot::Package(_)) {
             self.package_path(id)?
@@ -489,7 +514,7 @@ impl World for TypstWorld {
 fn render_typst(
     body: &str,
     root: &Path,
-    files: &HashMap<String, Vec<u8>>,
+    files: &ProjectFiles,
     main_path: &str,
     asset_base: &str,
 ) -> Result<Rendered> {
@@ -609,7 +634,7 @@ mod tests {
         symlink(base.join("secret.txt"), content.join("link.txt")).expect("创建符号链接");
         std::fs::write(content.join("normal.txt"), "fine").expect("写入普通文件");
 
-        let world = TypstWorld::new("", &content, "main.typ", &HashMap::new());
+        let world = TypstWorld::new("", &content, "main.typ", &Arc::new(HashMap::new()));
         // 普通文件仍然可以解析。
         let ok = world.path_for(FileId::new(RootedPath::new(VirtualRoot::Project, VirtualPath::new("normal.txt").unwrap())));
         assert!(ok.is_ok(), "普通文件应通过: {ok:?}");
@@ -635,12 +660,12 @@ mod tests {
 /// 作为返回值交给调用方写盘。
 fn rewrite_dom_images(
     root: &mut typst_html::HtmlElement,
-    files: &HashMap<String, Vec<u8>>,
+    files: &ProjectFiles,
     asset_base: &str,
 ) {
     // 内容哈希 → 项目内路径。项目文件通常只有几十到几百个，一次建表足够便宜。
     let mut by_digest: HashMap<[u8; 32], String> = HashMap::with_capacity(files.len());
-    for (path, data) in files {
+    for (path, data) in files.iter() {
         by_digest.entry(Sha256::digest(data).into()).or_insert_with(|| path.clone());
     }
     visit_html_element(root, &by_digest, asset_base);

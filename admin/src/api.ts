@@ -74,6 +74,18 @@ export type Content = {
   rev_seq: number;
 };
 
+/// 列表摘要：不含正文与 head。打开编辑器时再取全文。
+export type ContentSummary = {
+  id: string;
+  slug: string;
+  format: ContentFormat;
+  published: boolean;
+  created_at: string;
+  updated_at: string;
+  rev_seq: number;
+  size: number;
+};
+
 export type ContentRevision = {
   id: string;
   content_id: string;
@@ -446,6 +458,13 @@ export const api = {
     }),
 
   contents: () => request<{ items: Content[] }>("/contents"),
+  /// 摘要列表（分页）。列表页优先用这个，避免一次拉取全部正文。
+  contentSummaries: (limit = 100, offset = 0) =>
+    request<{ items: ContentSummary[]; total: number }>(
+      `/contents?summary=1&limit=${limit}&offset=${offset}`,
+    ),
+  /// 单条全文。
+  content: (id: string) => request<{ item: Content }>(`/contents/${id}`),
   saveContent: (payload: {
     id?: string;
     slug: string;
