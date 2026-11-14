@@ -55,8 +55,6 @@ struct BuiltPage {
     date: String,
     html: String,
     pdf: Option<Vec<u8>>,
-    /// 渲染阶段从 Typst DOM 里拆出来的图片（文件名 → 内容）。
-    assets: Vec<(String, Vec<u8>)>,
 }
 
 /// 从内容输出路径推导项目在站点里的 URL 基址。
@@ -831,7 +829,6 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
                     date,
                     html,
                     pdf: rendered.pdf,
-                    assets: rendered.assets,
                 },
                 cache_key,
             ))
@@ -872,7 +869,6 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
             slug: index_slug,
             title: "项目".to_string(),
             date: String::new(),
-            assets: Vec::new(),
             html,
             pdf: None,
         });
@@ -965,15 +961,6 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
         }
         std::fs::write(&target, &page.html)?;
         make_public(&target, false)?;
-        let dir = target.parent().unwrap_or(out);
-        for (name, data) in page.assets.iter() {
-            let asset_path = dir.join(name);
-            // 文件名带内容哈希，已存在就说明是同一张图，直接跳过。
-            if !asset_path.exists() {
-                std::fs::write(&asset_path, data)?;
-                make_public(&asset_path, false)?;
-            }
-        }
         if let Some(pdf) = &page.pdf {
             let pdf_target = safe_output_path(out, &pdf_path(&page.slug))?;
             if let Some(parent) = pdf_target.parent() {
@@ -1168,14 +1155,6 @@ pub async fn run_one(
     }
     std::fs::write(&target, &html)?;
     make_public(&target, false)?;
-    let asset_dir = target.parent().unwrap_or(out);
-    for (name, data) in rendered.assets.iter() {
-        let asset_path = asset_dir.join(name);
-        if !asset_path.exists() {
-            std::fs::write(&asset_path, data)?;
-            make_public(&asset_path, false)?;
-        }
-    }
     if let Some(pdf) = rendered.pdf {
         let pdf_target = safe_output_path(out, &pdf_path(&content.slug))?;
         if let Some(parent) = pdf_target.parent() {

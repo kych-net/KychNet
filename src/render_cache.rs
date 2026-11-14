@@ -86,10 +86,7 @@ impl RenderCache {
     pub fn get(&self, key: &str) -> Option<Rendered> {
         let html = std::fs::read_to_string(self.dir.join(format!("{key}.html"))).ok()?;
         let pdf = std::fs::read(self.dir.join(format!("{key}.pdf"))).ok();
-        let assets = std::fs::read_to_string(self.dir.join(format!("{key}.assets")))
-            .map(|text| parse_assets(&text))
-            .unwrap_or_default();
-        Some(Rendered { html, pdf, assets })
+        Some(Rendered { html, pdf })
     }
 
     /// 写缓存失败只告警：缓存是优化，不能让它阻断构建。
@@ -99,19 +96,6 @@ impl RenderCache {
             std::fs::write(self.dir.join(format!("{key}.html")), &rendered.html)?;
             if let Some(pdf) = &rendered.pdf {
                 std::fs::write(self.dir.join(format!("{key}.pdf")), pdf)?;
-            }
-            // 图片资产也要进缓存：命中的 HTML 里 src 已指向 media-* 文件名，
-            // 只缓存 HTML 会让这些文件在磁盘上缺失。
-            if !rendered.assets.is_empty() {
-                use base64::Engine as _;
-                let mut text = String::new();
-                for (name, data) in &rendered.assets {
-                    text.push_str(name);
-                    text.push('\t');
-                    text.push_str(&base64::engine::general_purpose::STANDARD.encode(data));
-                    text.push('\n');
-                }
-                std::fs::write(self.dir.join(format!("{key}.assets")), text)?;
             }
             Ok(())
         };
@@ -130,7 +114,6 @@ impl RenderCache {
             let stem = name
                 .strip_suffix(".html")
                 .or_else(|| name.strip_suffix(".pdf"))
-                .or_else(|| name.strip_suffix(".assets"))
                 .unwrap_or("");
             if !stem.is_empty() && !used.contains(stem) {
                 let _ = std::fs::remove_file(entry.path());
@@ -175,14 +158,3 @@ pub fn root_snapshot(root: &Path) -> String {
     hex(&h.finalize())
 }
 
-/// 解析缓存里的资产清单：每行 `文件名<TAB>base64内容`。
-fn parse_assets(text: &str) -> Vec<(String, Vec<u8>)> {
-    use base64::Engine as _;
-    text.lines()
-        .filter_map(|line| {
-            let (name, encoded) = line.split_once('\t')?;
-            let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
-            Some((name.to_string(), bytes))
-        })
-        .collect()
-}

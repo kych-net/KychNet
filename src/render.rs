@@ -28,9 +28,6 @@ use crate::models::ContentFormat;
 pub struct Rendered {
     pub html: String,
     pub pdf: Option<Vec<u8>>,
-    /// 与 HTML 同目录输出的附带资产（目前是 Typst 导出的图片）。
-    /// 文件名已带内容哈希，`html` 里的 src 已指向这些名字。
-    pub assets: Vec<(String, Vec<u8>)>,
 }
 
 /// 渲染一页 Wikidot 所需的上下文。
@@ -86,12 +83,10 @@ pub fn render_doc_with_project(
         ContentFormat::Markdown => Ok(Rendered {
             html: render_markdown(body),
             pdf: None,
-            assets: Vec::new(),
         }),
         ContentFormat::Html => Ok(Rendered {
             html: body.to_string(),
             pdf: None,
-            assets: Vec::new(),
         }),
         ContentFormat::Typst => render_typst(body, root, files, main_path, asset_base),
         ContentFormat::Wikidot => render_wikidot(body, ctx),
@@ -99,7 +94,6 @@ pub fn render_doc_with_project(
         ContentFormat::Svg => Ok(Rendered {
             html: body.to_string(),
             pdf: None,
-            assets: Vec::new(),
         }),
         ContentFormat::Css => bail!("CSS 文件不是页面，不能走页面渲染"),
     }
@@ -199,7 +193,6 @@ fn render_wikidot(body: &str, ctx: &DocContext) -> Result<Rendered> {
     Ok(Rendered {
         html: output.body,
         pdf: None,
-        assets: Vec::new(),
     })
 }
 
@@ -511,17 +504,16 @@ fn render_typst(
     let mut html_doc = typst::compile::<HtmlDocument>(&world)
         .output
         .map_err(|errors| anyhow::anyhow!("Typst HTML 编译失败: {errors:?}"))?;
-    // 在序列化之前把 `image` 元素内嵌的 data URI 换成独立文件名。
+    // 在序列化之前把 `image` 元素内嵌的 data URI 换回项目里的原路径。
     // Typst 的导出规则（IMAGE_RULE）无条件调 `to_base64_url()`，且
     // HtmlOptions 没有开关；直接在 DOM 上改属性比事后扫字符串更可靠。
-    let assets = extract_dom_images(html_doc.root_mut(), files, asset_base);
+    rewrite_dom_images(html_doc.root_mut(), files, asset_base);
     let full = typst_html::html(&html_doc, &typst_html::HtmlOptions::default())
         .map_err(|errors| anyhow::anyhow!("Typst HTML 导出失败: {:?}", errors))?;
 
     Ok(Rendered {
         html: extract_typst_fragment(&full),
         pdf: Some(pdf),
-        assets,
     })
 }
 
@@ -641,50 +633,40 @@ mod tests {
 ///
 /// 反查不到的（Typst 运行时绘制出来的图形）才落成 `media-<hash>.<ext>`，
 /// 作为返回值交给调用方写盘。
-fn extract_dom_images(
+fn rewrite_dom_images(
     root: &mut typst_html::HtmlElement,
     files: &HashMap<String, Vec<u8>>,
     asset_base: &str,
-) -> Vec<(String, Vec<u8>)> {
+) {
     // 内容哈希 → 项目内路径。项目文件通常只有几十到几百个，一次建表足够便宜。
     let mut by_digest: HashMap<[u8; 32], String> = HashMap::with_capacity(files.len());
     for (path, data) in files {
         by_digest.entry(Sha256::digest(data).into()).or_insert_with(|| path.clone());
     }
-
-    let mut assets: Vec<(String, Vec<u8>)> = Vec::new();
-    visit_html_element(root, &by_digest, asset_base, &mut assets);
-    assets
+    visit_html_element(root, &by_digest, asset_base);
 }
 
 fn visit_html_element(
     elem: &mut typst_html::HtmlElement,
     by_digest: &HashMap<[u8; 32], String>,
     asset_base: &str,
-    assets: &mut Vec<(String, Vec<u8>)>,
 ) {
     if elem.tag == typst_html::tag::img {
         if let Some(src) = elem.attrs.get(typst_html::attr::src).cloned() {
             if let Some((mime, bytes)) = decode_data_uri(&src) {
                 let digest: [u8; 32] = Sha256::digest(&bytes).into();
-                let replacement = match by_digest.get(&digest) {
-                    // 命中项目文件：引用原路径，不产生新文件。
-                    Some(path) if !asset_base.is_empty() => {
-                        format!("{asset_base}/{path}")
-                    }
-                    Some(path) if !path.is_empty() => path.clone(),
-                    // 运行时绘制的图形：只能落盘。
-                    _ => {
-                        let file = format!(
-                            "media-{}.{}",
-                            hex::encode(&digest[..6]),
-                            mime_ext(&mime)
-                        );
-                        if !assets.iter().any(|(existing, _)| existing == &file) {
-                            assets.push((file.clone(), bytes));
-                        }
-                        file
-                    }
+                // 一律改回项目里的原路径；找不到就不动（保留原内嵌数据），
+                // 不再另存 media-* 副本——那等于给项目复制一份图片。
+                let Some(path) = by_digest.get(&digest) else {
+                    return;
+                };
+                if path.is_empty() {
+                    return;
+                }
+                let replacement = if asset_base.is_empty() {
+                    path.clone()
+                } else {
+                    format!("{asset_base}/{path}")
                 };
                 if let Some(slot) = elem.attrs.get_mut(typst_html::attr::src) {
                     *slot = replacement.into();
@@ -695,7 +677,7 @@ fn visit_html_element(
     }
     for child in elem.children.make_mut().iter_mut() {
         if let typst_html::HtmlNode::Element(inner) = child {
-            visit_html_element(inner, by_digest, asset_base, assets);
+            visit_html_element(inner, by_digest, asset_base);
         }
     }
 }
