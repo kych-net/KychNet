@@ -7,7 +7,7 @@ pub(crate) async fn contents(
     Query(query): Query<ContentsQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     current_user(&state, &session).await?;
-    if !query.summary {
+    if !query.wants_summary() {
         // 兼容旧调用：完整列表（含正文）。
         let items: Vec<serde_json::Value> = service::list_contents(&state.pool)
             .await?
@@ -31,13 +31,22 @@ pub(crate) async fn contents(
 
 #[derive(Deserialize)]
 pub(crate) struct ContentsQuery {
-    /// `1` 表示只要摘要（不含正文与 head），并配合 limit/offset 分页。
+    /// 只有摘要（不含正文与 head），并配合 limit/offset 分页。
+    ///
+    /// 用字符串而非 bool：`?summary=1` 是最常见的写法，而 serde 的 bool
+    /// 只认 `true`/`false`，直接写 bool 会让 `summary=1` 整个请求 400。
     #[serde(default)]
-    summary: bool,
+    summary: Option<String>,
     #[serde(default)]
     limit: Option<i64>,
     #[serde(default)]
     offset: Option<i64>,
+}
+
+impl ContentsQuery {
+    fn wants_summary(&self) -> bool {
+        matches!(self.summary.as_deref(), Some("1") | Some("true") | Some("yes"))
+    }
 }
 
 /// 单条内容全文：列表只给摘要，编辑时按需取正文。
