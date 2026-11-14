@@ -963,13 +963,10 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
             std::fs::create_dir_all(parent)?;
             make_parent_dirs_public(out, parent)?;
         }
-        // 图片资产有两个来源：Typst 渲染阶段已在 DOM 层拆出的（page.assets），
-        // 以及正文里手写的 data URI（markdown / html 内容，这里兜底提取）。
-        let (html, inline_assets) = crate::render::extract_inline_assets(&page.html);
-        std::fs::write(&target, &html)?;
+        std::fs::write(&target, &page.html)?;
         make_public(&target, false)?;
         let dir = target.parent().unwrap_or(out);
-        for (name, data) in page.assets.iter().chain(inline_assets.iter()) {
+        for (name, data) in page.assets.iter() {
             let asset_path = dir.join(name);
             // 文件名带内容哈希，已存在就说明是同一张图，直接跳过。
             if !asset_path.exists() {
@@ -1169,12 +1166,10 @@ pub async fn run_one(
         std::fs::create_dir_all(parent)?;
         make_parent_dirs_public(out, parent)?;
     }
-    // 与整站构建一致：内嵌 data URI 的图片落成同目录独立文件。
-    let (html, inline_assets) = crate::render::extract_inline_assets(&html);
     std::fs::write(&target, &html)?;
     make_public(&target, false)?;
     let asset_dir = target.parent().unwrap_or(out);
-    for (name, data) in rendered.assets.iter().chain(inline_assets.iter()) {
+    for (name, data) in rendered.assets.iter() {
         let asset_path = asset_dir.join(name);
         if !asset_path.exists() {
             std::fs::write(&asset_path, data)?;
