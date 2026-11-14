@@ -295,6 +295,68 @@ async fn prune(state: &WorkflowState) -> Result<()> {
     )
     .execute(&state.pool)
     .await?;
+
+    // 库里状态清理完，磁盘上的快照与日志也要按保留期删除：
+    // 之前只改状态不删文件，跑得久了会一直涨。
+    if let Err(error) = prune_files(state).await {
+        warn!("工作流文件清理失败：{error:#}");
+    }
+    Ok(())
+}
+
+/// 删除超过保留期的快照缓存与日志文件。
+///
+/// 目录遍历放在阻塞线程里；整个清理每小时最多跑一次——prune 本身
+/// 每 30 秒一轮，没必要每次都扫盘。
+async fn prune_files(state: &WorkflowState) -> Result<()> {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    static LAST: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+    let last = LAST.get_or_init(|| Mutex::new(None));
+    {
+        let mut guard = last.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = *guard {
+            if at.elapsed() < Duration::from_secs(3600) {
+                return Ok(());
+            }
+        }
+        *guard = Some(Instant::now());
+    }
+
+    let targets = [
+        (
+            state.cfg.snapshot_cache.clone(),
+            Duration::from_secs(state.cfg.snapshot_retention_secs),
+        ),
+        (
+            state.cfg.log_root.clone(),
+            Duration::from_secs(state.cfg.log_retention_secs),
+        ),
+    ];
+    tokio::task::spawn_blocking(move || {
+        for (dir, ttl) in targets {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(meta) = entry.metadata() else { continue };
+                if !meta.is_file() {
+                    continue;
+                }
+                let stale = meta
+                    .modified()
+                    .ok()
+                    .and_then(|at| at.elapsed().ok())
+                    .map(|age| age > ttl)
+                    .unwrap_or(false);
+                if stale {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    })
+    .await?;
     Ok(())
 }
 

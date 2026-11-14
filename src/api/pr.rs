@@ -27,11 +27,12 @@ pub(crate) async fn pr_list(
     State(state): State<AppState>,
     session: Session,
     Path(id): Path<Uuid>,
+    Query(page): Query<PageQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     current_user(&state, &session).await?;
     require_project(&state, id).await?;
     Ok(Json(json!({
-        "items": crate::collab::list_prs(&state.pool, id).await?
+        "items": crate::collab::list_prs(&state.pool, id, page.limit(), page.offset()).await?
     })))
 }
 
@@ -113,11 +114,13 @@ pub(crate) async fn discussion_list(
     State(state): State<AppState>,
     session: Session,
     Path(id): Path<Uuid>,
+    Query(page): Query<PageQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     current_user(&state, &session).await?;
     require_project(&state, id).await?;
     Ok(Json(json!({
-        "items": crate::collab::list_discussions(&state.pool, id).await?
+        "items": crate::collab::list_discussions(&state.pool, id, page.limit(), page.offset())
+            .await?
     })))
 }
 

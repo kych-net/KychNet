@@ -29,6 +29,25 @@ pub(crate) async fn contents(
     Ok(Json(json!({ "items": items, "total": total })))
 }
 
+/// 通用列表分页参数：默认 100 条，上限 500。
+#[derive(Deserialize)]
+pub(crate) struct PageQuery {
+    #[serde(default)]
+    limit: Option<i64>,
+    #[serde(default)]
+    offset: Option<i64>,
+}
+
+impl PageQuery {
+    pub(crate) fn limit(&self) -> i64 {
+        self.limit.unwrap_or(100)
+    }
+
+    pub(crate) fn offset(&self) -> i64 {
+        self.offset.unwrap_or(0)
+    }
+}
+
 #[derive(Deserialize)]
 pub(crate) struct ContentsQuery {
     /// 只有摘要（不含正文与 head），并配合 limit/offset 分页。
@@ -242,6 +261,7 @@ pub(crate) async fn content_revisions(
     State(state): State<AppState>,
     session: Session,
     Path(id): Path<Uuid>,
+    Query(page): Query<PageQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     current_user(&state, &session).await?;
     let rev_seq: i32 = sqlx::query_scalar("SELECT rev_seq FROM contents WHERE id = $1")
@@ -249,8 +269,9 @@ pub(crate) async fn content_revisions(
         .fetch_optional(&state.pool)
         .await?
         .ok_or_else(|| ApiError::with_status(StatusCode::NOT_FOUND, "内容不存在"))?;
-    let items: Vec<serde_json::Value> = crate::history::list_revisions(&state.pool, id)
-        .await?
+    let items: Vec<serde_json::Value> =
+        crate::history::list_revisions(&state.pool, id, page.limit(), page.offset())
+            .await?
         .into_iter()
         .map(|revision| {
             let mut value = json!(revision);

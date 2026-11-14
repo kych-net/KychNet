@@ -403,7 +403,7 @@ async fn collect_pack(
 /// 只缓存「无 have / 无 shallow / 无 filter 的全量 clone」（见
 /// `pack_cache::key_for`）；ref 一变就由 `store::set_ref` / `delete_ref` 失效。
 async fn fetch_pack(
-    conn: &mut PgConnection,
+    pool: &PgPool,
     project: &Project,
     request: &proto::UploadRequest,
     exclude: &HashSet<Oid>,
@@ -422,9 +422,12 @@ async fn fetch_pack(
         Some(lock) => Some(lock.clone().lock_owned().await),
         None => None,
     };
+    // 等锁期间**不持有数据库连接**：连接池只有 10 个，多个客户端同时
+    // clone 同一仓库时，排在后面的请求不该把连接耗尽、让普通 API 饿死。
+    let mut conn = pool.acquire().await?;
     // 拿到锁之后的所有路径（缓存复查命中、磁盘直发、现场组包）都要
     // 走同一个收尾逻辑，否则锁表条目会随 wants 组合无限堆积。
-    let result = fetch_pack_locked(conn, project, request, exclude, shallow, &key).await;
+    let result = fetch_pack_locked(&mut conn, project, request, exclude, shallow, &key).await;
     drop(inflight_guard);
     if let (Some(key), Some(lock)) = (&key, &inflight_lock) {
         pack_cache::release_inflight(key, lock);
@@ -724,8 +727,10 @@ pub(crate) async fn upload_pack_request(
         return Ok(PackResponse { head: out, pack: Arc::new(Bytes::new()), sideband: false });
     }
 
-    // `done` 轮:ACK/NAK 后紧跟 packfile。
-    let pack = fetch_pack(&mut conn, project, request, &exclude, &shallow).await?;
+    // `done` 轮:ACK/NAK 后紧跟 packfile。先归还连接：fetch_pack 内部
+    // 要等 singleflight 锁，持有连接等待会让连接池被等待者占满。
+    drop(conn);
+    let pack = fetch_pack(pool, project, request, &exclude, &shallow).await?;
     match common.last() {
         Some(oid) => out.extend(proto::pkt_str(&format!("ACK {}\n", oid.to_hex()))),
         None => out.extend(proto::pkt_str("NAK\n")),
@@ -799,11 +804,7 @@ async fn ls_refs(conn: &mut PgConnection, project: &Project, args: &[String]) ->
 }
 
 /// v2 `fetch`。
-async fn v2_fetch(
-    conn: &mut PgConnection,
-    project: &Project,
-    args: &[String],
-) -> Result<PackResponse> {
+async fn v2_fetch(pool: &PgPool, project: &Project, args: &[String]) -> Result<PackResponse> {
     let mut request = proto::UploadRequest::default();
     for arg in args {
         if let Some(rest) = arg.strip_prefix("want ") {
@@ -837,14 +838,17 @@ async fn v2_fetch(
         return Ok(PackResponse { head: out, pack: Arc::new(Bytes::new()), sideband: true });
     }
 
+    let mut conn = pool.acquire().await?;
     let (common, exclude) =
-        match have_reachable(conn, project.id, &request.haves, &request.shallow).await? {
+        match have_reachable(&mut conn, project.id, &request.haves, &request.shallow).await? {
             Some(value) => value,
             None => (vec![Oid::zero()], HashSet::new()),
         };
     let common_known = common.iter().any(|oid| !oid.is_zero());
     let (boundaries, unshallow, shallow) =
-        compute_shallow(conn, project.id, &request.wants, &request).await?;
+        compute_shallow(&mut conn, project.id, &request.wants, &request).await?;
+    // 协商阶段结束，连接先还回去：组包可能要等 singleflight 锁。
+    drop(conn);
 
     // 还没 done 又没有公共提交时只回复 NAK，让客户端继续协商。
     if !request.done && !common_known {
@@ -854,7 +858,7 @@ async fn v2_fetch(
         return Ok(PackResponse { head: out, pack: Arc::new(Bytes::new()), sideband: true });
     }
 
-    let pack = fetch_pack(conn, project, &request, &exclude, &shallow).await?;
+    let pack = fetch_pack(pool, project, &request, &exclude, &shallow).await?;
 
     // packfile 段：ready 与 done 两条路径共用（v2 规范要求 ready 之后
     // 必须紧跟 delim 并在同一响应里带上 shallow-info / packfile 段，
@@ -913,7 +917,10 @@ pub async fn upload_pack_v2(
             pack: Arc::new(Bytes::new()),
             sideband: false,
         }),
-        "fetch" => v2_fetch(&mut conn, project, &request.args).await,
+        "fetch" => {
+            drop(conn);
+            v2_fetch(pool, project, &request.args).await
+        }
         other => bail!("不支持的 protocol v2 命令: {other}"),
     }
 }

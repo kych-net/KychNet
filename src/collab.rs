@@ -602,11 +602,18 @@ async fn list_pr_comments(conn: &mut PgConnection, pr_id: Uuid) -> Result<Vec<Pr
     .await?)
 }
 
-pub async fn list_prs(pool: &PgPool, project_id: Uuid) -> Result<Vec<PullRequest>> {
+pub async fn list_prs(
+    pool: &PgPool,
+    project_id: Uuid,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<PullRequest>> {
     Ok(sqlx::query_as::<_, PullRequest>(&format!(
-        "{PR_SELECT} WHERE pr.project_id = $1 ORDER BY pr.number DESC"
+        "{PR_SELECT} WHERE pr.project_id = $1 ORDER BY pr.number DESC LIMIT $2 OFFSET $3"
     ))
     .bind(project_id)
+    .bind(limit.clamp(1, 500))
+    .bind(offset.max(0))
     .fetch_all(pool)
     .await?)
 }
@@ -1019,11 +1026,19 @@ async fn list_discussion_comments(
     .await?)
 }
 
-pub async fn list_discussions(pool: &PgPool, project_id: Uuid) -> Result<Vec<Discussion>> {
+pub async fn list_discussions(
+    pool: &PgPool,
+    project_id: Uuid,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<Discussion>> {
     Ok(sqlx::query_as::<_, Discussion>(&format!(
-        "{DISCUSSION_SELECT} WHERE d.project_id = $1 ORDER BY d.created_at DESC"
+        "{DISCUSSION_SELECT} WHERE d.project_id = $1 ORDER BY d.created_at DESC \
+         LIMIT $2 OFFSET $3"
     ))
     .bind(project_id)
+    .bind(limit.clamp(1, 500))
+    .bind(offset.max(0))
     .fetch_all(pool)
     .await?)
 }
