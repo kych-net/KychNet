@@ -3629,6 +3629,18 @@ code,
   white-space: nowrap;
 }
 
+.res-usage {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.res-bar-label {
+  font-size: 0.78rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
 .res-bar {
   height: 8px;
   border-radius: 4px;

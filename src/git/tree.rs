@@ -91,6 +91,18 @@ pub async fn list_dir(
     }
 
     let tree = read_tree(conn, project_id, current).await?;
+    // 先把所有 blob 的 size 批量查出来（只读 size 列，不解压正文），
+    // 只有查不到的（已 offload 到磁盘的对象）才回退到完整读取。
+    let blob_oids: Vec<Oid> = tree
+        .entries
+        .values()
+        .filter_map(|entry| match entry {
+            TreeEntry::Blob(oid) => Some(*oid),
+            _ => None,
+        })
+        .collect();
+    let sizes = super::store::get_object_sizes(conn, project_id, &blob_oids).await?;
+
     let mut items = Vec::with_capacity(tree.entries.len());
     for (name, entry) in tree.entries {
         let path = if dir.is_empty() {
@@ -107,10 +119,14 @@ pub async fn list_dir(
                 oid: oid.to_hex(),
             }),
             TreeEntry::Blob(oid) => {
-                let size = get_object(conn, project_id, oid)
-                    .await?
-                    .map(|object| object.data.len())
-                    .unwrap_or(0);
+                let size = match sizes.get(&oid) {
+                    Some(size) => *size,
+                    // 磁盘后端里的对象不在 PG：这里只能完整读一次。
+                    None => get_object(conn, project_id, oid)
+                        .await?
+                        .map(|object| object.data.len())
+                        .unwrap_or(0),
+                };
                 items.push(DirItem {
                     name,
                     path,

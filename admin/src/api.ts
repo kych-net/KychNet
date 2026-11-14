@@ -310,21 +310,33 @@ export function avatarUrl(id: string, version?: number): string {
 }
 
 /** 公开的 Git 仓库地址；项目名按 URL 段编码。 */
+/// 同域部署时 API_BASE 为空，克隆地址必须回到当前页面的 origin，
+/// 否则界面上只会显示 `/git/xxx.git` 这样的路径，无法直接使用。
+function siteOrigin(): string {
+  if (API_BASE) return API_BASE;
+  if (typeof window !== "undefined") return window.location.origin;
+  return "";
+}
+
 export function gitUrl(slug: string): string {
   // Git 用 URL 最后一段作为默认克隆目录名；这里保留原始 UTF-8 项目名，
   // 否则中文项目会被克隆成 %E5%... 目录。服务端本来就会解码路径。
-  return `${API_BASE}/git/${slug}.git`;
+  return `${siteOrigin()}/git/${slug}.git`;
 }
 
-/** Git over SSH 地址；端口固定 2222，host 跟随 API 基址。 */
+/** Git over SSH 地址；端口固定 2222，host 跟随 API 基址（同域则用当前域名）。 */
 export function sshGitUrl(slug: string): string {
-  let host = "kych.net";
-  if (API_BASE) {
+  const origin = siteOrigin();
+  let host = "";
+  if (origin) {
     try {
-      host = new URL(API_BASE).host;
+      host = new URL(origin).hostname;
     } catch {
-      // 配置异常时保留默认站名，至少地址可读。
+      // 配置异常时下面回退到当前域名。
     }
+  }
+  if (!host && typeof window !== "undefined") {
+    host = window.location.hostname;
   }
   return `ssh://git@${host}:2222/${slug}.git`;
 }

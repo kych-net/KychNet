@@ -496,9 +496,64 @@ pub(crate) async fn have_reachable(
                 fetch.push(oid);
             }
         }
-        let rows = store::get_objects(conn, project_id, &fetch).await?;
-        let mut found: HashMap<Oid, Object> = rows.into_iter().collect();
+        // 先只查类型：blob 只进 exclude 集合，正文用不上，
+        // 不必为它读整块数据再 zlib 解压。历史大的仓库这里省得最多。
+        let kinds = store::get_object_kinds(conn, project_id, &fetch).await?;
+        let needed: Vec<Oid> = fetch
+            .iter()
+            .filter(|oid| {
+                matches!(
+                    kinds.get(oid),
+                    Some(ObjectKind::Commit | ObjectKind::Tree | ObjectKind::Tag)
+                )
+            })
+            .copied()
+            .collect();
+        let mut found: HashMap<Oid, Object> = if needed.is_empty() {
+            HashMap::new()
+        } else {
+            store::get_objects(conn, project_id, &needed)
+                .await?
+                .into_iter()
+                .collect()
+        };
         for oid in fetch {
+            // 类型查不到（已 offload 到磁盘）时回退到完整读取。
+            let Some(kind) = kinds.get(&oid).copied() else {
+                if let Some(object) = store::get_object(conn, project_id, oid).await? {
+                    let kind = object.kind;
+                    match kind {
+                        ObjectKind::Commit => {
+                            stack.push(commit_tree(&object.data)?);
+                            if !client_shallow.contains(&oid) {
+                                stack.extend(super::object::commit_parents(&object.data)?);
+                            }
+                        }
+                        ObjectKind::Tree => {
+                            let tree = Tree::parse(&object.data)?;
+                            for entry in tree.entries.values() {
+                                match entry {
+                                    TreeEntry::Blob(oid) | TreeEntry::Dir(oid) => stack.push(*oid),
+                                    TreeEntry::Gitlink(_) => {}
+                                }
+                            }
+                        }
+                        ObjectKind::Tag => {
+                            if let Some(target) = tag_target(&object.data)? {
+                                stack.push(target);
+                            }
+                        }
+                        ObjectKind::Blob => {}
+                    }
+                    exclude.insert(oid);
+                }
+                continue;
+            };
+            if kind == ObjectKind::Blob {
+                // 正文不需要：直接排除，省掉一次读库 + 解压。
+                exclude.insert(oid);
+                continue;
+            }
             let Some(object) = found.remove(&oid) else {
                 continue;
             };

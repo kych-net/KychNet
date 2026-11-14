@@ -4,6 +4,7 @@ use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use sqlx::{PgConnection, PgPool, Row};
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -218,6 +219,69 @@ impl StoredObject {
 }
 
 /// 批量取对象原始行，不做解压。
+/// 批量取对象**大小**：只读 `size` 列，不取 `data`、不解压。
+///
+/// 列目录只需要文件大小，逐个 `get_object` 会把每个 blob 完整读出来再解压，
+/// 大目录下这是纯粹的浪费（数据库带宽 + zlib 解压 CPU）。
+/// 命中不了的对象（已 offload 到磁盘）由调用方回退到完整读取。
+/// 批量取对象**类型**：只读 `kind` 列，不取正文。
+///
+/// 增量 fetch 的可达性遍历里，blob 只需要记进 exclude 集合，
+/// 正文完全用不上；先查类型就能把这类对象从「读 + 解压」里摘出去。
+pub async fn get_object_kinds(
+    conn: &mut PgConnection,
+    project_id: Uuid,
+    oids: &[Oid],
+) -> Result<HashMap<Oid, ObjectKind>> {
+    if oids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let keys: Vec<Vec<u8>> = oids.iter().map(|oid| oid.as_bytes().to_vec()).collect();
+    let rows = sqlx::query(
+        "SELECT oid, kind FROM git_objects WHERE project_id = $1 AND oid = ANY($2::bytea[])",
+    )
+    .bind(project_id)
+    .bind(keys)
+    .fetch_all(conn)
+    .await?;
+    let mut kinds = HashMap::with_capacity(rows.len());
+    for row in rows {
+        let raw: Vec<u8> = row.try_get("oid")?;
+        let oid = Oid::from_slice(&raw)?;
+        let kind: i16 = row.try_get("kind")?;
+        if let Some(kind) = ObjectKind::from_i16(kind) {
+            kinds.insert(oid, kind);
+        }
+    }
+    Ok(kinds)
+}
+
+pub async fn get_object_sizes(
+    conn: &mut PgConnection,
+    project_id: Uuid,
+    oids: &[Oid],
+) -> Result<HashMap<Oid, usize>> {
+    if oids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let keys: Vec<Vec<u8>> = oids.iter().map(|oid| oid.as_bytes().to_vec()).collect();
+    let rows = sqlx::query(
+        "SELECT oid, size FROM git_objects WHERE project_id = $1 AND oid = ANY($2::bytea[])",
+    )
+    .bind(project_id)
+    .bind(keys)
+    .fetch_all(conn)
+    .await?;
+    let mut sizes = HashMap::with_capacity(rows.len());
+    for row in rows {
+        let raw: Vec<u8> = row.try_get("oid")?;
+        let oid = Oid::from_slice(&raw)?;
+        let size: i64 = row.try_get("size")?;
+        sizes.insert(oid, size.max(0) as usize);
+    }
+    Ok(sizes)
+}
+
 pub async fn get_objects_raw(
     conn: &mut PgConnection,
     project_id: Uuid,

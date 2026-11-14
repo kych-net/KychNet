@@ -24,12 +24,16 @@ function fmtDuration(secs: number): string {
 /** 简单的用量条：超过 85% 变警示色。 */
 function UsageBar({ used, total }: { used: number; total: number }) {
   const percent = total > 0 ? Math.min(100, Math.round((used / total) * 100)) : 0;
+  // 数字必须放在条外面：.res-bar 只有 8px 高且 overflow:hidden，
+  // 文字塞进去会被裁掉，页面上只剩一条空条。
   return (
-    <div className="res-bar">
-      <div
-        className={percent >= 85 ? "res-bar-fill warn" : "res-bar-fill"}
-        style={{ width: `${percent}%` }}
-      />
+    <div className="res-usage">
+      <div className="res-bar">
+        <div
+          className={percent >= 85 ? "res-bar-fill warn" : "res-bar-fill"}
+          style={{ width: `${percent}%` }}
+        />
+      </div>
       <span className="res-bar-label">
         {percent}% · {fmtBytes(used)} / {fmtBytes(total)}
       </span>
