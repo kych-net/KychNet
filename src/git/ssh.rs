@@ -827,10 +827,17 @@ where
             return Ok(());
         }
         let response = crate::git::http::upload_pack_v2(pool, project, &chunk).await?;
+        // 控制行都在 head 里；pack 单独写出，避免整包复制进响应缓冲。
         let finished = response
+            .head
             .windows(9)
             .any(|part| part == &b"packfile\n"[..]);
-        stream.write_all(&response).await?;
+        stream.write_all(&response.head).await?;
+        if !response.pack.is_empty() {
+            let mut encoded = sideband_encode(&response.pack);
+            stream.write_all(&encoded).await?;
+            encoded.clear();
+        }
         stream.flush().await?;
         // fetch 的 packfile 段发完就代表这个 exec 会话结束。客户端读完 pack
         // 未必会关闭写端，继续等 read() 会让 exit-status 一直拖到 russh 的
@@ -840,6 +847,22 @@ where
             return Ok(());
         }
     }
+}
+
+/// 把 pack 按 sideband 编码成可写出的字节。
+///
+/// SSH 是流式通道，可以边编码边写；但这里复用 HTTP 侧的 pkt 头格式，
+/// 分块拼接即可（每块 64 KiB，峰值只多一块的副本，而不是整包）。
+fn sideband_encode(pack: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(pack.len() + pack.len() / 65_515 * 5 + 16);
+    for chunk in pack.chunks(65_515) {
+        let mut payload = Vec::with_capacity(chunk.len() + 1);
+        payload.push(1);
+        payload.extend_from_slice(chunk);
+        out.extend(crate::git::proto::pkt(&payload));
+    }
+    out.extend(crate::git::proto::flush());
+    out
 }
 
 /// 判定 pack 是否收齐时，允许的单次空闲时长与连续空闲轮数。

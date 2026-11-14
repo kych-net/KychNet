@@ -414,10 +414,33 @@ async fn fetch_pack(
         return Ok(hit);
     }
     // 同一 key 的并发 clone 只让一个去组包，其余等它填好缓存后直接复用。
-    let _inflight = match &key {
-        Some(key) => Some(pack_cache::inflight_lock(key).lock_owned().await),
+    let inflight_lock = match &key {
+        Some(key) => Some(pack_cache::inflight_lock(key)),
         None => None,
     };
+    let inflight_guard = match &inflight_lock {
+        Some(lock) => Some(lock.clone().lock_owned().await),
+        None => None,
+    };
+    // 拿到锁之后的所有路径（缓存复查命中、磁盘直发、现场组包）都要
+    // 走同一个收尾逻辑，否则锁表条目会随 wants 组合无限堆积。
+    let result = fetch_pack_locked(conn, project, request, exclude, shallow, &key).await;
+    drop(inflight_guard);
+    if let (Some(key), Some(lock)) = (&key, &inflight_lock) {
+        pack_cache::release_inflight(key, lock);
+    }
+    result
+}
+
+/// `fetch_pack` 在持锁期间的实际工作：缓存复查 → 磁盘直发 → 现场组包。
+async fn fetch_pack_locked(
+    conn: &mut PgConnection,
+    project: &Project,
+    request: &proto::UploadRequest,
+    exclude: &HashSet<Oid>,
+    shallow: &HashSet<Oid>,
+    key: &Option<pack_cache::CacheKey>,
+) -> Result<Arc<Bytes>> {
     if let Some(hit) = key.as_ref().and_then(pack_cache::get) {
         // 等锁期间别人已经组好包了。
         return Ok(hit);
@@ -451,7 +474,7 @@ async fn fetch_pack(
     )
     .await?;
     let pack = Arc::new(Bytes::from(pack));
-    if let Some(key) = key {
+    if let Some(key) = key.clone() {
         pack_cache::insert(key, pack.clone());
     }
     Ok(pack)
@@ -633,6 +656,9 @@ fn sideband_pack(data: &[u8]) -> Vec<u8> {
 pub struct PackResponse {
     pub head: Vec<u8>,
     pub pack: Arc<Bytes>,
+    /// v2 的 packfile 段走 sideband 编码（每块带 pkt 头 + 通道号），
+    /// v0 直接裸发 pack。
+    pub sideband: bool,
 }
 
 pub async fn upload_pack(pool: &PgPool, project: &Project, body: &[u8]) -> Result<PackResponse> {
@@ -653,7 +679,7 @@ pub(crate) async fn upload_pack_request(
     let mut out = Vec::new();
     if request.wants.is_empty() {
         out.extend(proto::pkt_str("NAK\n"));
-        return Ok(PackResponse { head: out, pack: Arc::new(Bytes::new()) });
+        return Ok(PackResponse { head: out, pack: Arc::new(Bytes::new()), sideband: false });
     }
     let mut conn = pool.acquire().await?;
     let (common, exclude) =
@@ -683,11 +709,11 @@ pub(crate) async fn upload_pack_request(
     // "bad line length character: PACK"。
     if !request.done {
         if request.haves.is_empty() {
-            return Ok(PackResponse { head: out, pack: Arc::new(Bytes::new()) });
+            return Ok(PackResponse { head: out, pack: Arc::new(Bytes::new()), sideband: false });
         }
         if common.is_empty() {
             out.extend(proto::pkt_str("NAK\n"));
-            return Ok(PackResponse { head: out, pack: Arc::new(Bytes::new()) });
+            return Ok(PackResponse { head: out, pack: Arc::new(Bytes::new()), sideband: false });
         }
         for oid in &common {
             out.extend(proto::pkt_str(&format!("ACK {} common\n", oid.to_hex())));
@@ -695,7 +721,7 @@ pub(crate) async fn upload_pack_request(
         let last = common.last().expect("common 非空");
         out.extend(proto::pkt_str(&format!("ACK {} ready\n", last.to_hex())));
         out.extend(proto::pkt_str("NAK\n"));
-        return Ok(PackResponse { head: out, pack: Arc::new(Bytes::new()) });
+        return Ok(PackResponse { head: out, pack: Arc::new(Bytes::new()), sideband: false });
     }
 
     // `done` 轮:ACK/NAK 后紧跟 packfile。
@@ -704,7 +730,7 @@ pub(crate) async fn upload_pack_request(
         Some(oid) => out.extend(proto::pkt_str(&format!("ACK {}\n", oid.to_hex()))),
         None => out.extend(proto::pkt_str("NAK\n")),
     }
-    Ok(PackResponse { head: out, pack })
+    Ok(PackResponse { head: out, pack, sideband: false })
 }
 
 /// v2 `ls-refs`。
@@ -773,7 +799,11 @@ async fn ls_refs(conn: &mut PgConnection, project: &Project, args: &[String]) ->
 }
 
 /// v2 `fetch`。
-async fn v2_fetch(conn: &mut PgConnection, project: &Project, args: &[String]) -> Result<Vec<u8>> {
+async fn v2_fetch(
+    conn: &mut PgConnection,
+    project: &Project,
+    args: &[String],
+) -> Result<PackResponse> {
     let mut request = proto::UploadRequest::default();
     for arg in args {
         if let Some(rest) = arg.strip_prefix("want ") {
@@ -804,7 +834,7 @@ async fn v2_fetch(conn: &mut PgConnection, project: &Project, args: &[String]) -
         out.extend(proto::pkt_str("acknowledgments\n"));
         out.extend(proto::pkt_str("NAK\n"));
         out.extend(proto::flush());
-        return Ok(out);
+        return Ok(PackResponse { head: out, pack: Arc::new(Bytes::new()), sideband: true });
     }
 
     let (common, exclude) =
@@ -821,7 +851,7 @@ async fn v2_fetch(conn: &mut PgConnection, project: &Project, args: &[String]) -
         out.extend(proto::pkt_str("acknowledgments\n"));
         out.extend(proto::pkt_str("NAK\n"));
         out.extend(proto::flush());
-        return Ok(out);
+        return Ok(PackResponse { head: out, pack: Arc::new(Bytes::new()), sideband: true });
     }
 
     let pack = fetch_pack(conn, project, &request, &exclude, &shallow).await?;
@@ -841,7 +871,6 @@ async fn v2_fetch(conn: &mut PgConnection, project: &Project, args: &[String]) -
             out.extend(proto::delim());
         }
         out.extend(proto::pkt_str("packfile\n"));
-        out.extend(sideband_pack(pack.as_ref()));
     };
 
     if !request.done {
@@ -856,26 +885,34 @@ async fn v2_fetch(conn: &mut PgConnection, project: &Project, args: &[String]) -
                 out.extend(proto::pkt_str("ready\n"));
                 out.extend(proto::delim());
                 pack_sections(&mut out);
-                return Ok(out);
+                return Ok(PackResponse { head: out, pack, sideband: true });
             }
         } else {
             out.extend(proto::pkt_str("NAK\n"));
         }
         out.extend(proto::flush());
-        return Ok(out);
+        return Ok(PackResponse { head: out, pack: Arc::new(Bytes::new()), sideband: true });
     }
 
     // done 之后不再回 acknowledgments；客户端已经在等 packfile 段。
     pack_sections(&mut out);
-    Ok(out)
+    Ok(PackResponse { head: out, pack, sideband: true })
 }
 
 /// v2 请求入口：根据 `command=` 分发。
-pub async fn upload_pack_v2(pool: &PgPool, project: &Project, body: &[u8]) -> Result<Vec<u8>> {
+pub async fn upload_pack_v2(
+    pool: &PgPool,
+    project: &Project,
+    body: &[u8],
+) -> Result<PackResponse> {
     let request = proto::parse_v2_request(body)?;
     let mut conn = pool.acquire().await?;
     match request.command.as_str() {
-        "ls-refs" => ls_refs(&mut conn, project, &request.args).await,
+        "ls-refs" => Ok(PackResponse {
+            head: ls_refs(&mut conn, project, &request.args).await?,
+            pack: Arc::new(Bytes::new()),
+            sideband: false,
+        }),
         "fetch" => v2_fetch(&mut conn, project, &request.args).await,
         other => bail!("不支持的 protocol v2 命令: {other}"),
     }

@@ -512,6 +512,9 @@ pub async fn set_ref(
 /// ref 更新事务**提交后**必须再调用一次（提交前的调用只是兜底）。
 pub fn invalidate_project_caches(project_id: Uuid) -> Result<()> {
     super::pack_cache::invalidate_project(project_id);
+    // 同步清掉该项目的 singleflight 锁表：缓存已作废，旧 key 的锁
+    // 不会再有新的等待者，留着只会随 wants 组合无限增长。
+    super::pack_cache::forget_inflight(project_id);
     if let Some(disk) = disk_store() {
         disk.clear_full(project_id)?;
     }

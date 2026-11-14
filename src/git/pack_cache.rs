@@ -206,3 +206,22 @@ pub fn forget_inflight(project_id: Uuid) {
     let mut map = inflight().lock().unwrap_or_else(|e| e.into_inner());
     map.retain(|key, _| key.project_id != project_id);
 }
+
+/// 组包结束后回收该 key 的锁（若已无人等待）。
+///
+/// 锁表按 wants 组合建 key，同一 ref 下不同 wants 的 clone 会不断留下条目，
+/// 而且它不受 pack 缓存 64 MiB 上限约束，所以必须用完即删。
+/// 引用计数：锁表 1 + 调用方 `lock` 1 + 仍在等待的 guard 各 1，
+/// 因此 ≤ 3 就代表没有其他等待者。
+pub fn release_inflight(key: &CacheKey, lock: &Arc<tokio::sync::Mutex<()>>) {
+    let mut map = inflight().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(entry) = map.get(key) else {
+        return;
+    };
+    if !Arc::ptr_eq(entry, lock) {
+        return;
+    }
+    if Arc::strong_count(entry) <= 3 {
+        map.remove(key);
+    }
+}

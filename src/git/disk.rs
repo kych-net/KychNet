@@ -719,22 +719,27 @@ impl DiskStore {
     ///
     /// 结果按「pack 目录 mtime」缓存：新增/删除 pack 会改变目录 mtime，
     /// 缓存自然失效；内容不变的重复调用直接返回上一次的清单。
-    fn packs(&self, project_id: Uuid) -> Result<Vec<(PathBuf, Arc<PackFile>)>> {
+    fn snapshot(&self, project_id: Uuid) -> Result<(PackList, Arc<PackIndex>)> {
         let dir = self.pack_dir(project_id);
         let dir_mtime = fs::metadata(&dir)
             .and_then(|meta| meta.modified())
             .ok();
         if let Some(mtime) = dir_mtime {
             let cache = pack_list_cache().lock().unwrap_or_else(|e| e.into_inner());
-            if let Some((cached_mtime, cached, _)) = cache.get(&project_id) {
+            if let Some((cached_mtime, cached, index)) = cache.get(&project_id) {
                 if *cached_mtime == mtime {
-                    return Ok((**cached).clone());
+                    // 清单与索引必须来自同一次快照：分两次读缓存的话，
+                    // 中间若有 push/repack 刷新过缓存，就会配成
+                    //「旧清单 + 新索引」→ 偏移错乱或对象找不到。
+                    return Ok(((**cached).clone(), index.clone()));
                 }
             }
         }
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return Ok((Vec::new(), Arc::new(PackIndex::new())))
+            }
             Err(error) => return Err(error.into()),
         };
         let mut names = Vec::new();
@@ -776,35 +781,21 @@ impl DiskStore {
             };
             out.push((pack_path, Arc::new(PackFile { bytes, idx })));
         }
+        let index = Arc::new(build_pack_index(&out));
         if let Some(mtime) = dir_mtime {
-            let index = Arc::new(build_pack_index(&out));
             let mut cache = pack_list_cache().lock().unwrap_or_else(|e| e.into_inner());
-            cache.insert(project_id, (mtime, Arc::new(out.clone()), index));
+            cache.insert(project_id, (mtime, Arc::new(out.clone()), index.clone()));
         }
-        Ok(out)
+        Ok((out, index))
     }
 
-    /// 取「pack 清单 + 跨 pack OID 索引」，索引与清单共用同一个 mtime 缓存。
-    fn packs_indexed(&self, project_id: Uuid) -> Result<(PackList, Arc<PackIndex>)> {
-        let packs = self.packs(project_id)?;
-        let dir = self.pack_dir(project_id);
-        let dir_mtime = fs::metadata(&dir).and_then(|meta| meta.modified()).ok();
-        if let Some(mtime) = dir_mtime {
-            let cache = pack_list_cache().lock().unwrap_or_else(|e| e.into_inner());
-            if let Some((cached_mtime, _, index)) = cache.get(&project_id) {
-                if *cached_mtime == mtime {
-                    let index = index.clone();
-                    drop(cache);
-                    return Ok((packs, index));
-                }
-            }
-        }
-        let index = Arc::new(build_pack_index(&packs));
-        Ok((packs, index))
+    /// 只要清单、不要索引的调用方（如 repack 前枚举）用这个。
+    fn packs(&self, project_id: Uuid) -> Result<PackList> {
+        Ok(self.snapshot(project_id)?.0)
     }
 
     pub fn get(&self, project_id: Uuid, oid: &Oid) -> Result<Option<Object>> {
-        let (packs, index) = self.packs_indexed(project_id)?;
+        let (packs, index) = self.snapshot(project_id)?;
         let Some((pack_pos, offset)) = index.get(oid).copied() else {
             return Ok(None);
         };
@@ -820,7 +811,7 @@ impl DiskStore {
     }
 
     pub fn get_many(&self, project_id: Uuid, oids: &[Oid]) -> Result<Vec<(Oid, Object)>> {
-        let (packs, index) = self.packs_indexed(project_id)?;
+        let (packs, index) = self.snapshot(project_id)?;
         let mut out = Vec::with_capacity(oids.len());
         for oid in oids {
             let Some((pack_pos, offset)) = index.get(oid).copied() else {

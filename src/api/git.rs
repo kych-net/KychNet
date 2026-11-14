@@ -109,12 +109,27 @@ pub(crate) fn git_binary_split(
     content_type: &'static str,
     data: crate::git::http::PackResponse,
 ) -> Response {
-    let head = axum::body::Bytes::from(data.head);
-    let pack = data.pack.as_ref().clone();
-    let stream = futures_util::stream::iter([
-        Ok::<_, std::io::Error>(head),
-        Ok::<_, std::io::Error>(pack),
-    ]);
+    let mut parts: Vec<Result<axum::body::Bytes, std::io::Error>> =
+        vec![Ok(axum::body::Bytes::from(data.head))];
+    if !data.pack.is_empty() {
+        if data.sideband {
+            // v2 的 packfile 段每块都要带 pkt 头和通道号 1。
+            // 数据本身用 Bytes::slice 切，不复制整包。
+            const CHUNK: usize = 65_515;
+            let mut offset = 0usize;
+            while offset < data.pack.len() {
+                let len = CHUNK.min(data.pack.len() - offset);
+                parts.push(Ok(axum::body::Bytes::from(format!("{:04x}", len + 5))));
+                parts.push(Ok(axum::body::Bytes::from_static(&[1])));
+                parts.push(Ok(data.pack.slice(offset..offset + len)));
+                offset += len;
+            }
+            parts.push(Ok(axum::body::Bytes::from(crate::git::proto::flush())));
+        } else {
+            parts.push(Ok(data.pack.as_ref().clone()));
+        }
+    }
+    let stream = futures_util::stream::iter(parts);
     (
         [
             (header::CONTENT_TYPE, HeaderValue::from_static(content_type)),
@@ -655,7 +670,7 @@ pub(crate) async fn git_http_post(
         "git-upload-pack" => {
             if wants_v2(&headers) {
                 return match crate::git::http::upload_pack_v2(&state.pool, &project, &body).await {
-                    Ok(data) => git_binary("application/x-git-upload-pack-result", data),
+                    Ok(data) => git_binary_split("application/x-git-upload-pack-result", data),
                     Err(error)
                         if error
                             .downcast_ref::<crate::git::proto::MalformedRequest>()
