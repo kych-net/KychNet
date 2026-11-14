@@ -59,6 +59,24 @@ struct BuiltPage {
     assets: Vec<(String, Vec<u8>)>,
 }
 
+/// 从内容输出路径推导项目在站点里的 URL 基址。
+///
+/// 项目页的输出路径形如 `项目/地狱之下/地理/主行星.html`，对应的图片
+/// 资源前缀是 `/项目/地狱之下`；非项目页返回空串。
+fn project_asset_base(slug: &str) -> String {
+    let mut parts = slug.split('/');
+    let Some(namespace) = parts.next() else {
+        return String::new();
+    };
+    if namespace != crate::project::PROJECT_NAMESPACE {
+        return String::new();
+    }
+    let Some(name) = parts.next() else {
+        return String::new();
+    };
+    format!("/{namespace}/{name}")
+}
+
 /// 目录树节点。目录和文件分开存：目录名没有扩展名，文件名保留源格式扩展名。
 #[derive(Default)]
 struct TreeNode {
@@ -760,6 +778,7 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
                             &ctx,
                             files,
                             main_path,
+                            &project_asset_base(&content.slug),
                         ),
                         None => render::render_doc(content.format(), &body, &root, &ctx),
                     };
