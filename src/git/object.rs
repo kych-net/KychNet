@@ -291,6 +291,28 @@ pub fn encode_commit(
     out.into_bytes()
 }
 
+/// 生成 annotated tag 对象内容。`identity` 形如 `名字 <noreply@kych.net>`。
+///
+/// 格式与 git 的 `git tag -a` 一致：object / type / tag / tagger 四行头部，
+/// 空行后是标签说明。站内创建的附注标签只指向 commit，因此 type 固定为 commit。
+pub fn encode_tag(
+    target: Oid,
+    tag: &str,
+    identity: &str,
+    message: &str,
+    timestamp: i64,
+) -> Vec<u8> {
+    let mut out = String::new();
+    out.push_str(&format!("object {}\n", target.to_hex()));
+    out.push_str("type commit\n");
+    out.push_str(&format!("tag {}\n", tag));
+    out.push_str(&format!("tagger {identity} {timestamp} +0000\n"));
+    out.push('\n');
+    out.push_str(message.trim_end());
+    out.push('\n');
+    out.into_bytes()
+}
+
 /// 从 commit 对象里取出根 tree。
 pub fn commit_tree(data: &[u8]) -> Result<Oid> {
     let text = std::str::from_utf8(data).map_err(|_| anyhow::anyhow!("commit 对象不是 UTF-8"))?;
