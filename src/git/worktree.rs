@@ -19,27 +19,20 @@ use super::object::Oid;
 use super::object::TreeEntry;
 use super::store;
 use super::tree::{self, DirItem};
-use crate::project::{valid_branch, valid_file_path};
+use crate::project::valid_file_path;
 
 /// 全量工作树导出的字节上限，避免超大仓库把主服务内存拖垮。
 pub const MAX_WORKTREE_BYTES: u64 = 209_715_200;
 
-/// `ref` 支持分支名，也支持 40 位 commit OID。
+/// `ref` 支持分支名、标签名（含附注标签）和 40 位 commit OID。
 ///
 /// 执行器从 claim 里拿到的是 `commit_oid`，而不是分支名；分支名可能会在
 /// run 排队期间被新的 push 顶掉，按 OID 读才能保证代码与定义是同一时刻的。
-/// 返回 `None` 表示分支不存在。
+/// 与管理端共用 `project::resolve_read_ref` 一套解析逻辑，返回 `None` 表示
+/// 引用不存在。
 pub async fn resolve_ref(pool: &PgPool, project_id: Uuid, ref_name: &str) -> Result<Option<Oid>> {
-    if ref_name.len() == 40 && ref_name.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Oid::from_hex(ref_name)
-            .map(Some)
-            .context("非法的 commit OID");
-    }
-    if !valid_branch(ref_name) {
-        bail!("非法 ref：{ref_name:?}");
-    }
     let mut conn = pool.acquire().await?;
-    store::resolve_branch(&mut conn, project_id, ref_name).await
+    crate::project::resolve_read_ref(&mut conn, project_id, ref_name).await
 }
 
 /// 单层目录列表，与管理端 `project_tree` 的 `items` 同构。

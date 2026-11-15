@@ -130,6 +130,16 @@ pub enum ContentFormat {
 }
 
 impl ContentFormat {
+    /// 这种格式是否会产出一个带 <head> 的 HTML 页面。
+    ///
+    /// css / svg 作为静态资源原样输出，没有页面结构，因此不支持自定义 head。
+    pub fn renders_html(self) -> bool {
+        matches!(
+            self,
+            Self::Markdown | Self::Html | Self::Typst | Self::Wikidot
+        )
+    }
+
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "markdown" => Some(Self::Markdown),
@@ -187,11 +197,31 @@ pub struct Content {
     pub format: String,
     pub body: String,
     pub published: bool,
+    /// 页面自定义 <head> 内容（原样注入，仅管理员可写；不参与版本历史）。
+    #[serde(default)]
+    pub head: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     /// 当前版本指针：指向 `content_revisions` 里正在展示的版本。
     /// 回滚直接移动这个指针，不产生新版本；0 表示尚未落任何版本。
     pub rev_seq: i32,
+}
+
+/// 内容列表用的摘要：不含正文与自定义 head。
+///
+/// 列表页只需要路径/格式/时间，正文按需单条获取；这样一次列表请求
+/// 不会把整站正文都读出来（大站点这里是数十 MB 的数据库读取与 JSON）。
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct ContentSummary {
+    pub id: Uuid,
+    pub slug: String,
+    pub format: String,
+    pub published: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub rev_seq: i32,
+    /// 正文字节长度，供列表显示与排序参考。
+    pub size: i64,
 }
 
 /// 单篇内容的单线历史版本。`kind = full` 时 `data` 是整段正文，

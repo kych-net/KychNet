@@ -180,7 +180,204 @@ pub(crate) async fn project_detail(
         api_reject!(StatusCode::NOT_FOUND, "项目不存在");
     };
     let branches = crate::project::list_branches(&state.pool, id).await?;
-    Ok(Json(json!({ "item": project, "branches": branches })))
+    let tags = crate::project::list_tags(&state.pool, id).await?;
+    Ok(Json(json!({ "item": project, "branches": branches, "tags": tags })))
+}
+
+/// 一次性拿到分支 / 标签 / 默认分支 / 当前 ref 顶点，供编辑器初始化工作区。
+pub(crate) async fn project_refs(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+    Query(query): Query<CommitListQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current_user(&state, &session).await?;
+    let project = require_project(&state, id).await?;
+    let branches = crate::project::list_branches(&state.pool, id).await?;
+    let tags = crate::project::list_tags(&state.pool, id).await?;
+    let reference = query.reference.as_deref().unwrap_or(&project.default_branch);
+    let mut conn = state.pool.acquire().await?;
+    let head = crate::project::resolve_read_ref(&mut conn, id, reference).await?;
+    Ok(Json(json!({
+        "branches": branches,
+        "tags": tags,
+        "default_branch": project.default_branch,
+        "ref": reference,
+        "head": head.map(|oid| oid.to_hex()),
+    })))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct TagCreateBody {
+    name: String,
+    /// 标签指向的 ref（分支 / 标签 / commit OID），缺省为默认分支。
+    #[serde(rename = "ref")]
+    reference: Option<String>,
+    /// 给了说明就创建附注标签，否则是轻量标签。
+    #[serde(default)]
+    message: Option<String>,
+}
+
+pub(crate) async fn project_tag_create(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+    Json(body): Json<TagCreateBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = current_user(&state, &session).await?;
+    require_project(&state, id).await?;
+    let item = crate::project::create_tag(
+        &state.pool,
+        &user,
+        id,
+        &body.name,
+        body.reference.as_deref(),
+        body.message.as_deref(),
+    )
+    .await?;
+    Ok(Json(json!({ "item": item })))
+}
+
+pub(crate) async fn project_tag_list(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current_user(&state, &session).await?;
+    require_project(&state, id).await?;
+    let items = crate::project::list_tags(&state.pool, id).await?;
+    Ok(Json(json!({ "items": items })))
+}
+
+pub(crate) async fn project_tag_delete(
+    State(state): State<AppState>,
+    session: Session,
+    Path((id, name)): Path<(Uuid, String)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current_user(&state, &session).await?;
+    require_project(&state, id).await?;
+    crate::project::delete_tag(&state.pool, id, &name).await?;
+    let items = crate::project::list_tags(&state.pool, id).await?;
+    Ok(Json(json!({ "items": items })))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct MergeBody {
+    source: String,
+    /// 缺省为项目默认分支。
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+pub(crate) async fn project_merge(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+    Json(body): Json<MergeBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = current_user(&state, &session).await?;
+    let project = require_project(&state, id).await?;
+    let target = body.target.as_deref().unwrap_or(&project.default_branch);
+    let item = crate::collab::merge_branches(
+        &state.pool,
+        &user,
+        id,
+        &body.source,
+        target,
+        body.message.as_deref(),
+    )
+    .await?;
+    if target == project.default_branch && !item.already_up_to_date {
+        if let Err(error) = state.build_ctl.build_all().await {
+            return Err(ApiError::with_status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("分支已合并，但自动编译失败：{error}"),
+            ));
+        }
+    }
+    Ok(Json(json!({ "item": item })))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ResetBody {
+    #[serde(rename = "ref", default = "main_branch")]
+    branch: String,
+    commit: String,
+    /// 允许把分支重置到当前历史之外的提交。
+    #[serde(default)]
+    force: bool,
+}
+
+pub(crate) async fn project_reset(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+    Json(body): Json<ResetBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = current_user(&state, &session).await?;
+    let project = require_project(&state, id).await?;
+    let item = crate::project::reset_branch(
+        &state.pool,
+        &user,
+        id,
+        &body.branch,
+        &body.commit,
+        body.force,
+    )
+    .await?;
+    if body.branch == project.default_branch && item.commit != item.previous {
+        if let Err(error) = state.build_ctl.build_all().await {
+            return Err(ApiError::with_status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("分支已重置，但自动编译失败：{error}"),
+            ));
+        }
+    }
+    Ok(Json(json!({ "item": item })))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct PathQuery {
+    #[serde(rename = "ref")]
+    reference: Option<String>,
+    path: String,
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+pub(crate) async fn project_file_history(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+    Query(query): Query<PathQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current_user(&state, &session).await?;
+    let project = require_project(&state, id).await?;
+    let reference = query.reference.as_deref().unwrap_or(&project.default_branch);
+    let items = crate::project::file_history(
+        &state.pool,
+        id,
+        reference,
+        &query.path,
+        query.limit.unwrap_or(50),
+    )
+    .await?;
+    Ok(Json(json!({ "items": items })))
+}
+
+pub(crate) async fn project_blame(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+    Query(query): Query<PathQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current_user(&state, &session).await?;
+    let project = require_project(&state, id).await?;
+    let reference = query.reference.as_deref().unwrap_or(&project.default_branch);
+    let item = crate::project::blame(&state.pool, id, reference, &query.path).await?;
+    Ok(Json(json!({ "item": item })))
 }
 
 pub(crate) async fn project_update(

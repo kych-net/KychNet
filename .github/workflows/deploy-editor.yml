@@ -1,0 +1,123 @@
+name: deploy-editor
+
+# 独立编辑器（kych.net/编辑器/）静态站发布：push 到 main 且改动 editor/ 或其
+# 复用的管理端源码时构建并同步到源站。源站由 nginx 直接托管，EdgeOne 回源到这里。
+#
+# 编辑器通过 @admin 别名复用 admin/src 的 api.ts / CodeEditor.tsx /
+# editorCompletions.ts，因此：
+#   1. 这些共享文件改动也要触发编辑器重新发布；
+#   2. 构建前必须同时安装 admin 依赖——editor 的 tsc 会编译这些 admin 源文件，
+#      它们的 bare import 按 node 解析落到 admin/node_modules，只装 editor 会报
+#      「Cannot find module」。
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'editor/**'
+      - 'admin/src/api.ts'
+      - 'admin/src/components/CodeEditor.tsx'
+      - 'admin/src/components/editorCompletions.ts'
+      # workflow 自身也要算进触发路径，否则改这个文件不会重新发布。
+      - '.github/workflows/deploy-editor.yml'
+  pull_request:
+    paths:
+      - 'editor/**'
+      - 'admin/src/api.ts'
+      - 'admin/src/components/CodeEditor.tsx'
+      - 'admin/src/components/editorCompletions.ts'
+  workflow_dispatch:
+
+# 同一分支的发布串行执行，避免两次 push 的 rsync 交错覆盖。
+concurrency:
+  group: deploy-editor-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 仓库里只有 pnpm-lock.yaml，没有 package-lock.json：必须用 pnpm。
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: |
+            admin/pnpm-lock.yaml
+            editor/pnpm-lock.yaml
+
+      # 先装管理端依赖：editor 的 tsc 编译被 include 的 admin 源文件时需要它们。
+      - name: 安装管理端依赖（编辑器复用其源码）
+        working-directory: admin
+        run: pnpm install --frozen-lockfile
+
+      - name: 安装编辑器依赖
+        working-directory: editor
+        run: pnpm install --frozen-lockfile
+
+      # 生产构建必须显式给出 API origin。editor 复用 admin/src/api.ts，
+      # 它读 VITE_API_BASE_URL，留空会退化成同源 /api；显式注入避免把开发期
+      # vite 代理的相对路径行为带进产物。
+      - name: 构建
+        working-directory: editor
+        env:
+          VITE_API_BASE_URL: https://kych.net
+        run: pnpm build
+
+      - name: 检查产物完整性
+        working-directory: editor
+        run: |
+          test -f dist/index.html || { echo "缺少 dist/index.html"; exit 1; }
+          test -d dist/assets  || { echo "缺少 dist/assets"; exit 1; }
+          grep -q 'https://kych.net' dist/assets/*.js || { echo "产物未注入 API origin"; exit 1; }
+          grep -q '/编辑器/assets/' dist/index.html || { echo "产物 base 不是 /编辑器/"; exit 1; }
+          echo "产物文件数: $(find dist -type f | wc -l)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: editor-dist
+          path: editor/dist
+          retention-days: 7
+
+  deploy:
+    needs: build
+    # 只在 main 分支的 push 和手动触发时发布；PR 只构建做校验。
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      # 用与 build 相同的产物，不重复构建，避免两次构建 hash 不一致。
+      - uses: actions/download-artifact@v4
+        with:
+          name: editor-dist
+          path: dist
+
+      # 编辑器与管理端共用同一部署账号（DEPLOY_HOST/USER/SSH_KEY），
+      # 目标目录固定为 /opt/kych-editor/（非敏感，直接写死，无需新增 secret）。
+      # 服务器侧需先把该目录建好并授予部署账号写权限，见 deploy/README.md。
+      - name: 同步到源站
+        uses: burnett01/rsync-deployments@7.0.1
+        with:
+          # --delete 清掉上一版带 hash 的旧 chunk；index.html 是 no-cache，
+          # 用户刷新即拿到新版本，不会有长期指针。
+          switches: -avzr --delete --delete-delay
+          path: dist/
+          remote_path: /opt/kych-editor/
+          remote_host: ${{ secrets.DEPLOY_HOST }}
+          remote_user: ${{ secrets.DEPLOY_USER }}
+          remote_key: ${{ secrets.DEPLOY_SSH_KEY }}
+
+      - name: 校验线上版本
+        run: |
+          sleep 2
+          curl -sS --max-time 20 "https://kych.net/编辑器/" | grep -oE 'index-[A-Za-z0-9_-]+\.js' > /tmp/live.txt || true
+          grep -oE 'index-[A-Za-z0-9_-]+\.js' dist/index.html > /tmp/built.txt || true
+          echo "构建产物: $(cat /tmp/built.txt)"
+          echo "线上引用: $(cat /tmp/live.txt)"

@@ -33,13 +33,30 @@ pub(crate) async fn mark_reachable(
     // 否则 gc 会删掉快照接口尚未读取的 Git 对象。
     stack.extend(extra);
 
-    while let Some(oid) = stack.pop() {
-        if !reachable.insert(oid) {
+    // 按批拉取：GC 遍历的对象数可能上万，逐对象一次 SELECT 会让
+    // 持锁时间显著变长（push 也被这把锁挡住）。
+    const BATCH: usize = 512;
+    while !stack.is_empty() {
+        let take = stack.len().min(BATCH);
+        let batch: Vec<Oid> = stack.drain(stack.len() - take..).collect();
+        let mut fetch = Vec::with_capacity(batch.len());
+        for oid in batch {
+            if reachable.insert(oid) {
+                fetch.push(oid);
+            }
+        }
+        if fetch.is_empty() {
             continue;
         }
-        let Some(object) = store::get_object(conn, project_id, oid).await? else {
-            continue;
-        };
+        let rows = store::get_objects(conn, project_id, &fetch).await?;
+        let mut found = std::collections::HashMap::with_capacity(rows.len());
+        for (oid, object) in rows {
+            found.insert(oid, object);
+        }
+        for oid in fetch {
+            let Some(object) = found.remove(&oid) else {
+                continue;
+            };
         match object.kind {
             ObjectKind::Commit => {
                 commits.insert(oid);
@@ -66,6 +83,7 @@ pub(crate) async fn mark_reachable(
                     lfs_oids.insert(oid);
                 }
             }
+        }
         }
     }
     Ok((reachable, commits, lfs_oids))
@@ -110,17 +128,25 @@ pub async fn run(pool: &PgPool, root: &Path, project: &Project) -> Result<GcStat
         .bind(project.id)
         .fetch_all(&mut *tx)
         .await?;
+    // 逐条 DELETE 会把持锁时间拉到与对象数成正比；按批 ANY($2) 一次删一批。
+    let mut dead: Vec<Vec<u8>> = Vec::new();
     for row in rows {
         let bytes: Vec<u8> = row.try_get("oid")?;
         let oid = Oid::from_slice(&bytes)?;
         if !reachable.contains(&oid) {
-            sqlx::query("DELETE FROM git_objects WHERE project_id = $1 AND oid = $2")
-                .bind(project.id)
-                .bind(&oid.as_bytes()[..])
-                .execute(&mut *tx)
-                .await?;
-            objects_removed += 1;
+            dead.push(oid.as_bytes().to_vec());
         }
+    }
+    for chunk in dead.chunks(512) {
+        let removed = sqlx::query(
+            "DELETE FROM git_objects WHERE project_id = $1 AND oid = ANY($2::bytea[])",
+        )
+        .bind(project.id)
+        .bind(chunk.to_vec())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected() as usize;
+        objects_removed += removed;
     }
 
     let mut commits_removed = 0usize;
@@ -128,17 +154,24 @@ pub async fn run(pool: &PgPool, root: &Path, project: &Project) -> Result<GcStat
         .bind(project.id)
         .fetch_all(&mut *tx)
         .await?;
+    let mut dead_commits: Vec<Vec<u8>> = Vec::new();
     for row in rows {
         let bytes: Vec<u8> = row.try_get("oid")?;
         let oid = Oid::from_slice(&bytes)?;
         if !commits.contains(&oid) {
-            sqlx::query("DELETE FROM git_commits WHERE project_id = $1 AND oid = $2")
-                .bind(project.id)
-                .bind(&oid.as_bytes()[..])
-                .execute(&mut *tx)
-                .await?;
-            commits_removed += 1;
+            dead_commits.push(oid.as_bytes().to_vec());
         }
+    }
+    for chunk in dead_commits.chunks(512) {
+        let removed = sqlx::query(
+            "DELETE FROM git_commits WHERE project_id = $1 AND oid = ANY($2::bytea[])",
+        )
+        .bind(project.id)
+        .bind(chunk.to_vec())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected() as usize;
+        commits_removed += removed;
     }
 
     let paths_removed = sqlx::query(

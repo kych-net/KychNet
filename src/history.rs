@@ -306,7 +306,12 @@ pub async fn record_full_baseline(
 }
 
 /// 版本列表（不含 data，避免把大正文拖出来）。
-pub async fn list_revisions(pool: &sqlx::PgPool, content_id: Uuid) -> Result<Vec<ContentRevision>> {
+pub async fn list_revisions(
+    pool: &sqlx::PgPool,
+    content_id: Uuid,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<ContentRevision>> {
     Ok(sqlx::query_as::<_, ContentRevision>(
         "SELECT r.id, r.content_id, r.seq, r.parent_seq, r.kind, r.slug, r.format, ''::text AS data,
                 r.added, r.removed, r.author_id, COALESCE(u.username, '已注销用户') AS author_name,
@@ -314,9 +319,11 @@ pub async fn list_revisions(pool: &sqlx::PgPool, content_id: Uuid) -> Result<Vec
          FROM content_revisions r
          LEFT JOIN users u ON u.id = r.author_id
          WHERE r.content_id = $1
-         ORDER BY r.seq DESC",
+         ORDER BY r.seq DESC LIMIT $2 OFFSET $3",
     )
     .bind(content_id)
+    .bind(limit.clamp(1, 500))
+    .bind(offset.max(0))
     .fetch_all(pool)
     .await?)
 }

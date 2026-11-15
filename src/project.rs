@@ -2,13 +2,17 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use sqlx::{PgConnection, PgPool};
+use sqlx::{PgConnection, PgPool, Row};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use uuid::Uuid;
 
 use crate::git::lfs;
-use crate::git::object::{commit_parents, encode_commit, ensure_text, identity_name, is_text, Oid};
+use crate::git::object::{
+    commit_parents, encode_commit, encode_tag, ensure_text, identity_name, is_text, parse_commit,
+    ObjectKind, Oid,
+};
+use similar::{DiffOp, TextDiff};
 use crate::git::proto;
 use crate::git::store;
 use crate::git::tree;
@@ -232,9 +236,12 @@ fn validate_changes(changes: &[FileChange]) -> Result<()> {
 /// `a.html` 与 `a.html/b.md` 是文件/目录冲突（写盘时 create_dir_all 会失败），
 /// 同样拒绝——否则整站重建会在删旧产物之后的写盘阶段失败，留下半删的站点。
 /// `a.typ` 与 `a.css` 分别输出 `a.html` / `a.css`，可以共存。
-fn ensure_no_output_conflict(path: &str, files: &BTreeMap<String, Vec<u8>>) -> Result<()> {
+fn ensure_no_output_conflict(
+    path: &str,
+    files: &std::collections::BTreeSet<String>,
+) -> Result<()> {
     let target = project_output_path(path);
-    for existing in files.keys() {
+    for existing in files {
         if existing == path {
             continue;
         }
@@ -918,21 +925,241 @@ pub async fn list_branches(pool: &PgPool, project_id: Uuid) -> Result<Vec<String
         .collect())
 }
 
+/// 只读入口统一的 ref 解析：分支名 / 标签名 / 40 位 commit OID 都接受。
+///
+/// 也兼容 `refs/heads/...`、`refs/tags/...` 全名；附注标签会逐层剥到
+/// commit。写接口仍然只接受分支名（要更新 ref），不要调用这里。
+pub async fn resolve_read_ref(
+    conn: &mut PgConnection,
+    project_id: Uuid,
+    reference: &str,
+) -> Result<Option<Oid>> {
+    let value = reference.trim();
+    if value.is_empty() {
+        bail!("引用名不能为空");
+    }
+    if value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        let oid = Oid::from_hex(value)?;
+        let Some(object) = store::get_object(conn, project_id, oid).await? else {
+            return Ok(None);
+        };
+        return match object.kind {
+            ObjectKind::Commit => Ok(Some(oid)),
+            ObjectKind::Tag => Ok(Some(store::peel_to_commit(conn, project_id, oid).await?)),
+            _ => bail!("目标不是提交对象: {value}"),
+        };
+    }
+    // 显式写了完整 ref 时只查对应 namespace，避免 `refs/tags/v1` 与同名分支
+    // `refs/heads/v1` 同时存在时误命中分支；短名才按 Git 的消歧顺序先 heads 后 tags。
+    let (short, prefixes): (&str, &[&str]) = if let Some(rest) = value.strip_prefix("refs/heads/") {
+        (rest, &["refs/heads/"])
+    } else if let Some(rest) = value.strip_prefix("refs/tags/") {
+        (rest, &["refs/tags/"])
+    } else {
+        (value, &["refs/heads/", "refs/tags/"])
+    };
+    if !valid_branch(short) {
+        bail!("非法引用名: {reference:?}");
+    }
+    for prefix in prefixes {
+        if let Some(oid) = store::get_ref(conn, project_id, &format!("{prefix}{short}")).await? {
+            return Ok(Some(store::peel_to_commit(conn, project_id, oid).await?));
+        }
+    }
+    Ok(None)
+}
+
+/// 标签列表项。`oid` 始终是标签最终指向的 commit（附注标签已剥开）。
+#[derive(Debug, Clone, Serialize)]
+pub struct TagInfo {
+    pub name: String,
+    pub oid: String,
+    /// 附注标签的对象 OID；轻量标签与 ref 的 target 相同。
+    pub tag_oid: Option<String>,
+    pub message: String,
+    pub author_name: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// 列出项目标签。附注标签的 tagger / 说明从 tag 对象里读出来。
+pub async fn list_tags(pool: &PgPool, project_id: Uuid) -> Result<Vec<TagInfo>> {
+    let mut conn = pool.acquire().await?;
+    // 直接取 updated_at：轻量标签没有 tagger 行，用 ref 的写入时间才稳定，
+    // 否则每次列表都退化成「现在」，排序会随刷新跳动。
+    let rows = sqlx::query(
+        "SELECT name, target, updated_at FROM git_refs
+         WHERE project_id = $1 AND name LIKE 'refs/tags/%' ORDER BY name",
+    )
+    .bind(project_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut tags = Vec::new();
+    for row in rows {
+        let name: String = row.try_get("name")?;
+        let raw: Vec<u8> = row.try_get("target")?;
+        let target = Oid::from_slice(&raw)?;
+        let ref_updated: DateTime<Utc> = row.try_get("updated_at")?;
+        let Some(tag_name) = name.strip_prefix("refs/tags/") else {
+            continue;
+        };
+        let object = store::get_object(&mut conn, project_id, target).await?;
+        let (commit, tag_oid, message, author_name, created_at) = match object {
+            Some(object) if object.kind == ObjectKind::Tag => {
+                let text = String::from_utf8_lossy(&object.data);
+                let mut msg = String::new();
+                let mut tagger = String::new();
+                let mut timestamp = 0i64;
+                // tag 对象以第一个空行分隔 header 与 message；空行之后的内容
+                // 一律算说明，避免说明里出现 "object " 之类的行被当 header 丢掉。
+                let mut in_message = false;
+                for line in text.lines() {
+                    if !in_message {
+                        if line.is_empty() {
+                            in_message = true;
+                            continue;
+                        }
+                        if let Some(value) = line.strip_prefix("tagger ") {
+                            tagger = value.split('<').next().unwrap_or("").trim().to_string();
+                            timestamp = value
+                                .split_whitespace()
+                                .rev()
+                                .nth(1)
+                                .and_then(|part| part.parse().ok())
+                                .unwrap_or(0);
+                        }
+                        continue;
+                    }
+                    if !msg.is_empty() {
+                        msg.push('\n');
+                    }
+                    msg.push_str(line);
+                }
+                let peeled = store::peel_to_commit(&mut conn, project_id, target).await?;
+                let created_at = DateTime::from_timestamp(timestamp, 0).unwrap_or(ref_updated);
+                (
+                    peeled,
+                    Some(target.to_hex()),
+                    msg.trim().to_string(),
+                    if tagger.is_empty() { "未知".to_string() } else { tagger },
+                    created_at,
+                )
+            }
+            _ => (
+                target,
+                None,
+                String::new(),
+                "轻量标签".to_string(),
+                ref_updated,
+            ),
+        };
+        tags.push(TagInfo {
+            name: tag_name.to_string(),
+            oid: commit.to_hex(),
+            tag_oid,
+            message,
+            author_name,
+            created_at,
+        });
+    }
+    tags.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| a.name.cmp(&b.name)));
+    Ok(tags)
+}
+
+/// 创建标签。`target_ref` 缺省为项目默认分支；给了 message 就写成附注标签。
+pub async fn create_tag(
+    pool: &PgPool,
+    user: &User,
+    project_id: Uuid,
+    name: &str,
+    target_ref: Option<&str>,
+    message: Option<&str>,
+) -> Result<TagInfo> {
+    if !valid_branch(name) {
+        bail!("非法标签名");
+    }
+    let project = get_project(pool, project_id).await?.context("项目不存在")?;
+    let reference = target_ref.unwrap_or(&project.default_branch);
+    let mut tx = pool.begin().await?;
+    lock_project(&mut tx, project_id).await?;
+    let full = format!("refs/tags/{name}");
+    if store::get_ref(&mut tx, project_id, &full).await?.is_some() {
+        bail!("标签已存在: {name}");
+    }
+    let commit = resolve_read_ref(&mut tx, project_id, reference)
+        .await?
+        .with_context(|| format!("引用不存在: {reference}"))?;
+    let target = match message {
+        Some(message) if !message.trim().is_empty() => {
+            let data = encode_tag(
+                commit,
+                name,
+                &identity(user),
+                message,
+                Utc::now().timestamp(),
+            );
+            store::put_object(
+                &mut tx,
+                project_id,
+                &crate::git::object::Object { kind: ObjectKind::Tag, data },
+            )
+            .await?
+        }
+        _ => commit,
+    };
+    store::set_ref(&mut tx, project_id, &full, target).await?;
+    sqlx::query("UPDATE projects SET updated_at = now() WHERE id = $1")
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    if let Err(error) = store::invalidate_project_caches(project_id) {
+        tracing::warn!(%error, "创建标签后作废项目缓存失败");
+    }
+    Ok(TagInfo {
+        name: name.to_string(),
+        oid: commit.to_hex(),
+        tag_oid: (target != commit).then(|| target.to_hex()),
+        message: message.unwrap_or("").trim().to_string(),
+        author_name: user.username.clone(),
+        created_at: Utc::now(),
+    })
+}
+
+pub async fn delete_tag(pool: &PgPool, project_id: Uuid, name: &str) -> Result<()> {
+    if !valid_branch(name) {
+        bail!("非法标签名");
+    }
+    let mut tx = pool.begin().await?;
+    lock_project(&mut tx, project_id).await?;
+    let full = format!("refs/tags/{name}");
+    if store::get_ref(&mut tx, project_id, &full).await?.is_none() {
+        bail!("标签不存在: {name}");
+    }
+    store::delete_ref(&mut tx, project_id, &full).await?;
+    sqlx::query("UPDATE projects SET updated_at = now() WHERE id = $1")
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    if let Err(error) = store::invalidate_project_caches(project_id) {
+        tracing::warn!(%error, "删除标签后作废项目缓存失败");
+    }
+    Ok(())
+}
+
+/// 读取单个文件。`branch` 参数实际接受任意只读 ref（分支 / 标签 / commit OID）。
 pub async fn read_file(
     pool: &PgPool,
     project_id: Uuid,
     branch: &str,
     path: &str,
 ) -> Result<Option<FileContent>> {
-    if !valid_branch(branch) {
-        bail!("非法分支名");
-    }
     if !valid_file_path(path) {
         bail!("非法文件路径");
     }
     let mut conn = pool.acquire().await?;
-    let Some(commit) = store::resolve_branch(&mut conn, project_id, branch).await? else {
-        bail!("分支不存在: {branch}");
+    let Some(commit) = resolve_read_ref(&mut conn, project_id, branch).await? else {
+        bail!("引用不存在: {branch}");
     };
     let Some((oid, data)) = tree::find_file(&mut conn, project_id, commit, path).await? else {
         return Ok(None);
@@ -947,21 +1174,19 @@ pub async fn read_file(
     }))
 }
 
+/// 列目录。`branch` 参数实际接受任意只读 ref（分支 / 标签 / commit OID）。
 pub async fn list_dir(
     pool: &PgPool,
     project_id: Uuid,
     branch: &str,
     dir: &str,
 ) -> Result<Vec<tree::DirItem>> {
-    if !valid_branch(branch) {
-        bail!("非法分支名");
-    }
     if !dir.is_empty() && !valid_file_path(dir) {
         bail!("非法目录路径");
     }
     let mut conn = pool.acquire().await?;
-    let Some(commit) = store::resolve_branch(&mut conn, project_id, branch).await? else {
-        bail!("分支不存在: {branch}");
+    let Some(commit) = resolve_read_ref(&mut conn, project_id, branch).await? else {
+        bail!("引用不存在: {branch}");
     };
     tree::list_dir(&mut conn, project_id, commit, dir).await
 }
@@ -989,15 +1214,18 @@ pub async fn write_file(
     lock_project(&mut tx, project_id).await?;
 
     let parent = store::resolve_branch(&mut tx, project_id, branch).await?;
-    let files = match parent {
-        Some(commit) => tree::read_files(&mut tx, project_id, commit).await?,
-        None => BTreeMap::new(),
+    // 只取目标文件的 OID 与全仓库的路径集合：既做 base_oid 校验又做输出
+    // 冲突检查，但不再把每个 blob 都解压一遍（仓库大时这是主要开销）。
+    let existing_oid = match parent {
+        Some(commit) => tree::find_blob_oid(&mut tx, project_id, commit, path).await?,
+        None => None,
     };
-    let existing_oid = files
-        .get(path)
-        .map(|data| crate::git::object::hash_object(crate::git::object::ObjectKind::Blob, data));
     store::check_old_oid(existing_oid, base_oid)?;
-    ensure_no_output_conflict(path, &files)?;
+    let paths = match parent {
+        Some(commit) => tree::list_paths(&mut tx, project_id, commit).await?,
+        None => std::collections::BTreeSet::new(),
+    };
+    ensure_no_output_conflict(path, &paths)?;
 
     let blob = tree::write_blob(&mut tx, project_id, content.as_bytes()).await?;
     let root = match parent {
@@ -1086,15 +1314,16 @@ pub async fn write_file_bytes(
     let mut tx = pool.begin().await?;
     lock_project(&mut tx, project_id).await?;
     let parent = store::resolve_branch(&mut tx, project_id, branch).await?;
-    let files = match parent {
-        Some(commit) => tree::read_files(&mut tx, project_id, commit).await?,
-        None => BTreeMap::new(),
+    let existing_oid = match parent {
+        Some(commit) => tree::find_blob_oid(&mut tx, project_id, commit, path).await?,
+        None => None,
     };
-    let existing_oid = files
-        .get(path)
-        .map(|old| crate::git::object::hash_object(crate::git::object::ObjectKind::Blob, old));
     store::check_old_oid(existing_oid, base_oid)?;
-    ensure_no_output_conflict(path, &files)?;
+    let paths = match parent {
+        Some(commit) => tree::list_paths(&mut tx, project_id, commit).await?,
+        None => std::collections::BTreeSet::new(),
+    };
+    ensure_no_output_conflict(path, &paths)?;
 
     let blob = tree::write_blob(&mut tx, project_id, &blob_bytes).await?;
     let root = match parent {
@@ -1198,7 +1427,8 @@ pub async fn commit_changes(
                 Some(old_oid),
             ));
         } else {
-            ensure_no_output_conflict(&change.path, &files)?;
+            let existing_paths: std::collections::BTreeSet<String> = files.keys().cloned().collect();
+            ensure_no_output_conflict(&change.path, &existing_paths)?;
             let content = change.content.as_deref().unwrap_or_default();
             let blob = tree::write_blob(&mut tx, project_id, content.as_bytes()).await?;
             let existed = files.contains_key(&change.path);
@@ -1338,17 +1568,14 @@ pub async fn move_file(
     let Some((blob, data)) = tree::find_file(&mut tx, project_id, commit, from).await? else {
         bail!("文件不存在: {from}");
     };
-    let files = tree::read_files(&mut tx, project_id, commit).await?;
-    if files.contains_key(to) {
+    let all_paths = tree::list_paths(&mut tx, project_id, commit).await?;
+    if all_paths.contains(to) {
         bail!("目标路径已存在: {to}");
     }
     // 冲突检查要排除源文件本身：同 stem 换格式改名（a.md → a.typ）
-    // 输出路径相同是改名的目的，不是冲突。只克隆键，不克隆文件内容。
-    let others: BTreeMap<String, Vec<u8>> = files
-        .keys()
-        .filter(|key| *key != from)
-        .map(|key| (key.clone(), Vec::new()))
-        .collect();
+    // 输出路径相同是改名的目的，不是冲突。
+    let others: std::collections::BTreeSet<String> =
+        all_paths.into_iter().filter(|key| key != from).collect();
     ensure_no_output_conflict(to, &others)?;
     ensure_text(&data)?;
 
@@ -1449,10 +1676,8 @@ pub async fn list_commits(
 
     match reference {
         Some(reference) => {
-            if !valid_branch(reference) {
-                bail!("非法分支名");
-            }
-            let Some(tip) = store::resolve_branch(&mut conn, project_id, reference).await? else {
+            // 分支 / 标签 / commit OID 都能作为历史起点，方便按标签回溯版本。
+            let Some(tip) = resolve_read_ref(&mut conn, project_id, reference).await? else {
                 return Ok(Vec::new());
             };
             let oids = walk_commit_oids(&mut conn, project_id, tip).await?;
@@ -1578,8 +1803,9 @@ pub async fn revert_commit(
     if changes.is_empty() {
         bail!("该提交没有可还原的改动");
     }
+    let current_paths: std::collections::BTreeSet<String> = current.keys().cloned().collect();
     for path in current.keys() {
-        ensure_no_output_conflict(path, &current)?;
+        ensure_no_output_conflict(path, &current_paths)?;
     }
 
     let root = tree::build_from_files(&mut tx, project_id, &current).await?;
@@ -1606,9 +1832,9 @@ pub async fn revert_commit(
     })
 }
 
-/// 从指定分支（或默认分支）拉出新分支。
+/// 从指定 ref（分支 / 标签 / commit OID）拉出新分支。
 pub async fn create_branch(pool: &PgPool, project_id: Uuid, name: &str, from: &str) -> Result<()> {
-    if !valid_branch(name) || !valid_branch(from) {
+    if !valid_branch(name) {
         bail!("非法分支名");
     }
     let mut tx = pool.begin().await?;
@@ -1619,9 +1845,9 @@ pub async fn create_branch(pool: &PgPool, project_id: Uuid, name: &str, from: &s
     {
         bail!("分支已存在: {name}");
     }
-    let tip = store::resolve_branch(&mut tx, project_id, from)
+    let tip = resolve_read_ref(&mut tx, project_id, from)
         .await?
-        .with_context(|| format!("来源分支不存在: {from}"))?;
+        .with_context(|| format!("来源引用不存在: {from}"))?;
     store::set_ref(&mut tx, project_id, &format!("refs/heads/{name}"), tip).await?;
     sqlx::query("UPDATE projects SET updated_at = now() WHERE id = $1")
         .bind(project_id)
@@ -1680,15 +1906,13 @@ pub async fn compare_branches(
     source: &str,
     target: &str,
 ) -> Result<BranchCompare> {
-    if !valid_branch(source) || !valid_branch(target) {
-        bail!("非法分支名");
-    }
     let mut conn = pool.acquire().await?;
-    let Some(source_tip) = store::resolve_branch(&mut conn, project_id, source).await? else {
-        bail!("来源分支不存在: {source}");
+    // 比较同样接受分支 / 标签 / commit OID：任意两个版本都能看差异。
+    let Some(source_tip) = resolve_read_ref(&mut conn, project_id, source).await? else {
+        bail!("来源引用不存在: {source}");
     };
-    let Some(target_tip) = store::resolve_branch(&mut conn, project_id, target).await? else {
-        bail!("目标分支不存在: {target}");
+    let Some(target_tip) = resolve_read_ref(&mut conn, project_id, target).await? else {
+        bail!("目标引用不存在: {target}");
     };
     let base = crate::collab::merge_base(&mut conn, project_id, source_tip, target_tip).await?;
     // 领先提交：从 source tip 走父链，走到 merge_base 停。共同历史都在
@@ -1728,6 +1952,350 @@ pub async fn compare_branches(
         merge_base: base.map(|oid| oid.to_hex()),
         commits,
         files,
+    })
+}
+
+/// 分支重置结果。
+#[derive(Debug, Clone, Serialize)]
+pub struct ResetResult {
+    pub commit: String,
+    pub previous: String,
+}
+
+/// 把分支指针移动到指定提交（等价于无工作树的 `git reset --hard`）。
+///
+/// 站内没有 checkout 的概念，重置只是移动 ref：默认只允许退回当前分支历史
+/// 里的提交，避免把分支指到无关历史；显式 `force` 才允许任意提交。
+/// 默认分支被重置后由调用方触发整站重建。
+pub async fn reset_branch(
+    pool: &PgPool,
+    user: &User,
+    project_id: Uuid,
+    branch: &str,
+    target_ref: &str,
+    force: bool,
+) -> Result<ResetResult> {
+    if !valid_branch(branch) {
+        bail!("非法分支名");
+    }
+    let mut tx = pool.begin().await?;
+    lock_project(&mut tx, project_id).await?;
+    let tip = store::resolve_branch(&mut tx, project_id, branch)
+        .await?
+        .with_context(|| format!("分支不存在: {branch}"))?;
+    let target = resolve_read_ref(&mut tx, project_id, target_ref)
+        .await?
+        .with_context(|| format!("引用不存在: {target_ref}"))?;
+    if target == tip {
+        return Ok(ResetResult {
+            commit: target.to_hex(),
+            previous: tip.to_hex(),
+        });
+    }
+    if !force {
+        let history = walk_commit_oids(&mut tx, project_id, tip).await?;
+        if !history.contains(&target) {
+            bail!("目标提交不在当前分支历史中；如确要重置到其它提交，请勾选强制重置");
+        }
+    }
+    store::set_ref(&mut tx, project_id, &format!("refs/heads/{branch}"), target).await?;
+    sqlx::query("UPDATE projects SET updated_at = now() WHERE id = $1")
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?;
+    crate::workflow::event::enqueue(
+        &mut tx,
+        &crate::workflow::event::WorkflowEvent {
+            project_id,
+            kind: "push".to_string(),
+            ref_name: format!("refs/heads/{branch}"),
+            before_oid: Some(tip.as_bytes().to_vec()),
+            after_oid: Some(target.as_bytes().to_vec()),
+            pr_number: None,
+            actor_id: Some(user.id),
+            payload: serde_json::json!({
+                "action": "reset",
+                "target": target_ref,
+                "sender": { "login": user.username },
+            }),
+            dedupe_key: None,
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    if let Err(error) = store::invalidate_project_caches(project_id) {
+        tracing::warn!(%error, "分支重置后作废项目缓存失败");
+    }
+    Ok(ResetResult {
+        commit: target.to_hex(),
+        previous: tip.to_hex(),
+    })
+}
+
+/// 单文件提交历史的一项。`change` 为 add / modify / delete。
+#[derive(Debug, Clone, Serialize)]
+pub struct FileHistoryEntry {
+    pub oid: String,
+    pub author_name: String,
+    pub message: String,
+    pub committed_at: DateTime<Utc>,
+    pub change: String,
+    pub old_oid: Option<String>,
+    pub new_oid: Option<String>,
+}
+
+/// 追踪某个路径的变更历史（沿第一父链，与 `git log --first-parent -- <path>` 同构）。
+///
+/// 用 tree 里的 blob OID 判断变化，不依赖 `git_commit_paths` 索引——外部导入
+/// 的仓库与 git push 上来的提交都没有写那张表，只有 blob OID 是权威的。
+pub async fn file_history(
+    pool: &PgPool,
+    project_id: Uuid,
+    reference: &str,
+    path: &str,
+    limit: i64,
+) -> Result<Vec<FileHistoryEntry>> {
+    if !valid_file_path(path) {
+        bail!("非法文件路径");
+    }
+    let limit = limit.clamp(1, 200) as usize;
+    let mut conn = pool.acquire().await?;
+    let tip = resolve_read_ref(&mut conn, project_id, reference)
+        .await?
+        .with_context(|| format!("引用不存在: {reference}"))?;
+    let mut current = Some(tip);
+    let mut walked = 0usize;
+    let mut out = Vec::new();
+    while let Some(commit) = current {
+        walked += 1;
+        if walked > 5000 {
+            break;
+        }
+        let object = store::require_object(&mut conn, project_id, commit).await?;
+        if object.kind != ObjectKind::Commit {
+            break;
+        }
+        let info = parse_commit(&object.data)?;
+        let parent = info.parents.first().copied();
+        let new_oid = tree::find_blob_oid(&mut conn, project_id, commit, path).await?;
+        let old_oid = match parent {
+            Some(parent) => tree::find_blob_oid(&mut conn, project_id, parent, path).await?,
+            None => None,
+        };
+        if new_oid != old_oid {
+            let change = match (old_oid, new_oid) {
+                (None, Some(_)) => "add",
+                (Some(_), None) => "delete",
+                _ => "modify",
+            };
+            out.push(FileHistoryEntry {
+                oid: commit.to_hex(),
+                author_name: identity_name(&info.author),
+                message: info.message.lines().next().unwrap_or("").to_string(),
+                committed_at: info.committed_at,
+                change: change.to_string(),
+                old_oid: old_oid.map(|oid| oid.to_hex()),
+                new_oid: new_oid.map(|oid| oid.to_hex()),
+            });
+            if out.len() >= limit {
+                break;
+            }
+        }
+        current = parent;
+    }
+    Ok(out)
+}
+
+/// blame 的一行：`commit` 是最后改动该行的提交 OID。
+#[derive(Debug, Clone, Serialize)]
+pub struct BlameLine {
+    pub line: usize,
+    pub commit: String,
+    pub author_name: String,
+    pub message: String,
+    pub committed_at: DateTime<Utc>,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BlameResult {
+    pub path: String,
+    pub oid: String,
+    pub truncated: bool,
+    pub lines: Vec<BlameLine>,
+}
+
+const BLAME_MAX_BYTES: usize = 512 * 1024;
+const BLAME_MAX_LINES: usize = 4000;
+const BLAME_MAX_COMMITS: usize = 1000;
+
+/// 保留行尾换行符切行，与 `similar` 的行切分保持一致。
+fn blame_split_lines(text: &str) -> Vec<&str> {
+    if text.is_empty() {
+        Vec::new()
+    } else {
+        text.split_inclusive('\n').collect()
+    }
+}
+
+async fn read_text_blob(
+    conn: &mut PgConnection,
+    project_id: Uuid,
+    oid: Oid,
+) -> Result<String> {
+    let object = store::require_object(conn, project_id, oid).await?;
+    if object.kind != ObjectKind::Blob || !is_text(&object.data) {
+        bail!("历史里包含非文本版本，无法逐行追溯");
+    }
+    Ok(String::from_utf8_lossy(&object.data).into_owned())
+}
+
+/// 逐行追溯：从 ref 的文件内容出发，沿第一父链把每一行归到最后改动它的提交。
+///
+/// 站内没有工作树，所以不做 checkout：对相邻两个版本做行级 diff，把「当前
+/// 行号」逐层映射回父版本；在本次提交里新出现（没有父版本对应行）的行就
+/// 归属该提交，其余行继续向历史回溯。合并提交只跟第一父，与文件历史一致。
+pub async fn blame(
+    pool: &PgPool,
+    project_id: Uuid,
+    reference: &str,
+    path: &str,
+) -> Result<BlameResult> {
+    if !valid_file_path(path) {
+        bail!("非法文件路径");
+    }
+    let mut conn = pool.acquire().await?;
+    let tip = resolve_read_ref(&mut conn, project_id, reference)
+        .await?
+        .with_context(|| format!("引用不存在: {reference}"))?;
+    let (blob_oid, data) = tree::find_file(&mut conn, project_id, tip, path)
+        .await?
+        .with_context(|| format!("文件不存在: {path}"))?;
+    if !is_text(&data) {
+        bail!("二进制文件不支持逐行追溯");
+    }
+    let truncated_bytes = data.len() > BLAME_MAX_BYTES;
+    let text = String::from_utf8_lossy(&data);
+    let all_lines: Vec<&str> = blame_split_lines(&text);
+    let truncated_lines = all_lines.len() > BLAME_MAX_LINES;
+    let count = all_lines.len().min(BLAME_MAX_LINES);
+    let display_lines: Vec<String> = all_lines[..count]
+        .iter()
+        .map(|line| line.trim_end_matches('\n').trim_end_matches('\r').to_string())
+        .collect();
+
+    // positions[i]：当前展示的第 i 行，在「正在处理的版本」里的行号。
+    let mut positions: Vec<Option<usize>> = (0..count).map(Some).collect();
+    let mut owners: Vec<Option<String>> = vec![None; count];
+    let mut infos: HashMap<String, (String, String, DateTime<Utc>)> = HashMap::new();
+
+    let mut current = Some(tip);
+    let mut walked = 0usize;
+    let mut last_commit = tip.to_hex();
+    let mut truncated_commits = false;
+    while let Some(commit) = current {
+        if walked >= BLAME_MAX_COMMITS {
+            truncated_commits = true;
+            break;
+        }
+        if positions.iter().all(Option::is_none) {
+            break;
+        }
+        walked += 1;
+        let object = store::require_object(&mut conn, project_id, commit).await?;
+        if object.kind != ObjectKind::Commit {
+            break;
+        }
+        let info = parse_commit(&object.data)?;
+        let parent = info.parents.first().copied();
+        let cur_oid = tree::find_blob_oid(&mut conn, project_id, commit, path).await?;
+        let par_oid = match parent {
+            Some(parent) => tree::find_blob_oid(&mut conn, project_id, parent, path).await?,
+            None => None,
+        };
+        if cur_oid == par_oid {
+            current = parent;
+            continue;
+        }
+        let cur_text = match cur_oid {
+            Some(oid) => read_text_blob(&mut conn, project_id, oid).await?,
+            None => String::new(),
+        };
+        let par_text = match par_oid {
+            Some(oid) => read_text_blob(&mut conn, project_id, oid).await?,
+            None => String::new(),
+        };
+        let diff = TextDiff::from_lines(&par_text, &cur_text);
+        let cur_len = blame_split_lines(&cur_text).len();
+        let mut map: Vec<Option<usize>> = vec![None; cur_len];
+        for &op in diff.ops() {
+            if let DiffOp::Equal {
+                old_index,
+                new_index,
+                len,
+            } = op
+            {
+                for offset in 0..len {
+                    if new_index + offset < map.len() {
+                        map[new_index + offset] = Some(old_index + offset);
+                    }
+                }
+            }
+        }
+        let short = commit.to_hex();
+        for (i, position) in positions.iter_mut().enumerate() {
+            if let Some(index) = *position {
+                match map.get(index).copied().flatten() {
+                    Some(old_index) => *position = Some(old_index),
+                    None => {
+                        owners[i] = Some(short.clone());
+                        *position = None;
+                    }
+                }
+            }
+        }
+        infos.insert(
+            short.clone(),
+            (
+                identity_name(&info.author),
+                info.message.lines().next().unwrap_or("").to_string(),
+                info.committed_at,
+            ),
+        );
+        last_commit = short;
+        current = parent;
+    }
+
+    // 走到历史尽头仍未归属的行，归给最早遍历到的那个提交。
+    let fallback = infos
+        .get(&last_commit)
+        .cloned()
+        .unwrap_or_else(|| ("unknown".to_string(), String::new(), Utc::now()));
+    infos.entry(last_commit.clone()).or_insert(fallback.clone());
+    let lines = display_lines
+        .into_iter()
+        .enumerate()
+        .map(|(index, text)| {
+            let oid = owners[index].clone().unwrap_or_else(|| last_commit.clone());
+            let (author_name, message, committed_at) = infos
+                .get(&oid)
+                .cloned()
+                .unwrap_or_else(|| fallback.clone());
+            BlameLine {
+                line: index + 1,
+                commit: oid,
+                author_name,
+                message,
+                committed_at,
+                text,
+            }
+        })
+        .collect();
+    Ok(BlameResult {
+        path: path.to_string(),
+        oid: blob_oid.to_hex(),
+        truncated: truncated_bytes || truncated_lines || truncated_commits,
+        lines,
     })
 }
 
@@ -1792,14 +2360,17 @@ mod tests {
 
     #[test]
     fn output_conflict_only_when_built_paths_match() {
-        let files = BTreeMap::from([
-            ("模板.typ".to_string(), b"= tpl".to_vec()),
-            ("模板.css".to_string(), b"body {}".to_vec()),
-            ("说明.md".to_string(), b"# doc".to_vec()),
-            ("图标.svg".to_string(), b"<svg/>".to_vec()),
-            ("notes.txt".to_string(), b"x".to_vec()),
-            ("子目录/模板.typ".to_string(), b"= sub".to_vec()),
-        ]);
+        let files: std::collections::BTreeSet<String> = [
+            "模板.typ",
+            "模板.css",
+            "说明.md",
+            "图标.svg",
+            "notes.txt",
+            "子目录/模板.typ",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
 
         // 截图里的场景：修改 .typ 时同名的 .css 是静态资源，不该拦。
         assert!(ensure_no_output_conflict("模板.typ", &files).is_ok());

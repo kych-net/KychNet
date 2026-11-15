@@ -21,6 +21,8 @@ struct IndexTemplate {
     styles: Vec<String>,
     /// 项目页专属图标；为空时 layout 回退站点默认图标。
     icon: String,
+    /// 内容页自定义 <head>，原样注入；自动生成的页面为空。
+    head: String,
 }
 
 struct PostLink {
@@ -42,6 +44,8 @@ struct PageTemplate {
     styles: Vec<String>,
     /// 项目页专属图标；为空时 layout 回退站点默认图标。
     icon: String,
+    /// 内容页自定义 <head>，原样注入；自动生成的页面为空。
+    head: String,
 }
 
 /// 一篇已经渲染完成的页面，先留在内存里，等全部成功后再统一落盘。
@@ -51,6 +55,24 @@ struct BuiltPage {
     date: String,
     html: String,
     pdf: Option<Vec<u8>>,
+}
+
+/// 从内容输出路径推导项目在站点里的 URL 基址。
+///
+/// 项目页的输出路径形如 `项目/地狱之下/地理/主行星.html`，对应的图片
+/// 资源前缀是 `/项目/地狱之下`；非项目页返回空串。
+fn project_asset_base(slug: &str) -> String {
+    let mut parts = slug.split('/');
+    let Some(namespace) = parts.next() else {
+        return String::new();
+    };
+    if namespace != crate::project::PROJECT_NAMESPACE {
+        return String::new();
+    }
+    let Some(name) = parts.next() else {
+        return String::new();
+    };
+    format!("/{namespace}/{name}")
 }
 
 /// 目录树节点。目录和文件分开存：目录名没有扩展名，文件名保留源格式扩展名。
@@ -552,18 +574,24 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
     let snapshots = crate::project::snapshots(pool).await?;
     let mut project_styles = Vec::new();
     let mut project_assets = Vec::new();
-    let mut project_typst: HashMap<String, (HashMap<String, Vec<u8>>, String)> = HashMap::new();
+    let mut project_typst: HashMap<String, (render::ProjectFiles, String)> = HashMap::new();
     let mut project_links = Vec::new();
     /// 项目 slug -> 图标 URL（/项目/<slug>/icon.svg）。
     let mut project_icons: HashMap<String, String> = HashMap::new();
     let mut seen_slugs: HashSet<String> = contents.iter().map(|item| item.slug.clone()).collect();
 
     for snapshot in &snapshots {
-        let files_map: HashMap<String, Vec<u8>> = snapshot
-            .files
-            .iter()
-            .map(|(path, data)| (path.clone(), data.clone()))
-            .collect();
+        // 每个文件的内容在这里复制**一次**，之后所有引用同一份 Bytes；
+        // 同项目下的多个页面共享同一个 Arc，不再各自复制整份快照。
+        let files_map: render::ProjectFiles = std::sync::Arc::new(
+            snapshot
+                .files
+                .iter()
+                .map(|(path, data)| {
+                    (path.clone(), typst::foundations::Bytes::new(data.clone()))
+                })
+                .collect(),
+        );
         // 项目图标：优先用仓库根目录的自定义 SVG，否则按项目名生成字母图标。
         // 输出成固定的 icon.svg，供项目页面 <link rel="icon"> 使用。
         let icon_href = format!(
@@ -633,13 +661,14 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
                         slug: slug.clone(),
                         format: format.as_str().to_string(),
                         body,
+                        head: String::new(),
                         published: true,
                         created_at: snapshot.committed_at,
                         updated_at: snapshot.committed_at,
                         rev_seq: 0,
                     });
                     if format == ContentFormat::Typst {
-                        project_typst.insert(slug, (files_map.clone(), path.clone()));
+                        project_typst.insert(slug, (std::sync::Arc::clone(&files_map), path.clone()));
                     }
                 }
                 None => {
@@ -735,9 +764,14 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
             let cache_key = match content.format() {
                 ContentFormat::Typst => match project {
                     Some((files, main_path)) => {
-                        Some(cache.key_typst(&body, main_path, files, &root_hash))
+                        Some(cache.key_typst(&body, main_path, &render::files_digest(files), &root_hash))
                     }
-                    None => Some(cache.key_typst(&body, "main.typ", &HashMap::new(), &root_hash)),
+                    None => Some(cache.key_typst(
+                        &body,
+                        "main.typ",
+                        &render::files_digest(&std::sync::Arc::new(HashMap::new())),
+                        &root_hash,
+                    )),
                 },
                 ContentFormat::Wikidot => Some(cache.key_wikidot(&body, &includes)),
                 _ => None,
@@ -753,6 +787,7 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
                             &ctx,
                             files,
                             main_path,
+                            &project_asset_base(&content.slug),
                         ),
                         None => render::render_doc(content.format(), &body, &root, &ctx),
                     };
@@ -788,6 +823,7 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
                 tree: tree_html,
                 styles,
                 icon,
+                head: content.head.clone(),
             };
             let html = match template.render() {
                 Ok(value) => value,
@@ -837,6 +873,7 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
             tree: tree_html.clone(),
             styles: Vec::new(),
             icon: String::new(),
+            head: String::new(),
         }
         .render()?;
         pages.push(BuiltPage {
@@ -872,6 +909,7 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
                 tree: tree_html.clone(),
                 styles: Vec::new(),
                 icon: String::new(),
+                head: String::new(),
             }
             .render()?,
         )
@@ -1073,7 +1111,13 @@ pub async fn run_one(
     let cache_key = match content.format() {
         ContentFormat::Typst => {
             let root_hash = crate::render_cache::root_snapshot(&cfg.content_root);
-            Some(cache.key_typst(&body, "main.typ", &HashMap::new(), &root_hash))
+            // 单页构建不加载项目文件，摘要按空集合算。
+            Some(cache.key_typst(
+                &body,
+                "main.typ",
+                &render::files_digest(&std::sync::Arc::new(HashMap::new())),
+                &root_hash,
+            ))
         }
         ContentFormat::Wikidot => Some(cache.key_wikidot(&body, &wikidot_includes)),
         _ => None,
@@ -1104,6 +1148,7 @@ pub async fn run_one(
         tree: tree_html,
         styles,
         icon: String::new(),
+        head: content.head.clone(),
     }
     .render()?;
 
@@ -1125,7 +1170,7 @@ pub async fn run_one(
         std::fs::create_dir_all(parent)?;
         make_parent_dirs_public(out, parent)?;
     }
-    std::fs::write(&target, html)?;
+    std::fs::write(&target, &html)?;
     make_public(&target, false)?;
     if let Some(pdf) = rendered.pdf {
         let pdf_target = safe_output_path(out, &pdf_path(&content.slug))?;
@@ -1256,6 +1301,7 @@ mod tests {
             tree: tree.clone(),
             styles: Vec::new(),
             icon: String::new(),
+            head: String::new(),
         };
         let html = index.render().unwrap();
         assert!(html.contains("第一篇"));
@@ -1271,6 +1317,7 @@ mod tests {
             tree,
             styles: Vec::new(),
             icon: String::new(),
+            head: String::new(),
         };
         let html = page.render().unwrap();
         assert!(html.contains("<p>正文</p>"));
@@ -1290,6 +1337,7 @@ mod tests {
             tree: tree.clone(),
             styles: Vec::new(),
             icon: String::new(),
+            head: String::new(),
         };
         let plain = index.render().unwrap();
         assert!(
@@ -1309,6 +1357,7 @@ mod tests {
             tree,
             styles: Vec::new(),
             icon: String::new(),
+            head: String::new(),
         };
         let html = page.render().unwrap();
         assert!(html.contains("京ICP备12345678号-1"));
@@ -1337,6 +1386,7 @@ mod tests {
             slug: slug.to_string(),
             format: "markdown".into(),
             body: String::new(),
+            head: String::new(),
             published: true,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),

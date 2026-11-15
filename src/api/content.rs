@@ -4,20 +4,81 @@ use super::*;
 pub(crate) async fn contents(
     State(state): State<AppState>,
     session: Session,
+    Query(query): Query<ContentsQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     current_user(&state, &session).await?;
-    let items: Vec<serde_json::Value> = service::list_contents(&state.pool)
+    if !query.wants_summary() {
+        // 兼容旧调用：完整列表（含正文）。
+        let items: Vec<serde_json::Value> = service::list_contents(&state.pool)
+            .await?
+            .into_iter()
+            .map(|content| {
+                let mut value = json!(content);
+                if let Some(object) = value.as_object_mut() {
+                    object.insert("filename".to_string(), json!(content.filename()));
+                }
+                value
+            })
+            .collect();
+        return Ok(Json(json!({ "items": items })));
+    }
+    let limit = query.limit.unwrap_or(100);
+    let offset = query.offset.unwrap_or(0);
+    let items = service::list_content_summaries(&state.pool, limit, offset).await?;
+    let total = service::count_contents(&state.pool).await?;
+    Ok(Json(json!({ "items": items, "total": total })))
+}
+
+/// 通用列表分页参数：默认 100 条，上限 500。
+#[derive(Deserialize)]
+pub(crate) struct PageQuery {
+    #[serde(default)]
+    limit: Option<i64>,
+    #[serde(default)]
+    offset: Option<i64>,
+}
+
+impl PageQuery {
+    pub(crate) fn limit(&self) -> i64 {
+        self.limit.unwrap_or(100)
+    }
+
+    pub(crate) fn offset(&self) -> i64 {
+        self.offset.unwrap_or(0)
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ContentsQuery {
+    /// 只有摘要（不含正文与 head），并配合 limit/offset 分页。
+    ///
+    /// 用字符串而非 bool：`?summary=1` 是最常见的写法，而 serde 的 bool
+    /// 只认 `true`/`false`，直接写 bool 会让 `summary=1` 整个请求 400。
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    limit: Option<i64>,
+    #[serde(default)]
+    offset: Option<i64>,
+}
+
+impl ContentsQuery {
+    fn wants_summary(&self) -> bool {
+        matches!(self.summary.as_deref(), Some("1") | Some("true") | Some("yes"))
+    }
+}
+
+/// 单条内容全文：列表只给摘要，编辑时按需取正文。
+pub(crate) async fn content_one(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current_user(&state, &session).await?;
+    let content = service::find_content_by_id(&state.pool, id)
         .await?
-        .into_iter()
-        .map(|content| {
-            let mut value = json!(content);
-            if let Some(object) = value.as_object_mut() {
-                object.insert("filename".to_string(), json!(content.filename()));
-            }
-            value
-        })
-        .collect();
-    Ok(Json(json!({ "items": items })))
+        .context("内容不存在")?;
+    Ok(Json(json!({ "item": content, "filename": content.filename() })))
 }
 
 #[derive(Deserialize)]
@@ -34,6 +95,11 @@ pub(crate) struct ContentRequest {
     slug: String,
     format: String,
     body: String,
+    /// 页面自定义 <head> 内容。仅对能渲染成 HTML 的格式生效，管理员可写。
+    /// 缺省（`None`）表示「不修改」，保留库里的旧值——这样旧客户端
+    /// 或只改正文的保存不会把已配置的 meta/link/script 清空。
+    #[serde(default)]
+    head: Option<String>,
     #[serde(default)]
     published: bool,
     /// 可选的版本说明，落入精简版历史；缺省为空。
@@ -100,6 +166,13 @@ pub(crate) async fn save_content(
     //   /eoe/index.md -> eoe/index.html
     // 同一路径只有一条记录，因此 .html/.md/.typ 天然互斥。
     let (slug, format) = service::normalize_content_path(&req.slug, format)?;
+    // 自定义 head 只对会产出 HTML 页面的格式有意义；css/svg 显式置空，
+    // 免得内容作者以为写了会生效。未提供该字段时保持 None（不修改）。
+    let head: Option<String> = match req.head.as_deref() {
+        Some(raw) if format.renders_html() => Some(validate_page_head(raw)?),
+        Some(_) => Some(String::new()),
+        None => None,
+    };
     if format == crate::models::ContentFormat::Svg {
         crate::svg::validate_svg(req.body.as_bytes())?;
     }
@@ -124,6 +197,7 @@ pub(crate) async fn save_content(
             &slug,
             format.as_str(),
             &req.body,
+            head.as_deref(),
             req.published,
             user.id,
             req.message.trim(),
@@ -135,6 +209,7 @@ pub(crate) async fn save_content(
             &slug,
             format.as_str(),
             &req.body,
+            head.as_deref(),
             req.published,
             user.id,
             req.message.trim(),
@@ -186,6 +261,7 @@ pub(crate) async fn content_revisions(
     State(state): State<AppState>,
     session: Session,
     Path(id): Path<Uuid>,
+    Query(page): Query<PageQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     current_user(&state, &session).await?;
     let rev_seq: i32 = sqlx::query_scalar("SELECT rev_seq FROM contents WHERE id = $1")
@@ -193,8 +269,9 @@ pub(crate) async fn content_revisions(
         .fetch_optional(&state.pool)
         .await?
         .ok_or_else(|| ApiError::with_status(StatusCode::NOT_FOUND, "内容不存在"))?;
-    let items: Vec<serde_json::Value> = crate::history::list_revisions(&state.pool, id)
-        .await?
+    let items: Vec<serde_json::Value> =
+        crate::history::list_revisions(&state.pool, id, page.limit(), page.offset())
+            .await?
         .into_iter()
         .map(|revision| {
             let mut value = json!(revision);
@@ -260,4 +337,24 @@ pub(crate) async fn content_revision_revert(
         ));
     }
     Ok(Json(json!({ "item": content })))
+}
+
+/// 校验并规整页面自定义 <head> 内容。
+///
+/// 这段内容是管理员手写的原始 HTML，原样注入模板，因此只需挡住会破坏
+/// 文档结构的情况：出现 `</head>` 闭合标签、或整体长度失控。
+fn validate_page_head(raw: &str) -> anyhow::Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    if trimmed.to_ascii_lowercase().contains("</head") {
+        anyhow::bail!("自定义 head 里不能出现 </head> 闭合标签");
+    }
+    // 32 KiB 足够放 meta / link / script，再大基本是误操作。
+    const MAX_HEAD_BYTES: usize = 32 * 1024;
+    if trimmed.len() > MAX_HEAD_BYTES {
+        anyhow::bail!("自定义 head 超过 {} KiB 上限", MAX_HEAD_BYTES / 1024);
+    }
+    Ok(trimmed.to_string())
 }

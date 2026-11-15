@@ -46,6 +46,10 @@ pub struct WorkflowConfig {
     pub snapshot_cache: PathBuf,
     pub max_snapshot_bytes: u64,
     pub max_log_bytes: u64,
+    /// 快照缓存的保留时长：超期文件由后台清理删除。
+    pub snapshot_retention_secs: u64,
+    /// 工作流日志的保留时长。
+    pub log_retention_secs: u64,
     pub lfs_root: PathBuf,
     #[allow(dead_code)]
     pub build_out_dir: PathBuf,
@@ -74,6 +78,9 @@ impl WorkflowConfig {
             )),
             max_snapshot_bytes: n("MAX_SNAPSHOT_BYTES", 209_715_200u64),
             max_log_bytes: n("MAX_LOG_BYTES", 8_388_608u64),
+            // 默认 7 天 / 30 天：过期 run 早已结束，留着的快照与日志只是占盘。
+            snapshot_retention_secs: n("SNAPSHOT_RETENTION_SECS", 7 * 24 * 3600u64),
+            log_retention_secs: n("LOG_RETENTION_SECS", 30 * 24 * 3600u64),
             lfs_root: PathBuf::from(s("LFS_ROOT", "lfs")),
             build_out_dir: PathBuf::from(s("BUILD_OUT_DIR", "dist")),
         }

@@ -290,6 +290,9 @@ impl KychMcp {
             &slug,
             format.as_str(),
             &params.body,
+            // MCP 写入不碰自定义 head：传 None 表示保留库里的值，
+            // 避免 MCP 改一次正文就把管理端配的 meta/link/script 清空。
+            None,
             params.published,
             author_id,
             "",

@@ -12,7 +12,9 @@ use std::convert::Infallible;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use sha2::{Digest, Sha256};
 use typst::diag::{FileError, FileResult};
+use std::sync::{Arc, OnceLock};
 use typst::foundations::{Bytes, Datetime};
 use typst::LibraryExt;
 use typst_html::HtmlDocument;
@@ -23,6 +25,29 @@ use typst::utils::LazyHash;
 use typst::{Feature, Library, World};
 
 use crate::models::ContentFormat;
+
+/// 一个项目的文件快照：路径 → 内容。
+///
+/// 用 `Arc` + `Bytes` 两层共享：同一项目下所有页面复用同一份快照，
+/// 每个文件的内容也不在页面之间复制（`Bytes` 克隆只是引用计数）。
+pub type ProjectFiles = Arc<HashMap<String, Bytes>>;
+
+/// 计算文件快照的内容摘要（路径 + 内容），供渲染缓存键复用。
+///
+/// 之前每个页面在查缓存前都要对全项目文件排序并逐字节哈希一遍；
+/// 一个项目几十个页面就是几十次重复计算。改为每个项目算一次。
+pub fn files_digest(files: &ProjectFiles) -> String {
+    let mut paths: Vec<&String> = files.keys().collect();
+    paths.sort();
+    let mut h = Sha256::new();
+    for path in paths {
+        h.update(path.as_bytes());
+        h.update(b"\0");
+        h.update(&files[path]);
+        h.update(b"\0");
+    }
+    hex::encode(h.finalize())
+}
 
 pub struct Rendered {
     pub html: String,
@@ -62,7 +87,7 @@ pub fn render_doc(
     root: &Path,
     ctx: &DocContext,
 ) -> Result<Rendered> {
-    render_doc_with_project(format, body, root, ctx, &HashMap::new(), "main.typ")
+    render_doc_with_project(format, body, root, ctx, &Arc::new(HashMap::new()), "main.typ", "")
 }
 
 /// 渲染项目文件。`files` 是项目根下的完整文件快照，Typst 的相对 include
@@ -72,8 +97,11 @@ pub fn render_doc_with_project(
     body: &str,
     root: &Path,
     ctx: &DocContext,
-    files: &HashMap<String, Vec<u8>>,
+    files: &ProjectFiles,
     main_path: &str,
+    // 项目在站点里的 URL 基址（如 `/项目/地狱之下`）；空串表示非项目页。
+    // Typst 内嵌图片若能在项目文件里找到同内容文件，就引用它而不是另存。
+    asset_base: &str,
 ) -> Result<Rendered> {
     match format {
         ContentFormat::Markdown => Ok(Rendered {
@@ -84,7 +112,7 @@ pub fn render_doc_with_project(
             html: body.to_string(),
             pdf: None,
         }),
-        ContentFormat::Typst => render_typst(body, root, files, main_path),
+        ContentFormat::Typst => render_typst(body, root, files, main_path, asset_base),
         ContentFormat::Wikidot => render_wikidot(body, ctx),
         // SVG 是原样输出的静态资源，不套 HTML 模板。
         ContentFormat::Svg => Ok(Rendered {
@@ -199,17 +227,49 @@ fn render_markdown(body: &str) -> String {
     output
 }
 
+/// 所有文档共用的 Typst 环境：字体索引 + Library。
+///
+/// 之前每渲染一篇文档都要遍历全部内置字体建一次 `FontBook`、再建一次
+/// `Library`。这些内容与文档无关，进程内建一次即可——站点有几十个 Typst
+/// 页面时，这部分是纯重复开销。
+struct TypstEnv {
+    book: LazyHash<FontBook>,
+    fonts: Vec<Font>,
+    library: LazyHash<Library>,
+}
+
+fn typst_env() -> &'static TypstEnv {
+    static ENV: OnceLock<TypstEnv> = OnceLock::new();
+    ENV.get_or_init(|| {
+        let mut book = FontBook::new();
+        let mut fonts = Vec::new();
+        for data in typst_assets::fonts() {
+            let bytes = Bytes::new(data);
+            for font in Font::iter(bytes) {
+                book.push(font.info().clone());
+                fonts.push(font);
+            }
+        }
+        let library = Library::builder()
+            .with_features(std::iter::once(Feature::Html).collect())
+            .build();
+        TypstEnv {
+            book: LazyHash::new(book),
+            fonts,
+            library: LazyHash::new(library),
+        }
+    })
+}
+
 struct TypstWorld {
     root: PathBuf,
     /// `@preview/...` 外部包缓存根目录；结构为 <namespace>/<name>/<version>/。
     package_root: PathBuf,
     main: FileId,
     source: Source,
-    /// 项目仓库文件，key 是相对项目根的路径。
-    files: HashMap<String, Vec<u8>>,
-    book: LazyHash<FontBook>,
-    fonts: Vec<Font>,
-    library: LazyHash<Library>,
+    /// 项目仓库文件，key 是相对项目根的路径。与同项目的其他页面共享。
+    files: ProjectFiles,
+    env: &'static TypstEnv,
 }
 
 impl TypstWorld {
@@ -217,7 +277,7 @@ impl TypstWorld {
         body: &str,
         root: &Path,
         main_path: &str,
-        files: &HashMap<String, Vec<u8>>,
+        files: &ProjectFiles,
     ) -> Self {
         let main = FileId::new(RootedPath::new(
             VirtualRoot::Project,
@@ -228,34 +288,18 @@ impl TypstWorld {
             .map(PathBuf::from)
             .unwrap_or_else(|| root.join("typst-packages"));
 
-        let mut book = FontBook::new();
-        let mut fonts = Vec::new();
-        for data in typst_assets::fonts() {
-            let bytes = Bytes::new(data);
-            for font in Font::iter(bytes) {
-                book.push(font.info().clone());
-                fonts.push(font);
-            }
-        }
-
-        let library = Library::builder()
-            .with_features(std::iter::once(Feature::Html).collect())
-            .build();
-
         Self {
             root: root.to_path_buf(),
             package_root,
             main,
             source,
-            files: files.clone(),
-            book: LazyHash::new(book),
-            fonts,
-            library: LazyHash::new(library),
+            files: Arc::clone(files),
+            env: typst_env(),
         }
     }
 
     /// 项目仓库文件优先于磁盘内容目录。
-    fn memory_file(&self, id: FileId) -> Option<&Vec<u8>> {
+    fn memory_file(&self, id: FileId) -> Option<&Bytes> {
         // 包文件不能落到项目仓库的同名路径上（例如 typst.toml）。
         if matches!(id.root(), VirtualRoot::Package(_)) {
             return None;
@@ -427,11 +471,11 @@ impl TypstWorld {
 
 impl World for TypstWorld {
     fn library(&self) -> &LazyHash<Library> {
-        &self.library
+        &self.env.library
     }
 
     fn book(&self) -> &LazyHash<FontBook> {
-        &self.book
+        &self.env.book
     }
 
     fn main(&self) -> FileId {
@@ -462,7 +506,8 @@ impl World for TypstWorld {
             return Ok(Bytes::new(self.source.text().as_bytes().to_vec()));
         }
         if let Some(data) = self.memory_file(id) {
-            return Ok(Bytes::new(data.to_vec()));
+            // Bytes 克隆是引用计数，不再复制文件内容。
+            return Ok(data.clone());
         }
         let path = if matches!(id.root(), VirtualRoot::Package(_)) {
             self.package_path(id)?
@@ -474,7 +519,7 @@ impl World for TypstWorld {
     }
 
     fn font(&self, index: usize) -> Option<Font> {
-        self.fonts.get(index).cloned()
+        self.env.fonts.get(index).cloned()
     }
 
     fn today(&self, _offset: Option<typst::foundations::Duration>) -> Option<Datetime> {
@@ -485,8 +530,9 @@ impl World for TypstWorld {
 fn render_typst(
     body: &str,
     root: &Path,
-    files: &HashMap<String, Vec<u8>>,
+    files: &ProjectFiles,
     main_path: &str,
+    asset_base: &str,
 ) -> Result<Rendered> {
     let world = TypstWorld::new(body, root, main_path, files);
 
@@ -496,9 +542,13 @@ fn render_typst(
     let pdf = typst_pdf::pdf(&paged, &typst_pdf::PdfOptions::default())
         .map_err(|errors| anyhow::anyhow!("Typst PDF 导出失败: {:?}", errors))?;
 
-    let html_doc = typst::compile::<HtmlDocument>(&world)
+    let mut html_doc = typst::compile::<HtmlDocument>(&world)
         .output
         .map_err(|errors| anyhow::anyhow!("Typst HTML 编译失败: {errors:?}"))?;
+    // 在序列化之前把 `image` 元素内嵌的 data URI 换回项目里的原路径。
+    // Typst 的导出规则（IMAGE_RULE）无条件调 `to_base64_url()`，且
+    // HtmlOptions 没有开关；直接在 DOM 上改属性比事后扫字符串更可靠。
+    rewrite_dom_images(html_doc.root_mut(), files, asset_base);
     let full = typst_html::html(&html_doc, &typst_html::HtmlOptions::default())
         .map_err(|errors| anyhow::anyhow!("Typst HTML 导出失败: {:?}", errors))?;
 
@@ -533,6 +583,7 @@ fn extract_typst_fragment(full: &str) -> String {
     out.push_str(&full[body_start..body_end]);
     out
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -599,7 +650,7 @@ mod tests {
         symlink(base.join("secret.txt"), content.join("link.txt")).expect("创建符号链接");
         std::fs::write(content.join("normal.txt"), "fine").expect("写入普通文件");
 
-        let world = TypstWorld::new("", &content, "main.typ", &HashMap::new());
+        let world = TypstWorld::new("", &content, "main.typ", &Arc::new(HashMap::new()));
         // 普通文件仍然可以解析。
         let ok = world.path_for(FileId::new(RootedPath::new(VirtualRoot::Project, VirtualPath::new("normal.txt").unwrap())));
         assert!(ok.is_ok(), "普通文件应通过: {ok:?}");
@@ -613,3 +664,91 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 }
+
+/// 遍历 Typst 的 HTML DOM，把 `<img src="data:image/...">` 换回**项目里原有的图片路径**。
+///
+/// Typst 导出 HTML 时会把 `#image("图片/x.svg")` 内嵌成 Base64。这里的做法是：
+/// 解码 data URI → 按内容哈希在项目文件里反查原始路径 → `src` 直接指向
+/// `${asset_base}/图片/x.svg`。这样 HTML 引用的就是原文档引用的那张图，
+/// 不需要额外落盘，也不会出现 media-* 这种重复副本。
+///
+/// 反查不到的（Typst 运行时绘制出来的图形）才落成 `media-<hash>.<ext>`，
+/// 作为返回值交给调用方写盘。
+fn rewrite_dom_images(
+    root: &mut typst_html::HtmlElement,
+    files: &ProjectFiles,
+    asset_base: &str,
+) {
+    // 内容哈希 → 项目内路径。项目文件通常只有几十到几百个，一次建表足够便宜。
+    let mut by_digest: HashMap<[u8; 32], String> = HashMap::with_capacity(files.len());
+    for (path, data) in files.iter() {
+        by_digest.entry(Sha256::digest(data).into()).or_insert_with(|| path.clone());
+    }
+    visit_html_element(root, &by_digest, asset_base);
+}
+
+fn visit_html_element(
+    elem: &mut typst_html::HtmlElement,
+    by_digest: &HashMap<[u8; 32], String>,
+    asset_base: &str,
+) {
+    if elem.tag == typst_html::tag::img {
+        if let Some(src) = elem.attrs.get(typst_html::attr::src).cloned() {
+            if let Some((mime, bytes)) = decode_data_uri(&src) {
+                let digest: [u8; 32] = Sha256::digest(&bytes).into();
+                // 一律改回项目里的原路径；找不到就不动（保留原内嵌数据），
+                // 不再另存 media-* 副本——那等于给项目复制一份图片。
+                let Some(path) = by_digest.get(&digest) else {
+                    return;
+                };
+                if path.is_empty() {
+                    return;
+                }
+                let replacement = if asset_base.is_empty() {
+                    path.clone()
+                } else {
+                    format!("{asset_base}/{path}")
+                };
+                if let Some(slot) = elem.attrs.get_mut(typst_html::attr::src) {
+                    *slot = replacement.into();
+                }
+                return;
+            }
+        }
+    }
+    for child in elem.children.make_mut().iter_mut() {
+        if let typst_html::HtmlNode::Element(inner) = child {
+            visit_html_element(inner, by_digest, asset_base);
+        }
+    }
+}
+
+/// 解析 `data:image/<mime>;base64,<payload>`，返回 (mime, 解码后的字节)。
+fn decode_data_uri(src: &str) -> Option<(String, Vec<u8>)> {
+    use base64::Engine as _;
+
+    let rest = src.strip_prefix("data:")?;
+    let comma = rest.find(',')?;
+    let meta = &rest[..comma];
+    let mime = meta.strip_suffix(";base64")?.to_string();
+    if !mime.starts_with("image/") {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&rest[comma + 1..])
+        .ok()?;
+    Some((mime, bytes))
+}
+
+fn mime_ext(mime: &str) -> &'static str {
+    match mime {
+        "image/svg+xml" => "svg",
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        _ => "bin",
+    }
+}
+
+

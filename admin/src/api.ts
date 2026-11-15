@@ -65,11 +65,25 @@ export type Content = {
   slug: string;
   format: ContentFormat;
   body: string;
+  /** 页面自定义 <head>：仅管理员可写，只对会产出 HTML 的格式生效。 */
+  head: string;
   published: boolean;
   created_at: string;
   updated_at: string;
   /** 当前版本指针：指向 content_revisions 里正在展示的版本。 */
   rev_seq: number;
+};
+
+/// 列表摘要：不含正文与 head。打开编辑器时再取全文。
+export type ContentSummary = {
+  id: string;
+  slug: string;
+  format: ContentFormat;
+  published: boolean;
+  created_at: string;
+  updated_at: string;
+  rev_seq: number;
+  size: number;
 };
 
 export type ContentRevision = {
@@ -163,6 +177,62 @@ export type GitSshKey = {
   public_key: string;
   created_at: string;
   last_used_at: string | null;
+};
+
+/** 轻量标签或附注标签；oid 始终是最终指向的 commit。 */
+export type TagInfo = {
+  name: string;
+  oid: string;
+  tag_oid: string | null;
+  message: string;
+  author_name: string;
+  created_at: string;
+};
+
+/** 编辑器工作区一次拉取的引用概览。 */
+export type ProjectRefs = {
+  branches: string[];
+  tags: TagInfo[];
+  default_branch: string;
+  ref: string;
+  head: string | null;
+};
+
+export type MergeResult = {
+  commit: string;
+  fast_forward: boolean;
+  already_up_to_date: boolean;
+};
+
+export type ResetResult = {
+  commit: string;
+  previous: string;
+};
+
+export type FileHistoryEntry = {
+  oid: string;
+  author_name: string;
+  message: string;
+  committed_at: string;
+  change: "add" | "modify" | "delete";
+  old_oid: string | null;
+  new_oid: string | null;
+};
+
+export type BlameLine = {
+  line: number;
+  commit: string;
+  author_name: string;
+  message: string;
+  committed_at: string;
+  text: string;
+};
+
+export type BlameResult = {
+  path: string;
+  oid: string;
+  truncated: boolean;
+  lines: BlameLine[];
 };
 
 
@@ -308,21 +378,33 @@ export function avatarUrl(id: string, version?: number): string {
 }
 
 /** 公开的 Git 仓库地址；项目名按 URL 段编码。 */
+/// 同域部署时 API_BASE 为空，克隆地址必须回到当前页面的 origin，
+/// 否则界面上只会显示 `/git/xxx.git` 这样的路径，无法直接使用。
+function siteOrigin(): string {
+  if (API_BASE) return API_BASE;
+  if (typeof window !== "undefined") return window.location.origin;
+  return "";
+}
+
 export function gitUrl(slug: string): string {
   // Git 用 URL 最后一段作为默认克隆目录名；这里保留原始 UTF-8 项目名，
   // 否则中文项目会被克隆成 %E5%... 目录。服务端本来就会解码路径。
-  return `${API_BASE}/git/${slug}.git`;
+  return `${siteOrigin()}/git/${slug}.git`;
 }
 
-/** Git over SSH 地址；端口固定 2222，host 跟随 API 基址。 */
+/** Git over SSH 地址；端口固定 2222，host 跟随 API 基址（同域则用当前域名）。 */
 export function sshGitUrl(slug: string): string {
-  let host = "kych.net";
-  if (API_BASE) {
+  const origin = siteOrigin();
+  let host = "";
+  if (origin) {
     try {
-      host = new URL(API_BASE).host;
+      host = new URL(origin).hostname;
     } catch {
-      // 配置异常时保留默认站名，至少地址可读。
+      // 配置异常时下面回退到当前域名。
     }
+  }
+  if (!host && typeof window !== "undefined") {
+    host = window.location.hostname;
   }
   return `ssh://git@${host}:2222/${slug}.git`;
 }
@@ -432,11 +514,19 @@ export const api = {
     }),
 
   contents: () => request<{ items: Content[] }>("/contents"),
+  /// 摘要列表（分页）。列表页优先用这个，避免一次拉取全部正文。
+  contentSummaries: (limit = 100, offset = 0) =>
+    request<{ items: ContentSummary[]; total: number }>(
+      `/contents?summary=1&limit=${limit}&offset=${offset}`,
+    ),
+  /// 单条全文。
+  content: (id: string) => request<{ item: Content }>(`/contents/${id}`),
   saveContent: (payload: {
     id?: string;
     slug: string;
     format: ContentFormat;
     body: string;
+    head?: string;
     published: boolean;
     message?: string;
   }) =>
@@ -511,7 +601,7 @@ export const api = {
       },
     ),
   project: (id: string) =>
-    request<{ item: Project; branches: string[] }>(`/projects/${id}`),
+    request<{ item: Project; branches: string[]; tags: TagInfo[] }>(`/projects/${id}`),
   updateProject: (id: string, payload: { description?: string; archived?: boolean }) =>
     request<{ item: Project }>(`/projects/${id}`, {
       method: "PATCH",
@@ -593,6 +683,55 @@ export const api = {
     request<{ branches: string[] }>(
       `/projects/${id}/branches/${encodeURIComponent(name)}`,
       { method: "DELETE" },
+    ),
+
+  /** 一次性取分支、标签、默认分支与当前 ref 的 commit OID。 */
+  projectRefs: (id: string, ref?: string) =>
+    request<ProjectRefs>(
+      `/projects/${id}/refs${ref ? `?ref=${encodeURIComponent(ref)}` : ""}`,
+    ),
+  projectTags: (id: string) =>
+    request<{ items: TagInfo[] }>(`/projects/${id}/tags`),
+  createProjectTag: (
+    id: string,
+    payload: { name: string; ref?: string; message?: string },
+  ) =>
+    request<{ item: TagInfo }>(`/projects/${id}/tags`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  deleteProjectTag: (id: string, name: string) =>
+    request<{ items: TagInfo[] }>(
+      `/projects/${id}/tags/${encodeURIComponent(name)}`,
+      { method: "DELETE" },
+    ),
+  /** 直接合并分支（不经 PR）：快进或生成双亲 merge commit，冲突时报错。 */
+  mergeProjectBranches: (
+    id: string,
+    payload: { source: string; target?: string; message?: string },
+  ) =>
+    request<{ item: MergeResult }>(`/projects/${id}/merge`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  /** 把分支指针移动到某个提交；默认只允许退回当前历史。 */
+  resetProjectBranch: (
+    id: string,
+    payload: { ref: string; commit: string; force?: boolean },
+  ) =>
+    request<{ item: ResetResult }>(`/projects/${id}/reset`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  fileHistory: (id: string, ref: string, path: string, limit = 50) =>
+    request<{ items: FileHistoryEntry[] }>(
+      `/projects/${id}/file-history?ref=${encodeURIComponent(ref)}` +
+        `&path=${encodeURIComponent(path)}&limit=${limit}`,
+    ),
+  blame: (id: string, ref: string, path: string) =>
+    request<{ item: BlameResult }>(
+      `/projects/${id}/blame?ref=${encodeURIComponent(ref)}` +
+        `&path=${encodeURIComponent(path)}`,
     ),
 
   prs: (id: string) => request<{ items: PullRequest[] }>(`/projects/${id}/prs`),

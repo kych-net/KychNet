@@ -16,7 +16,7 @@ use crate::render::Rendered;
 
 /// 渲染逻辑或依赖引擎（typst/ftml）行为变化时手动递增，使旧缓存整体失效。
 /// 包版本也参与键计算，常规依赖升级随 Cargo.lock 自动失效。
-const CACHE_VERSION: &str = "1";
+const CACHE_VERSION: &str = "4"; // 4: Typst 环境改为进程级共享，键语义不变但需重建
 
 pub struct RenderCache {
     dir: PathBuf,
@@ -43,7 +43,8 @@ impl RenderCache {
         &self,
         body: &str,
         main_path: &str,
-        files: &HashMap<String, Vec<u8>>,
+        // 项目文件集的内容摘要，由 `render::files_digest` 每个项目算一次。
+        files_digest: &str,
         root_snapshot: &str,
     ) -> String {
         let mut h = Sha256::new();
@@ -53,14 +54,8 @@ impl RenderCache {
         h.update(body.as_bytes());
         h.update(b"\0");
         h.update(main_path.as_bytes());
-        let mut paths: Vec<&String> = files.keys().collect();
-        paths.sort();
-        for path in paths {
-            h.update(path.as_bytes());
-            h.update(b"\0");
-            h.update(&files[path]);
-            h.update(b"\0");
-        }
+        h.update(b"\0");
+        h.update(files_digest.as_bytes());
         h.update(root_snapshot.as_bytes());
         hex(&h.finalize())
     }
@@ -157,3 +152,4 @@ pub fn root_snapshot(root: &Path) -> String {
     }
     hex(&h.finalize())
 }
+

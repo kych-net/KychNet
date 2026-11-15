@@ -1,3 +1,4 @@
+use axum::body::Bytes;
 use anyhow::{bail, Context, Result};
 use sqlx::{PgConnection, PgPool};
 use std::collections::{HashMap, HashSet};
@@ -282,7 +283,11 @@ async fn collect_pack(
     filter_blob_none: bool,
     deepen: bool,
 ) -> Result<Vec<u8>> {
-    let direct: HashSet<Oid> = wants.iter().copied().collect();
+    // 每批 spawn_blocking 都要用到这三个集合，逐批 clone 是纯浪费；
+    // 包成 Arc 后只复制引用计数。
+    let exclude: Arc<HashSet<Oid>> = Arc::new(exclude.clone());
+    let shallow: Arc<HashSet<Oid>> = Arc::new(shallow.clone());
+    let direct: Arc<HashSet<Oid>> = Arc::new(wants.iter().copied().collect());
     let mut seen = HashSet::new();
     let mut stack: Vec<Oid> = wants.to_vec();
     let mut builder = proto::PackBuilder::new();
@@ -307,9 +312,9 @@ async fn collect_pack(
             continue;
         }
         let rows = store::get_objects_raw(conn, project_id, &fetch).await?;
-        let excluded = exclude.clone();
-        let shallow_set = shallow.clone();
-        let direct_set = direct.clone();
+        let excluded = Arc::clone(&exclude);
+        let shallow_set = Arc::clone(&shallow);
+        let direct_set = Arc::clone(&direct);
         let (next_builder, children) = tokio::task::spawn_blocking(
             move || -> Result<(proto::PackBuilder, Vec<Oid>)> {
                 let mut builder = builder;
@@ -398,16 +403,52 @@ async fn collect_pack(
 /// 只缓存「无 have / 无 shallow / 无 filter 的全量 clone」（见
 /// `pack_cache::key_for`）；ref 一变就由 `store::set_ref` / `delete_ref` 失效。
 async fn fetch_pack(
+    pool: &PgPool,
+    project: &Project,
+    request: &proto::UploadRequest,
+    exclude: &HashSet<Oid>,
+    shallow: &HashSet<Oid>,
+) -> Result<Arc<Bytes>> {
+    let key = pack_cache::key_for(project.id, request);
+    if let Some(hit) = key.as_ref().and_then(pack_cache::get) {
+        return Ok(hit);
+    }
+    // 同一 key 的并发 clone 只让一个去组包，其余等它填好缓存后直接复用。
+    let inflight_lock = match &key {
+        Some(key) => Some(pack_cache::inflight_lock(key)),
+        None => None,
+    };
+    let inflight_guard = match &inflight_lock {
+        Some(lock) => Some(lock.clone().lock_owned().await),
+        None => None,
+    };
+    // 等锁期间**不持有数据库连接**：连接池只有 10 个，多个客户端同时
+    // clone 同一仓库时，排在后面的请求不该把连接耗尽、让普通 API 饿死。
+    let mut conn = pool.acquire().await?;
+    // 拿到锁之后的所有路径（缓存复查命中、磁盘直发、现场组包）都要
+    // 走同一个收尾逻辑，否则锁表条目会随 wants 组合无限堆积。
+    let result = fetch_pack_locked(&mut conn, project, request, exclude, shallow, &key).await;
+    drop(inflight_guard);
+    if let (Some(key), Some(lock)) = (&key, &inflight_lock) {
+        pack_cache::release_inflight(key, lock);
+    }
+    result
+}
+
+/// `fetch_pack` 在持锁期间的实际工作：缓存复查 → 磁盘直发 → 现场组包。
+async fn fetch_pack_locked(
     conn: &mut PgConnection,
     project: &Project,
     request: &proto::UploadRequest,
     exclude: &HashSet<Oid>,
     shallow: &HashSet<Oid>,
-) -> Result<Arc<Vec<u8>>> {
-    let key = pack_cache::key_for(project.id, request);
+    key: &Option<pack_cache::CacheKey>,
+) -> Result<Arc<Bytes>> {
     if let Some(hit) = key.as_ref().and_then(pack_cache::get) {
+        // 等锁期间别人已经组好包了。
         return Ok(hit);
     }
+
     // 磁盘权威且有全量快照：pack 字节原样发出，跳过对象图遍历与组包。
     // key 为 Some 才代表「无 have / 无 shallow / 无 filter 的干净全量
     // clone」；增量 fetch 仍须走 want/have 协商，不能偷懒发全量 pack。
@@ -417,7 +458,7 @@ async fn fetch_pack(
                 let bytes = tokio::fs::read(&path)
                     .await
                     .with_context(|| format!("读取全量 pack 失败: {}", path.display()))?;
-                let pack = Arc::new(bytes);
+                let pack = Arc::new(Bytes::from(bytes));
                 if let Some(key) = key.clone() {
                     pack_cache::insert(key, pack.clone());
                 }
@@ -435,8 +476,8 @@ async fn fetch_pack(
         request.deepen.is_some(),
     )
     .await?;
-    let pack = Arc::new(pack);
-    if let Some(key) = key {
+    let pack = Arc::new(Bytes::from(pack));
+    if let Some(key) = key.clone() {
         pack_cache::insert(key, pack.clone());
     }
     Ok(pack)
@@ -496,9 +537,64 @@ pub(crate) async fn have_reachable(
                 fetch.push(oid);
             }
         }
-        let rows = store::get_objects(conn, project_id, &fetch).await?;
-        let mut found: HashMap<Oid, Object> = rows.into_iter().collect();
+        // 先只查类型：blob 只进 exclude 集合，正文用不上，
+        // 不必为它读整块数据再 zlib 解压。历史大的仓库这里省得最多。
+        let kinds = store::get_object_kinds(conn, project_id, &fetch).await?;
+        let needed: Vec<Oid> = fetch
+            .iter()
+            .filter(|oid| {
+                matches!(
+                    kinds.get(oid),
+                    Some(ObjectKind::Commit | ObjectKind::Tree | ObjectKind::Tag)
+                )
+            })
+            .copied()
+            .collect();
+        let mut found: HashMap<Oid, Object> = if needed.is_empty() {
+            HashMap::new()
+        } else {
+            store::get_objects(conn, project_id, &needed)
+                .await?
+                .into_iter()
+                .collect()
+        };
         for oid in fetch {
+            // 类型查不到（已 offload 到磁盘）时回退到完整读取。
+            let Some(kind) = kinds.get(&oid).copied() else {
+                if let Some(object) = store::get_object(conn, project_id, oid).await? {
+                    let kind = object.kind;
+                    match kind {
+                        ObjectKind::Commit => {
+                            stack.push(commit_tree(&object.data)?);
+                            if !client_shallow.contains(&oid) {
+                                stack.extend(super::object::commit_parents(&object.data)?);
+                            }
+                        }
+                        ObjectKind::Tree => {
+                            let tree = Tree::parse(&object.data)?;
+                            for entry in tree.entries.values() {
+                                match entry {
+                                    TreeEntry::Blob(oid) | TreeEntry::Dir(oid) => stack.push(*oid),
+                                    TreeEntry::Gitlink(_) => {}
+                                }
+                            }
+                        }
+                        ObjectKind::Tag => {
+                            if let Some(target) = tag_target(&object.data)? {
+                                stack.push(target);
+                            }
+                        }
+                        ObjectKind::Blob => {}
+                    }
+                    exclude.insert(oid);
+                }
+                continue;
+            };
+            if kind == ObjectKind::Blob {
+                // 正文不需要：直接排除，省掉一次读库 + 解压。
+                exclude.insert(oid);
+                continue;
+            }
             let Some(object) = found.remove(&oid) else {
                 continue;
             };
@@ -558,7 +654,17 @@ fn sideband_pack(data: &[u8]) -> Vec<u8> {
 }
 
 /// v0 upload-pack。
-pub async fn upload_pack(pool: &PgPool, project: &Project, body: &[u8]) -> Result<Vec<u8>> {
+/// upload_pack 的返回：协商头部与 pack 分开放，
+/// 让上层可以直接把 pack 作为 Bytes 写出，避免整块复制进响应缓冲。
+pub struct PackResponse {
+    pub head: Vec<u8>,
+    pub pack: Arc<Bytes>,
+    /// v2 的 packfile 段走 sideband 编码（每块带 pkt 头 + 通道号），
+    /// v0 直接裸发 pack。
+    pub sideband: bool,
+}
+
+pub async fn upload_pack(pool: &PgPool, project: &Project, body: &[u8]) -> Result<PackResponse> {
     let request = proto::parse_upload_request(body)?;
     upload_pack_request(pool, project, &request).await
 }
@@ -572,11 +678,11 @@ pub(crate) async fn upload_pack_request(
     pool: &PgPool,
     project: &Project,
     request: &proto::UploadRequest,
-) -> Result<Vec<u8>> {
+) -> Result<PackResponse> {
     let mut out = Vec::new();
     if request.wants.is_empty() {
         out.extend(proto::pkt_str("NAK\n"));
-        return Ok(out);
+        return Ok(PackResponse { head: out, pack: Arc::new(Bytes::new()), sideband: false });
     }
     let mut conn = pool.acquire().await?;
     let (common, exclude) =
@@ -606,11 +712,11 @@ pub(crate) async fn upload_pack_request(
     // "bad line length character: PACK"。
     if !request.done {
         if request.haves.is_empty() {
-            return Ok(out);
+            return Ok(PackResponse { head: out, pack: Arc::new(Bytes::new()), sideband: false });
         }
         if common.is_empty() {
             out.extend(proto::pkt_str("NAK\n"));
-            return Ok(out);
+            return Ok(PackResponse { head: out, pack: Arc::new(Bytes::new()), sideband: false });
         }
         for oid in &common {
             out.extend(proto::pkt_str(&format!("ACK {} common\n", oid.to_hex())));
@@ -618,17 +724,18 @@ pub(crate) async fn upload_pack_request(
         let last = common.last().expect("common 非空");
         out.extend(proto::pkt_str(&format!("ACK {} ready\n", last.to_hex())));
         out.extend(proto::pkt_str("NAK\n"));
-        return Ok(out);
+        return Ok(PackResponse { head: out, pack: Arc::new(Bytes::new()), sideband: false });
     }
 
-    // `done` 轮:ACK/NAK 后紧跟 packfile。
-    let pack = fetch_pack(&mut conn, project, request, &exclude, &shallow).await?;
+    // `done` 轮:ACK/NAK 后紧跟 packfile。先归还连接：fetch_pack 内部
+    // 要等 singleflight 锁，持有连接等待会让连接池被等待者占满。
+    drop(conn);
+    let pack = fetch_pack(pool, project, request, &exclude, &shallow).await?;
     match common.last() {
         Some(oid) => out.extend(proto::pkt_str(&format!("ACK {}\n", oid.to_hex()))),
         None => out.extend(proto::pkt_str("NAK\n")),
     }
-    out.extend_from_slice(&pack);
-    Ok(out)
+    Ok(PackResponse { head: out, pack, sideband: false })
 }
 
 /// v2 `ls-refs`。
@@ -697,7 +804,7 @@ async fn ls_refs(conn: &mut PgConnection, project: &Project, args: &[String]) ->
 }
 
 /// v2 `fetch`。
-async fn v2_fetch(conn: &mut PgConnection, project: &Project, args: &[String]) -> Result<Vec<u8>> {
+async fn v2_fetch(pool: &PgPool, project: &Project, args: &[String]) -> Result<PackResponse> {
     let mut request = proto::UploadRequest::default();
     for arg in args {
         if let Some(rest) = arg.strip_prefix("want ") {
@@ -728,27 +835,30 @@ async fn v2_fetch(conn: &mut PgConnection, project: &Project, args: &[String]) -
         out.extend(proto::pkt_str("acknowledgments\n"));
         out.extend(proto::pkt_str("NAK\n"));
         out.extend(proto::flush());
-        return Ok(out);
+        return Ok(PackResponse { head: out, pack: Arc::new(Bytes::new()), sideband: true });
     }
 
+    let mut conn = pool.acquire().await?;
     let (common, exclude) =
-        match have_reachable(conn, project.id, &request.haves, &request.shallow).await? {
+        match have_reachable(&mut conn, project.id, &request.haves, &request.shallow).await? {
             Some(value) => value,
             None => (vec![Oid::zero()], HashSet::new()),
         };
     let common_known = common.iter().any(|oid| !oid.is_zero());
     let (boundaries, unshallow, shallow) =
-        compute_shallow(conn, project.id, &request.wants, &request).await?;
+        compute_shallow(&mut conn, project.id, &request.wants, &request).await?;
+    // 协商阶段结束，连接先还回去：组包可能要等 singleflight 锁。
+    drop(conn);
 
     // 还没 done 又没有公共提交时只回复 NAK，让客户端继续协商。
     if !request.done && !common_known {
         out.extend(proto::pkt_str("acknowledgments\n"));
         out.extend(proto::pkt_str("NAK\n"));
         out.extend(proto::flush());
-        return Ok(out);
+        return Ok(PackResponse { head: out, pack: Arc::new(Bytes::new()), sideband: true });
     }
 
-    let pack = fetch_pack(conn, project, &request, &exclude, &shallow).await?;
+    let pack = fetch_pack(pool, project, &request, &exclude, &shallow).await?;
 
     // packfile 段：ready 与 done 两条路径共用（v2 规范要求 ready 之后
     // 必须紧跟 delim 并在同一响应里带上 shallow-info / packfile 段，
@@ -765,7 +875,6 @@ async fn v2_fetch(conn: &mut PgConnection, project: &Project, args: &[String]) -
             out.extend(proto::delim());
         }
         out.extend(proto::pkt_str("packfile\n"));
-        out.extend(sideband_pack(pack.as_slice()));
     };
 
     if !request.done {
@@ -780,27 +889,38 @@ async fn v2_fetch(conn: &mut PgConnection, project: &Project, args: &[String]) -
                 out.extend(proto::pkt_str("ready\n"));
                 out.extend(proto::delim());
                 pack_sections(&mut out);
-                return Ok(out);
+                return Ok(PackResponse { head: out, pack, sideband: true });
             }
         } else {
             out.extend(proto::pkt_str("NAK\n"));
         }
         out.extend(proto::flush());
-        return Ok(out);
+        return Ok(PackResponse { head: out, pack: Arc::new(Bytes::new()), sideband: true });
     }
 
     // done 之后不再回 acknowledgments；客户端已经在等 packfile 段。
     pack_sections(&mut out);
-    Ok(out)
+    Ok(PackResponse { head: out, pack, sideband: true })
 }
 
 /// v2 请求入口：根据 `command=` 分发。
-pub async fn upload_pack_v2(pool: &PgPool, project: &Project, body: &[u8]) -> Result<Vec<u8>> {
+pub async fn upload_pack_v2(
+    pool: &PgPool,
+    project: &Project,
+    body: &[u8],
+) -> Result<PackResponse> {
     let request = proto::parse_v2_request(body)?;
     let mut conn = pool.acquire().await?;
     match request.command.as_str() {
-        "ls-refs" => ls_refs(&mut conn, project, &request.args).await,
-        "fetch" => v2_fetch(&mut conn, project, &request.args).await,
+        "ls-refs" => Ok(PackResponse {
+            head: ls_refs(&mut conn, project, &request.args).await?,
+            pack: Arc::new(Bytes::new()),
+            sideband: false,
+        }),
+        "fetch" => {
+            drop(conn);
+            v2_fetch(pool, project, &request.args).await
+        }
         other => bail!("不支持的 protocol v2 命令: {other}"),
     }
 }

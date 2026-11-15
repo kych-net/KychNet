@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { marked } from "marked";
-import { api, Content, ContentFormat, editorPath } from "../api";
+import { api, Content, ContentFormat, ContentSummary, editorPath, sourcePath } from "../api";
 import { CodeEditor } from "../components/CodeEditor";
 import { DirTree } from "../components/DirTree";
 import { RevisionPanel } from "../components/RevisionPanel";
@@ -20,6 +20,13 @@ function formatLabel(format: ContentFormat): string {
     case "svg":
       return "SVG";
   }
+}
+
+/// 会产出 HTML 页面的格式才支持自定义 <head>；css / svg 是静态资源，没有页面结构。
+function rendersHtml(format: ContentFormat): boolean {
+  return (
+    format === "markdown" || format === "html" || format === "wikidot" || format === "typst"
+  );
 }
 
 function extensionFor(format: ContentFormat): string {
@@ -65,7 +72,7 @@ function previewDocument(html: string): string {
 }
 
 export function ContentsView() {
-  const [items, setItems] = useState<Content[]>([]);
+  const [items, setItems] = useState<ContentSummary[]>([]);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
 
@@ -73,6 +80,10 @@ export function ContentsView() {
   const [slug, setSlug] = useState("");
   const [format, setFormat] = useState<ContentFormat>("markdown");
   const [body, setBody] = useState("");
+  // 页面自定义 <head>：只有会产出 HTML 的格式才显示这个编辑区。
+  const [head, setHead] = useState("");
+  // 切换内容时的代际号：慢响应回来时若已切走就丢弃。
+  const editGeneration = useRef(0);
   const [published, setPublished] = useState(false);
   const [message, setMessage] = useState("");
   const [previewOn, setPreviewOn] = useState(true);
@@ -112,24 +123,34 @@ export function ContentsView() {
       return;
     }
     if (format === "html" || format === "markdown") {
-      try {
-        const source = stripPreviewHeader(body);
-        const html =
-          format === "html"
-            ? source
-            : (marked.parse(source, {
-                async: false,
-                gfm: true,
-                breaks: false,
-              }) as string);
-        setPreviewHtml(html);
-        setPreviewError("");
-      } catch (e) {
-        setPreviewHtml("");
-        setPreviewError((e as Error).message);
-      }
-      setPreviewLoading(false);
-      return;
+      // 长文档逐字符解析会拖慢输入：延迟一小段时间再渲染，
+      // 期间用户继续打字就取消上一次。
+      let cancelled = false;
+      const timer = window.setTimeout(() => {
+        if (cancelled) return;
+        try {
+          const source = stripPreviewHeader(body);
+          const html =
+            format === "html"
+              ? source
+              : (marked.parse(source, {
+                  async: false,
+                  gfm: true,
+                  breaks: false,
+                }) as string);
+          setPreviewHtml(html);
+          setPreviewError("");
+        } catch (e) {
+          setPreviewHtml("");
+          setPreviewError((e as Error).message);
+        }
+        setPreviewLoading(false);
+      }, 200);
+      setPreviewLoading(true);
+      return () => {
+        cancelled = true;
+        window.clearTimeout(timer);
+      };
     }
 
     // Wikidot 需要 ftml，继续走服务端预览，并做防抖。
@@ -163,7 +184,7 @@ export function ContentsView() {
 
   async function refresh() {
     try {
-      setItems((await api.contents()).items);
+      setItems((await api.contentSummaries()).items);
     } catch (e) {
       setError((e as Error).message);
     }
@@ -181,6 +202,7 @@ export function ContentsView() {
         slug,
         format,
         body,
+        head,
         published,
         message: message.trim() || undefined,
       });
@@ -211,13 +233,25 @@ export function ContentsView() {
     }
   }
 
-  function edit(item: Content) {
+  async function edit(item: ContentSummary) {
     setContentId(item.id);
-    setSlug(editorPath(item));
+    setSlug(sourcePath(item));
     setFormat(item.format);
-    setBody(item.body);
     setPublished(item.published);
     setMessage("");
+    // 列表只有摘要：正文与 head 在这里按需取。
+    // 用代际号防止慢响应覆盖用户已经切到的另一篇。
+    const generation = ++editGeneration.current;
+    try {
+      const { item: full } = await api.content(item.id);
+      if (editGeneration.current !== generation) return;
+      setBody(full.body);
+      setHead(full.head ?? "");
+      setSlug(editorPath(full));
+    } catch (error) {
+      if (editGeneration.current !== generation) return;
+      setError((error as Error).message);
+    }
   }
 
   function changeFormat(next: ContentFormat) {
@@ -225,7 +259,7 @@ export function ContentsView() {
     setSlug((current) => current.replace(/\.(html|md|typ|wj|svg)$/i, extensionFor(next)));
   }
 
-  function editFromTree(item: Content) {
+  function editFromTree(item: ContentSummary) {
     edit(item);
     // 从目录打开文件后回到编辑器视图。
     setMobilePane("editor");
@@ -237,6 +271,7 @@ export function ContentsView() {
     setSlug("");
     setFormat("markdown");
     setBody("");
+    setHead("");
     setPublished(false);
     setMessage("");
     setError("");
@@ -334,6 +369,27 @@ export function ContentsView() {
           <div className={`editor-workbench ${previewOn && previewSupported ? "with-preview" : ""}`}>
             <div className="editor-pane">
               <CodeEditor value={body} format={format} onChange={setBody} />
+              {rendersHtml(format) && (
+                <details className="head-editor" open={head.trim() !== ""}>
+                  <summary>
+                    页面 &lt;head&gt; 自定义
+                    <span className="hint">
+                      {head.trim() ? `已设置 ${head.trim().length} 字符` : "未设置"}
+                    </span>
+                  </summary>
+                  <p className="hint">
+                    原样注入到 &lt;/head&gt; 之前，可写 meta、link、script 等标签；
+                    只影响当前这一页。css / svg 类内容没有页面结构，不提供此项。
+                  </p>
+                  <textarea
+                    className="head-editor-input"
+                    value={head}
+                    spellCheck={false}
+                    placeholder={'<meta name="robots" content="noindex" />'}
+                    onChange={(event) => setHead(event.target.value)}
+                  />
+                </details>
+              )}
             </div>
             {previewOn && previewSupported && (
               <div className="preview-pane">
@@ -445,6 +501,7 @@ export function ContentsView() {
                 setSlug(editorPath(item));
                 setFormat(item.format);
                 setBody(item.body);
+                setHead(item.head ?? "");
                 setPublished(item.published);
                 setNotice(`已回滚到版本 ${item.rev_seq}`);
                 setHistoryKey((value) => value + 1);

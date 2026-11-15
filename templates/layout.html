@@ -244,6 +244,10 @@
         .dir-tree-toggle { padding: 0.4rem 0.5rem; }
       }
     </style>
+    {#- 内容页的自定义 <head>：管理员手写，原样注入，不做转义。 -#}
+    {% if !head.is_empty() %}
+    {{ head|safe }}
+    {% endif %}
   </head>
   <body>
     <header class="topbar">

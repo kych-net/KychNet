@@ -63,9 +63,10 @@ pub async fn list_for_project(
         return Ok((workflow_dir, project.default_branch, Vec::new()));
     };
     let prefix = format!("{}/", workflow_dir.trim_end_matches('/'));
-    let files = tree::read_files(&mut conn, project_id, head).await?;
+    // 只需要路径，不读文件内容。
+    let files = tree::list_paths(&mut conn, project_id, head).await?;
     let discovered: Vec<String> = files
-        .into_keys()
+        .into_iter()
         .filter(|path| {
             path.starts_with(&prefix)
                 && (path.ends_with(".yml") || path.ends_with(".yaml"))

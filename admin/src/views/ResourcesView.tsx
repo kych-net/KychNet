@@ -24,12 +24,16 @@ function fmtDuration(secs: number): string {
 /** 简单的用量条：超过 85% 变警示色。 */
 function UsageBar({ used, total }: { used: number; total: number }) {
   const percent = total > 0 ? Math.min(100, Math.round((used / total) * 100)) : 0;
+  // 数字必须放在条外面：.res-bar 只有 8px 高且 overflow:hidden，
+  // 文字塞进去会被裁掉，页面上只剩一条空条。
   return (
-    <div className="res-bar">
-      <div
-        className={percent >= 85 ? "res-bar-fill warn" : "res-bar-fill"}
-        style={{ width: `${percent}%` }}
-      />
+    <div className="res-usage">
+      <div className="res-bar">
+        <div
+          className={percent >= 85 ? "res-bar-fill warn" : "res-bar-fill"}
+          style={{ width: `${percent}%` }}
+        />
+      </div>
       <span className="res-bar-label">
         {percent}% · {fmtBytes(used)} / {fmtBytes(total)}
       </span>
@@ -47,9 +51,14 @@ export function ResourcesView() {
 
   useEffect(() => {
     let alive = true;
-    async function load() {
+    // 上一次结果的时间戳：标签页切回来时不必立刻重扫（后端那次统计要扫
+    // git_objects 与 LFS 目录），短时间内直接用现有数据。
+    let lastLoadedAt = 0;
+    async function load(force = false) {
+      if (!force && Date.now() - lastLoadedAt < POLL_MS / 2) return;
       try {
         const result = await api.systemResources();
+        lastLoadedAt = Date.now();
         if (alive) {
           setRes(result);
           setError("");
@@ -58,11 +67,21 @@ export function ResourcesView() {
         if (alive) setError((e as Error).message);
       }
     }
-    load();
-    const timer = window.setInterval(load, POLL_MS);
+    load(true);
+    const timer = window.setInterval(() => void load(), POLL_MS);
+    // 页面隐藏时停掉轮询：后台标签页没必要每 10 秒让服务器扫一遍磁盘。
+    const onVisible = () => {
+      if (document.hidden) {
+        window.clearInterval(timer);
+      } else {
+        void load();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisible);
     return () => {
       alive = false;
       window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisible);
     };
   }, []);
 

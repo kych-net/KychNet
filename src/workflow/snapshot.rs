@@ -68,6 +68,7 @@ pub async fn build_snapshot(state: &WorkflowState, run: &RunRef) -> Result<Snaps
         run.project_id,
         &run.commit_oid,
         &state.cfg.lfs_root,
+        state.cfg.max_snapshot_bytes,
     )
     .await
     .context("读取代码快照失败")?;
@@ -76,6 +77,7 @@ pub async fn build_snapshot(state: &WorkflowState, run: &RunRef) -> Result<Snaps
         run.project_id,
         &run.def_commit_oid,
         &state.cfg.lfs_root,
+        state.cfg.max_snapshot_bytes,
     )
     .await
     .context("读取定义快照失败")?;
@@ -118,7 +120,11 @@ pub async fn build_snapshot(state: &WorkflowState, run: &RunRef) -> Result<Snaps
     }
 
     let files = entries.len();
-    let gz = write_tar_gz(&entries).context("打包 tar.gz 失败")?;
+    // tar + gzip 是纯 CPU 的同步操作，放到阻塞线程池，别卡住 async runtime。
+    let gz = tokio::task::spawn_blocking(move || write_tar_gz(&entries))
+        .await
+        .context("打包任务失败")?
+        .context("打包 tar.gz 失败")?;
     let headers = SnapshotHeaders {
         commit_oid: hex::encode(&run.commit_oid),
         def_commit_oid: hex::encode(&run.def_commit_oid),
@@ -155,9 +161,13 @@ async fn collect_files(
     project_id: Uuid,
     commit_oid: &[u8],
     lfs_root: &std::path::Path,
+    limit: u64,
 ) -> Result<BTreeMap<String, Vec<u8>>> {
     let oid = Oid::from_slice(commit_oid).context("非法 commit oid")?;
     let mut files = tree::read_files(conn, project_id, oid).await?;
+    // 边读边累计：超限就立刻中止，不再把剩下的大文件全部读进内存
+    // 之后才发现超限。
+    let mut total: u64 = 0;
     for (path, data) in files.iter_mut() {
         if let Some(p) = parse_lfs_pointer(data) {
             let file = lfs_root
@@ -172,6 +182,10 @@ async fn collect_files(
                 bail!("LFS 对象 {} 大小不符", p.oid);
             }
             *data = real;
+        }
+        total = total.saturating_add(data.len() as u64);
+        if total > limit {
+            bail!("快照内容超过限额 {limit} 字节（读取到 {total} 字节时中止）");
         }
     }
     Ok(files)

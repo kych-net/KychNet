@@ -26,6 +26,7 @@ rustc-ice-*.txt
 # Node
 node_modules/
 admin/dist/
+editor/dist/
 .pnpm-store/
 
 # Local env

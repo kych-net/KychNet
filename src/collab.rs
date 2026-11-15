@@ -602,11 +602,18 @@ async fn list_pr_comments(conn: &mut PgConnection, pr_id: Uuid) -> Result<Vec<Pr
     .await?)
 }
 
-pub async fn list_prs(pool: &PgPool, project_id: Uuid) -> Result<Vec<PullRequest>> {
+pub async fn list_prs(
+    pool: &PgPool,
+    project_id: Uuid,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<PullRequest>> {
     Ok(sqlx::query_as::<_, PullRequest>(&format!(
-        "{PR_SELECT} WHERE pr.project_id = $1 ORDER BY pr.number DESC"
+        "{PR_SELECT} WHERE pr.project_id = $1 ORDER BY pr.number DESC LIMIT $2 OFFSET $3"
     ))
     .bind(project_id)
+    .bind(limit.clamp(1, 500))
+    .bind(offset.max(0))
     .fetch_all(pool)
     .await?)
 }
@@ -941,6 +948,126 @@ pub async fn merge_pr(
     })
 }
 
+/// 直接把来源分支合并进目标分支（不经 PR）。
+///
+/// 与 `merge_pr` 共用快进判定、merge-base 和逐文件三方合并：能快进就只移动
+/// 目标 ref，不能快进则生成双亲 merge commit；同一文件两侧改动不同会拒绝，
+/// 绝不拿来源树覆盖目标分支。返回值供编辑器展示「已最新 / 快进 / 合并提交」。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MergeBranchOutcome {
+    pub commit: String,
+    pub fast_forward: bool,
+    pub already_up_to_date: bool,
+}
+
+pub async fn merge_branches(
+    pool: &PgPool,
+    user: &User,
+    project_id: Uuid,
+    source_branch: &str,
+    target_branch: &str,
+    message: Option<&str>,
+) -> Result<MergeBranchOutcome> {
+    if !valid_branch(source_branch) || !valid_branch(target_branch) {
+        bail!("非法分支名");
+    }
+    if source_branch == target_branch {
+        bail!("来源分支与目标分支不能相同");
+    }
+    let mut tx = pool.begin().await?;
+    lock_project(&mut tx, project_id).await?;
+
+    let source = store::resolve_branch(&mut tx, project_id, source_branch)
+        .await?
+        .with_context(|| format!("来源分支不存在: {source_branch}"))?;
+    let target = store::resolve_branch(&mut tx, project_id, target_branch)
+        .await?
+        .with_context(|| format!("目标分支不存在: {target_branch}"))?;
+
+    // 来源的所有提交已经在目标里：无需产生任何新提交。
+    if target == source || is_ancestor(&mut tx, project_id, source, target).await? {
+        return Ok(MergeBranchOutcome {
+            commit: target.to_hex(),
+            fast_forward: true,
+            already_up_to_date: true,
+        });
+    }
+
+    let fast_forward = is_ancestor(&mut tx, project_id, target, source).await?;
+    let merge_oid = if fast_forward {
+        source
+    } else {
+        let base = merge_base(&mut tx, project_id, target, source).await?;
+        let tree_oid = merged_tree(&mut tx, project_id, base, target, source).await?;
+        let identity = format!("{} <noreply@kych.net>", identity_name(&user.username));
+        let text = message
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                format!("合并分支 {source_branch} 到 {target_branch}")
+            });
+        let data = encode_commit(
+            tree_oid,
+            &[target, source],
+            &identity,
+            &text,
+            Utc::now().timestamp(),
+        );
+        store::put_object(
+            &mut tx,
+            project_id,
+            &Object {
+                kind: ObjectKind::Commit,
+                data,
+            },
+        )
+        .await?
+    };
+
+    store::set_ref(
+        &mut tx,
+        project_id,
+        &format!("refs/heads/{target_branch}"),
+        merge_oid,
+    )
+    .await?;
+    crate::git::http::index_commits(&mut tx, project_id, merge_oid, user).await?;
+    sqlx::query("UPDATE projects SET updated_at = now() WHERE id = $1")
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?;
+    crate::workflow::event::enqueue(
+        &mut tx,
+        &crate::workflow::event::WorkflowEvent {
+            project_id,
+            kind: "push".to_string(),
+            ref_name: format!("refs/heads/{target_branch}"),
+            before_oid: Some(target.as_bytes().to_vec()),
+            after_oid: Some(merge_oid.as_bytes().to_vec()),
+            pr_number: None,
+            actor_id: Some(user.id),
+            payload: serde_json::json!({
+                "action": "merge",
+                "source_branch": source_branch,
+                "target_branch": target_branch,
+                "sender": { "login": user.username },
+            }),
+            dedupe_key: None,
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    if let Err(error) = store::invalidate_project_caches(project_id) {
+        tracing::warn!(%error, "分支合并后作废项目缓存失败");
+    }
+    Ok(MergeBranchOutcome {
+        commit: merge_oid.to_hex(),
+        fast_forward,
+        already_up_to_date: false,
+    })
+}
+
 pub async fn close_pr(pool: &PgPool, project_id: Uuid, number: i32) -> Result<PullRequest> {
     let mut tx = pool.begin().await?;
     lock_project(&mut tx, project_id).await?;
@@ -1019,11 +1146,19 @@ async fn list_discussion_comments(
     .await?)
 }
 
-pub async fn list_discussions(pool: &PgPool, project_id: Uuid) -> Result<Vec<Discussion>> {
+pub async fn list_discussions(
+    pool: &PgPool,
+    project_id: Uuid,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<Discussion>> {
     Ok(sqlx::query_as::<_, Discussion>(&format!(
-        "{DISCUSSION_SELECT} WHERE d.project_id = $1 ORDER BY d.created_at DESC"
+        "{DISCUSSION_SELECT} WHERE d.project_id = $1 ORDER BY d.created_at DESC \
+         LIMIT $2 OFFSET $3"
     ))
     .bind(project_id)
+    .bind(limit.clamp(1, 500))
+    .bind(offset.max(0))
     .fetch_all(pool)
     .await?)
 }

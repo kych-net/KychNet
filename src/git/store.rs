@@ -4,6 +4,7 @@ use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use sqlx::{PgConnection, PgPool, Row};
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -218,6 +219,69 @@ impl StoredObject {
 }
 
 /// 批量取对象原始行，不做解压。
+/// 批量取对象**大小**：只读 `size` 列，不取 `data`、不解压。
+///
+/// 列目录只需要文件大小，逐个 `get_object` 会把每个 blob 完整读出来再解压，
+/// 大目录下这是纯粹的浪费（数据库带宽 + zlib 解压 CPU）。
+/// 命中不了的对象（已 offload 到磁盘）由调用方回退到完整读取。
+/// 批量取对象**类型**：只读 `kind` 列，不取正文。
+///
+/// 增量 fetch 的可达性遍历里，blob 只需要记进 exclude 集合，
+/// 正文完全用不上；先查类型就能把这类对象从「读 + 解压」里摘出去。
+pub async fn get_object_kinds(
+    conn: &mut PgConnection,
+    project_id: Uuid,
+    oids: &[Oid],
+) -> Result<HashMap<Oid, ObjectKind>> {
+    if oids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let keys: Vec<Vec<u8>> = oids.iter().map(|oid| oid.as_bytes().to_vec()).collect();
+    let rows = sqlx::query(
+        "SELECT oid, kind FROM git_objects WHERE project_id = $1 AND oid = ANY($2::bytea[])",
+    )
+    .bind(project_id)
+    .bind(keys)
+    .fetch_all(conn)
+    .await?;
+    let mut kinds = HashMap::with_capacity(rows.len());
+    for row in rows {
+        let raw: Vec<u8> = row.try_get("oid")?;
+        let oid = Oid::from_slice(&raw)?;
+        let kind: i16 = row.try_get("kind")?;
+        if let Some(kind) = ObjectKind::from_i16(kind) {
+            kinds.insert(oid, kind);
+        }
+    }
+    Ok(kinds)
+}
+
+pub async fn get_object_sizes(
+    conn: &mut PgConnection,
+    project_id: Uuid,
+    oids: &[Oid],
+) -> Result<HashMap<Oid, usize>> {
+    if oids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let keys: Vec<Vec<u8>> = oids.iter().map(|oid| oid.as_bytes().to_vec()).collect();
+    let rows = sqlx::query(
+        "SELECT oid, size FROM git_objects WHERE project_id = $1 AND oid = ANY($2::bytea[])",
+    )
+    .bind(project_id)
+    .bind(keys)
+    .fetch_all(conn)
+    .await?;
+    let mut sizes = HashMap::with_capacity(rows.len());
+    for row in rows {
+        let raw: Vec<u8> = row.try_get("oid")?;
+        let oid = Oid::from_slice(&raw)?;
+        let size: i64 = row.try_get("size")?;
+        sizes.insert(oid, size.max(0) as usize);
+    }
+    Ok(sizes)
+}
+
 pub async fn get_objects_raw(
     conn: &mut PgConnection,
     project_id: Uuid,
@@ -444,10 +508,52 @@ pub async fn set_ref(
     Ok(())
 }
 
+/// 剥开 annotated tag，返回最终的 commit OID。
+///
+/// 站内 `git_refs.target` 既可能直接指向 commit（轻量标签 / 分支），也可能
+/// 指向 tag 对象（git push 上来的附注标签）。所有按 ref 读取文件树的入口
+/// 都必须经过这里，否则附注标签会被当成「不是 commit」而读不出内容。
+/// 最多剥 8 层，与 smart HTTP 的 `peel_tag_once` 保持一致。
+pub async fn peel_to_commit(
+    conn: &mut PgConnection,
+    project_id: Uuid,
+    oid: Oid,
+) -> Result<Oid> {
+    let mut current = oid;
+    for _ in 0..8 {
+        let object = get_object(conn, project_id, current)
+            .await?
+            .with_context(|| format!("引用对象不存在: {current}"))?;
+        if object.kind != ObjectKind::Tag {
+            if object.kind != ObjectKind::Commit {
+                bail!("引用目标不是提交: {current}");
+            }
+            return Ok(current);
+        }
+        let text = std::str::from_utf8(&object.data)
+            .map_err(|_| anyhow::anyhow!("tag 对象不是 UTF-8"))?;
+        let mut target = None;
+        for line in text.lines() {
+            if line.is_empty() {
+                break;
+            }
+            if let Some(value) = line.strip_prefix("object ") {
+                target = Some(Oid::from_hex(value.trim())?);
+                break;
+            }
+        }
+        current = target.context("tag 对象缺少 object 行")?;
+    }
+    bail!("标签嵌套层数过多")
+}
+
 /// 作废项目的全量 clone pack 缓存与磁盘全量快照标记。
 /// ref 更新事务**提交后**必须再调用一次（提交前的调用只是兜底）。
 pub fn invalidate_project_caches(project_id: Uuid) -> Result<()> {
     super::pack_cache::invalidate_project(project_id);
+    // 同步清掉该项目的 singleflight 锁表：缓存已作废，旧 key 的锁
+    // 不会再有新的等待者，留着只会随 wants 组合无限增长。
+    super::pack_cache::forget_inflight(project_id);
     if let Some(disk) = disk_store() {
         disk.clear_full(project_id)?;
     }

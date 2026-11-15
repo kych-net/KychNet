@@ -91,6 +91,18 @@ pub async fn list_dir(
     }
 
     let tree = read_tree(conn, project_id, current).await?;
+    // 先把所有 blob 的 size 批量查出来（只读 size 列，不解压正文），
+    // 只有查不到的（已 offload 到磁盘的对象）才回退到完整读取。
+    let blob_oids: Vec<Oid> = tree
+        .entries
+        .values()
+        .filter_map(|entry| match entry {
+            TreeEntry::Blob(oid) => Some(*oid),
+            _ => None,
+        })
+        .collect();
+    let sizes = super::store::get_object_sizes(conn, project_id, &blob_oids).await?;
+
     let mut items = Vec::with_capacity(tree.entries.len());
     for (name, entry) in tree.entries {
         let path = if dir.is_empty() {
@@ -107,10 +119,14 @@ pub async fn list_dir(
                 oid: oid.to_hex(),
             }),
             TreeEntry::Blob(oid) => {
-                let size = get_object(conn, project_id, oid)
-                    .await?
-                    .map(|object| object.data.len())
-                    .unwrap_or(0);
+                let size = match sizes.get(&oid) {
+                    Some(size) => *size,
+                    // 磁盘后端里的对象不在 PG：这里只能完整读一次。
+                    None => get_object(conn, project_id, oid)
+                        .await?
+                        .map(|object| object.data.len())
+                        .unwrap_or(0),
+                };
                 items.push(DirItem {
                     name,
                     path,
@@ -182,6 +198,72 @@ pub async fn find_file(
         }
     }
     Ok(None)
+}
+
+/// 只取某个路径的 blob OID，不读对象内容。
+///
+/// 单文件写入只需要「原文件是否存在、OID 是否匹配」，没必要把内容也
+/// 解压出来——仓库大时那是成 MB 的无谓读取。
+pub async fn find_blob_oid(
+    conn: &mut PgConnection,
+    project_id: Uuid,
+    commit: Oid,
+    path: &str,
+) -> Result<Option<Oid>> {
+    let mut current = read_commit_tree(conn, project_id, commit).await?;
+    let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    if parts.is_empty() {
+        return Ok(None);
+    }
+    for (index, part) in parts.iter().enumerate() {
+        let tree = read_tree(conn, project_id, current).await?;
+        let Some(entry) = tree.get(part) else {
+            return Ok(None);
+        };
+        if index + 1 == parts.len() {
+            return Ok(match entry {
+                TreeEntry::Blob(oid) => Some(oid),
+                TreeEntry::Dir(_) | TreeEntry::Gitlink(_) => None,
+            });
+        }
+        match entry {
+            TreeEntry::Dir(oid) => current = oid,
+            TreeEntry::Blob(_) | TreeEntry::Gitlink(_) => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
+/// 列出仓库内全部文件路径，不读取任何 blob 内容。
+///
+/// 输出冲突检查只用到路径集合，用这个代替 `read_files` 可以省掉
+/// 整个仓库的解压开销。
+pub async fn list_paths(
+    conn: &mut PgConnection,
+    project_id: Uuid,
+    commit: Oid,
+) -> Result<std::collections::BTreeSet<String>> {
+    let root = read_commit_tree(conn, project_id, commit).await?;
+    let mut paths = std::collections::BTreeSet::new();
+    let mut stack = vec![(String::new(), root)];
+    while let Some((prefix, tree_oid)) = stack.pop() {
+        let tree = read_tree(conn, project_id, tree_oid).await?;
+        for (name, entry) in tree.entries {
+            let path = if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}/{name}")
+            };
+            match entry {
+                TreeEntry::Dir(oid) => stack.push((path, oid)),
+                TreeEntry::Blob(_) => {
+                    paths.insert(path);
+                }
+                TreeEntry::Gitlink(_) => {}
+            }
+        }
+    }
+    Ok(paths)
 }
 
 /// 在已有 tree 上增删一个路径，只重建沿途节点。
