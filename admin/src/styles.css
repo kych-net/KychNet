@@ -140,6 +140,9 @@ body {
 .avatar {
   width: 2.1rem;
   height: 2.1rem;
+  /* WHY: 全局 button { min-height } 会把 2.1rem 的方框撑成 2.35rem 高，
+     配合 border-radius: 50% 就变成椭圆；头像必须是正圆。 */
+  min-height: 0;
   border-radius: 50%;
   border: 1px solid var(--border);
   background: var(--accent);
@@ -1177,8 +1180,11 @@ body {
   gap: 0.2rem;
 }
 
+/* 页头的胶囊按钮。:not(.avatar) 是必须的：这条规则的特异性比 .avatar 高，
+   一旦命中头像按钮就会用 0.85rem 的横向内边距把 2.1rem 的圆压成
+   4×22px 的内容区，头像图片只剩中间一条竖缝。 */
 .appnav button,
-.appactions button,
+.appactions button:not(.avatar),
 .profile-button {
   border-radius: 999px;
   padding: 0.42rem 0.85rem;
@@ -1186,7 +1192,7 @@ body {
 }
 
 .appnav button:hover,
-.appactions button:hover,
+.appactions button:not(.avatar):hover,
 .profile-button:hover {
   background: var(--panel-soft);
   color: var(--text);
