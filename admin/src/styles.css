@@ -162,6 +162,13 @@ body {
   display: block;
 }
 
+/* 蓝底只是字母兜底的底色。用户传了头像就别铺：SVG 大多带透明区域，
+   压在 --accent 上会串色（红色描边在蓝底上几乎看不见）。
+   用 :has() 而不是加类，Shell 和 ProfileView 两处渲染自动一致。 */
+.avatar:has(.avatar-img) {
+  background: transparent;
+}
+
 .avatar-large {
   width: 4rem;
   height: 4rem;
