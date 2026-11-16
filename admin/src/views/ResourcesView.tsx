@@ -112,17 +112,9 @@ export function ResourcesView() {
           <p className="res-path" title={disk.path}>
             {disk.path}
           </p>
-          {/* 主显示目录自身大小；分区用量放小字——多个目录同分区时
-              那几个数字完全一样，容易被误读成「每个目录都占这么多」。 */}
+          {/* 只显示目录自身占用：这几个目录都在同一分区，分区用量对它们
+              来说完全一样，展示出来只会让人误以为每个目录都占了整块盘。 */}
           <p className="res-big">{fmtBytes(disk.dir_bytes)}</p>
-          {disk.total_bytes > 0 ? (
-            <>
-              <UsageBar used={disk.used_bytes} total={disk.total_bytes} />
-              <p className="hint">所在分区</p>
-            </>
-          ) : (
-            <p className="hint">路径不可读</p>
-          )}
         </div>
       ))}
       <div className="res-card">
