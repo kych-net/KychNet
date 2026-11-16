@@ -763,9 +763,14 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
             let project = project_typst.get(&content.slug);
             let cache_key = match content.format() {
                 ContentFormat::Typst => match project {
-                    Some((files, main_path)) => {
-                        Some(cache.key_typst(&body, main_path, &render::files_digest(files), &root_hash))
-                    }
+                    Some((files, main_path)) => Some(cache.key_typst(
+                        &body,
+                        main_path,
+                        // 只按本页实际引用的文件算摘要：改一张没被引用的图，
+                        // 本页缓存仍然有效。无法静态解析时自动回退全项目摘要。
+                        &render::page_files_digest(&body, files),
+                        &root_hash,
+                    )),
                     None => Some(cache.key_typst(
                         &body,
                         "main.typ",

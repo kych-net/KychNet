@@ -49,6 +49,107 @@ pub fn files_digest(files: &ProjectFiles) -> String {
     hex::encode(h.finalize())
 }
 
+/// 计算某个 Typst 页面**实际依赖**的文件摘要。
+///
+/// Typst 源里的图片/包含是通过字面量路径引用的（`#image("/图片/x.svg")`），
+/// 因此可以只对这些文件求摘要：改一张没有被本页引用的图时，本页缓存不再失效。
+///
+/// 正确性优先：只要发现无法静态确定的写法（拼接路径、变量路径），
+/// 或一个引用都没找到，就回退到全项目摘要——宁可多失效，不能命中旧内容。
+pub fn page_files_digest(body: &str, files: &ProjectFiles) -> String {
+    let Some(refs) = collect_literal_refs(body) else {
+        return files_digest(files);
+    };
+    if refs.is_empty() {
+        return files_digest(files);
+    }
+    let mut h = Sha256::new();
+    h.update(b"refs\0");
+    for path in &refs {
+        h.update(path.as_bytes());
+        h.update(b"\0");
+        match files.get(path) {
+            Some(data) => h.update(data),
+            // 引用了项目外的文件（内置包等）：不影响本页内容的可变性。
+            None => h.update(b"external"),
+        }
+        h.update(b"\0");
+    }
+    hex::encode(h.finalize())
+}
+
+/// 提取源码里 `#image(...)` / `#include` / `#import` 的字面量路径。
+///
+/// 全部按字节扫描：源码是 UTF-8，模式本身是 ASCII，用字节偏移匹配既能
+/// 避免多字节字符的切片 panic，也不需要为解析引入额外依赖。
+///
+/// 返回 `None` 表示存在无法静态解析的写法，调用方应回退到全项目摘要。
+fn collect_literal_refs(body: &str) -> Option<Vec<String>> {
+    let bytes = body.as_bytes();
+    let mut refs: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let (pattern, paren): (&[u8], bool) = if bytes[i..].starts_with(b"#image(") {
+            (b"#image(", true)
+        } else if bytes[i..].starts_with(b"#include ") {
+            (b"#include ", false)
+        } else if bytes[i..].starts_with(b"#import ") {
+            (b"#import ", false)
+        } else {
+            i += 1;
+            continue;
+        };
+        i += pattern.len();
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b'"' {
+            // `#image(name)` / `#include path`：动态写法，无法确定。
+            return None;
+        }
+        i += 1;
+        let start = i;
+        while i < bytes.len() && bytes[i] != b'"' {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            return None;
+        }
+        // 引号都在 ASCII 边界上，切片安全。
+        let raw = &body[start..i];
+        i += 1;
+        if paren {
+            let mut j = i;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            // image 之后应当是 `)` 或 `,`（还可能有命名参数）。
+            if j >= bytes.len() || (bytes[j] != b')' && bytes[j] != b',') {
+                return None;
+            }
+        } else {
+            // include/import 后应当是行尾、空白、注释或 `:`
+            let rest = &body[i..];
+            let rest = rest.trim_start();
+            if !rest.is_empty()
+                && !rest.starts_with('\n')
+                && !rest.starts_with("//")
+                && !rest.starts_with(':')
+            {
+                return None;
+            }
+        }
+        let path = raw.trim_start_matches('/').replace('\\', "/");
+        if path.is_empty() || path.contains(' ') {
+            return None;
+        }
+        if !refs.iter().any(|existing| existing == &path) {
+            refs.push(path);
+        }
+    }
+    Some(refs)
+}
+
 pub struct Rendered {
     pub html: String,
     pub pdf: Option<Vec<u8>>,
@@ -584,6 +685,67 @@ fn extract_typst_fragment(full: &str) -> String {
     out
 }
 
+
+#[cfg(test)]
+mod ref_digest_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn files(pairs: &[(&str, &str)]) -> ProjectFiles {
+        Arc::new(
+            pairs
+                .iter()
+                .map(|(p, d)| (p.to_string(), Bytes::new(d.as_bytes().to_vec())))
+                .collect::<HashMap<_, _>>(),
+        )
+    }
+
+    #[test]
+    fn collects_literal_refs() {
+        let src = r#"
+= 标题
+#image("/图片/地图.svg", width: 100%)
+#image("/图片/分区图.svg", format: "svg")
+#include "另一页.typ"
+"#;
+        let refs = collect_literal_refs(src).expect("应当能解析");
+        assert_eq!(refs, vec!["图片/地图.svg", "图片/分区图.svg", "另一页.typ"]);
+    }
+
+    #[test]
+    fn dynamic_paths_fall_back() {
+        let src = "#let n = \"x\"\n#image(\"/图片/\" + n + \".svg\")";
+        assert!(collect_literal_refs(src).is_none(), "动态路径必须回退");
+    }
+
+    #[test]
+    fn digest_changes_only_for_referenced_files() {
+        let body = "#image(\"/图/a.svg\")";
+        let base = files(&[("图/a.svg", "<svg>a</svg>"), ("图/b.svg", "<svg>b</svg>")]);
+        let untouched = files(&[("图/a.svg", "<svg>a</svg>"), ("图/b.svg", "<svg>CHANGED</svg>")]);
+        let touched = files(&[("图/a.svg", "<svg>A2</svg>"), ("图/b.svg", "<svg>b</svg>")]);
+
+        // 改没被引用的 b：本页摘要不变（缓存仍可命中）。
+        assert_eq!(
+            page_files_digest(body, &base),
+            page_files_digest(body, &untouched)
+        );
+        // 改被引用的 a：摘要必须变化。
+        assert_ne!(
+            page_files_digest(body, &base),
+            page_files_digest(body, &touched)
+        );
+    }
+
+    #[test]
+    fn no_refs_falls_back_to_whole_project() {
+        let body = "= 纯文字，没有引用";
+        let a = files(&[("x.svg", "1")]);
+        let b = files(&[("x.svg", "2")]);
+        assert_eq!(page_files_digest(body, &a), files_digest(&a));
+        assert_ne!(page_files_digest(body, &a), page_files_digest(body, &b));
+    }
+}
 
 #[cfg(test)]
 mod tests {
