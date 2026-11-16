@@ -80,6 +80,11 @@ printf 'GET / HTTP/1.1\r\nHost: kych.net\r\nConnection: close\r\n\r\n' \
    在构建前**先装 admin 依赖、再装 editor 依赖**，只装 editor 会报「Cannot find module」。
 3. 编辑器与管理端共用同一部署账号与 `DEPLOY_HOST` / `DEPLOY_USER` / `DEPLOY_SSH_KEY`，
    目标目录固定写死 `/opt/kych-editor/`（非敏感，无需新增 secret）。
+4. 编辑器的「项目」工作区(`editor/src/project/`)依赖后端新增的
+   `/api/projects/{id}/refs|tags|merge|reset|file-history|blame` 等路由，以及
+   `GET /api/projects/{id}` 返回值里的 `tags` 字段。**这些前端必须与后端同批上线**：
+   前端先发而后端未升级时，项目工作区会在拉取引用概览时报错；后端升级不影响
+   旧前端。共享的 `admin/src/api.ts` 已在触发路径里，改动它会同时重建管理端与编辑器。
 
 ## 服务器侧一次性准备
 

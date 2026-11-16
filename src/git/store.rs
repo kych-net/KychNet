@@ -508,6 +508,45 @@ pub async fn set_ref(
     Ok(())
 }
 
+/// 剥开 annotated tag，返回最终的 commit OID。
+///
+/// 站内 `git_refs.target` 既可能直接指向 commit（轻量标签 / 分支），也可能
+/// 指向 tag 对象（git push 上来的附注标签）。所有按 ref 读取文件树的入口
+/// 都必须经过这里，否则附注标签会被当成「不是 commit」而读不出内容。
+/// 最多剥 8 层，与 smart HTTP 的 `peel_tag_once` 保持一致。
+pub async fn peel_to_commit(
+    conn: &mut PgConnection,
+    project_id: Uuid,
+    oid: Oid,
+) -> Result<Oid> {
+    let mut current = oid;
+    for _ in 0..8 {
+        let object = get_object(conn, project_id, current)
+            .await?
+            .with_context(|| format!("引用对象不存在: {current}"))?;
+        if object.kind != ObjectKind::Tag {
+            if object.kind != ObjectKind::Commit {
+                bail!("引用目标不是提交: {current}");
+            }
+            return Ok(current);
+        }
+        let text = std::str::from_utf8(&object.data)
+            .map_err(|_| anyhow::anyhow!("tag 对象不是 UTF-8"))?;
+        let mut target = None;
+        for line in text.lines() {
+            if line.is_empty() {
+                break;
+            }
+            if let Some(value) = line.strip_prefix("object ") {
+                target = Some(Oid::from_hex(value.trim())?);
+                break;
+            }
+        }
+        current = target.context("tag 对象缺少 object 行")?;
+    }
+    bail!("标签嵌套层数过多")
+}
+
 /// 作废项目的全量 clone pack 缓存与磁盘全量快照标记。
 /// ref 更新事务**提交后**必须再调用一次（提交前的调用只是兜底）。
 pub fn invalidate_project_caches(project_id: Uuid) -> Result<()> {

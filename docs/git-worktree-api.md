@@ -37,8 +37,16 @@
 与 `git-upload-pack` 同等可见性：站内仓库内容本来就能匿名 fetch，`git_project()`
 只按 slug 查项目并排除已归档。packfile 已包含全部内容，文件树接口**没有放大暴露面**。
 
-`ref` 支持**分支名或 40 位 commit OID**。执行器从 claim 拿到的是 `commit_oid`
-而不是分支名；按 OID 读可避免 run 排队期间分支被新 push 顶掉。
+`ref` 支持**分支名、标签名、附注标签、40 位 commit OID,以及完整
+`refs/heads/…` / `refs/tags/…`**。读路径统一走
+`project::resolve_read_ref()`(见「实现位置」),附注标签会经
+`store::peel_to_commit()` 逐层剥到 commit,`worktree::resolve_ref()`
+现在只是它的薄封装——文件树通道与 `/api/projects/{id}/tree|file` 因此口径一致。
+执行器从 claim 拿到的是 `commit_oid` 而不是分支名；按 OID 读可避免 run
+排队期间分支被新 push 顶掉。
+
+注意读与写的非对称:**读接受任意 ref**(分支 / 标签 / OID),便于按历史版本浏览;
+**写只接受分支名**,因为要更新 ref(标签与 OID 是固定快照,不能作为写目标)。
 
 ### `GET /git/<项目>/tree?ref=<ref>&path=<dir>`
 
@@ -157,7 +165,10 @@ runner 宿主进程在 act 成功后据此 PUT / DELETE。容器 `--network=none
 | 文件 | 内容 |
 | --- | --- |
 | `src/git/http.rs` | `GitChannel` 与 `split_git_path()`：按 `.git` 后缀分流两类通道 |
-| `src/git/worktree.rs` | `resolve_ref` / `list` / `read` / `collect` / `total_bytes`，复用 `git::tree` 与 `git::lfs` |
+| `src/git/worktree.rs` | `list` / `read` / `collect` / `total_bytes`，复用 `git::tree` 与 `git::lfs`；`resolve_ref` 委托 `project::resolve_read_ref()` |
+| `src/project.rs::resolve_read_ref` | 通用只读 ref 解析：短名 / 完整 ref / OID / 附注标签剥到 commit |
+| `src/git/store.rs::peel_to_commit` | 逐层剥 tag 对象(上限 8 层)到 commit |
+| `src/git/object.rs::encode_tag` | 生成标准 annotated tag 对象 |
 | `src/api/git.rs::git_write_user` | Git 令牌 + 登录会话的双通道写认证（smart HTTP 用） |
 | `src/api/git.rs::worktree_write_auth` | 文件树写认证：在上一项之后追加 runner token，`allowed_ref` 限定分支 |
 | `src/api/git.rs::worktree_get` / `worktree_put` / `worktree_delete` | 读写 handler |

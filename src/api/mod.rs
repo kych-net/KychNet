@@ -618,6 +618,23 @@ pub async fn serve(cfg: Config) -> Result<()> {
             "/api/projects/{id}/branches/{*name}",
             delete(project_branch_delete),
         )
+        // 编辑器的 Git 面板：引用概览、标签、分支合并/重置、文件历史与逐行追溯。
+        .route("/api/projects/{id}/refs", get(project_refs))
+        .route(
+            "/api/projects/{id}/tags",
+            get(project_tag_list).post(project_tag_create),
+        )
+        .route(
+            "/api/projects/{id}/tags/{*name}",
+            delete(project_tag_delete),
+        )
+        .route("/api/projects/{id}/merge", post(project_merge))
+        .route("/api/projects/{id}/reset", post(project_reset))
+        .route(
+            "/api/projects/{id}/file-history",
+            get(project_file_history),
+        )
+        .route("/api/projects/{id}/blame", get(project_blame))
         .route("/api/projects/{id}/prs", get(pr_list).post(pr_create))
         .route("/api/projects/{id}/prs/{number}", get(pr_detail))
         .route(

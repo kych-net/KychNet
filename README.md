@@ -17,7 +17,7 @@
 
 | 地址 | 用途 |
 | --- | --- |
-| `kych.net` | 统一入口,EdgeOne 加速回源源站 nginx:`/` 内容站、`/管理/` 管理端 SPA、`/api/*`、`/git/*`、`/mcp` 后端接口 |
+| `kych.net` | 统一入口,EdgeOne 加速回源源站 nginx:`/` 内容站、`/管理/` 管理端 SPA、`/编辑器/` 独立编辑器 SPA、`/api/*`、`/git/*`、`/mcp` 后端接口 |
 | `www.kych.net` | 直连源站,301 到 `https://kych.net/` |
 
 `eo.kych.net` / `c.kych.net` / `m.kych.net` 为历史入口,DNS 记录已删除
@@ -53,6 +53,7 @@
 - 内容站正文使用自托管的 `LXGW WenKai Screen`;管理端编辑器使用 CodeMirror 6,按格式高亮.
 - 管理端 Markdown/HTML 预览在浏览器端渲染,Wikidot 预览走服务端 ftml,统一放进无脚本 sandbox iframe.
 - 用户头像为上传的 SVG 文件,由服务端校验确为纯矢量:必须是合法 XML 且根元素为 `svg`,至少包含一个矢量图形,禁止内嵌/外链位图、`<script>`、`<foreignObject>`、事件属性、DTD 与实体声明、`<animate>`/`<set>` 等属性动画元素,`href` 只允许指向文档内图元(`#xxx`);内容上限 256 KB,传输上限 257 KB.
+- 独立编辑器 `/编辑器/` 是移动优先的 SPA,顶部可切换「页面 / 项目」两种模式:页面模式编辑普通内容(与内容版本历史配套),项目模式打开项目仓库工作区(见「项目与 Git → 编辑器项目工作区」)。项目模式按标签页组织文件 / 变更 / 历史 / 分支 / 标签 / PR,窄屏下文件树与编辑器分屏切换,CodeMirror 6 按扩展名高亮。
 
 ## 精简版版本历史
 
@@ -109,7 +110,9 @@
 ├── plugins/             # 内置 MCP 客户端插件（dsh-mcp-kychnet）
 ├── templates/           # Askama 模板(layout / index / page)
 ├── migrations/          # SQLx 迁移(当前 0001–0020)
-└── admin/               # 管理前端(独立 Vite 工程)
+├── admin/               # 管理前端(独立 Vite 工程)
+└── editor/              # 独立编辑器 SPA(/编辑器/,移动优先)
+    └── src/project/     # 项目工作区:文件树、草稿、差异、历史、分支/标签/PR
 ```
 
 ## 命令行
@@ -402,6 +405,40 @@ access token 一小时内自然过期；refresh token 最长 30 天。数据库�
 - 已知限制:协议 v0 浅克隆(`--depth`)修复待 PR 发布,命令行 git 与 v2 客户端不受影响;
 - 迁移 `0009_projects` / `0010_lfs` 创建项目、对象、refs、commits、PR、讨论与 LFS 索引;
 - `kych-net gc --project <slug>` 清理不可达对象。
+
+### 编辑器项目工作区
+
+`/编辑器/` 的「项目」模式提供一套移动优先的 Git 工作区,面向不想装 Git 客户端、直接在浏览器里改仓库文件的场景。站内仓库没有磁盘工作树,前端把未提交的改动按「项目 + ref」分桶存进 localStorage 模拟暂存区,提交时一次性走 `commit_project_changes` 写一个 commit;提交成功后清掉对应路径的本地草稿。深链为 `?project=<id>&ref=<ref>&file=<path>&tab=<tab>`(原有 `?page=<id>` 页面深链不变)。
+
+工作区按六个标签页组织:文件(懒加载单层目录树 + 单文件编辑 + 本地行级 diff + 文件历史 + 逐行 blame)、变更(勾选暂存 / 放弃草稿 / 批量提交)、历史(分页提交列表 + 提交详情差异 + 还原 + 从提交建分支)、分支(切换 / 新建 / 删除 / 两 ref 比较 / 合并 / 重置 / clone 地址)、标签(轻量与附注标签的增删、按标签浏览)、PR(列表 / 创建 / 评论 / 合并 / 关闭 / 冲突差异)。
+
+只读与可写严格区分:**只有分支名可写**;标签名、40 位 commit OID、`refs/heads/…` / `refs/tags/…` 都作为只读版本入口,用于浏览历史版本而不误改 ref。所有读接口统一走 `project::resolve_read_ref()`:支持短分支 / 标签名、完整 ref、OID,附注标签经 `store::peel_to_commit()` 逐层剥到 commit;`/git/<项目>/tree|file|archive` 的文件树接口也复用它,因此 worktree 通道同样能按标签和 OID 读取。
+
+本次为编辑器补齐的后端能力(全部复用现有 service 层,不引入新依赖):
+
+| 能力 | 说明 |
+| --- | --- |
+| 附注标签 | `git::object::encode_tag()` 生成标准 tag 对象,`create_tag()` 写 `refs/tags/…`;`list_tags()` / `delete_tag()` 配套。轻量标签直接指 commit |
+| 分支合并 | `collab::merge_branches()` 复用 `merge_base()` / `merged_tree()` / `three_way_merge()`:快进移 ref,非快进生成双亲 merge commit,冲突时整单失败不动目标分支 |
+| 分支重置 | `project::reset_branch()` 等价 `reset --hard` 但只移动分支 ref(不碰工作树):默认只允许重置到当前分支历史内的提交,`force` 才允许任意 ref |
+| 文件历史 | `file_history()` 沿第一父链逐对比较 tree 里的 blob OID,不依赖 `git_commit_paths` 索引,外部导入与 push 上来的提交同样能查 |
+| 逐行 blame | `blame()` 用现有 `similar = "2"` 的 `TextDiff` / `DiffOp`,按相邻版本行级 diff 把当前行映射回父版本,新出现的行归属当前 commit;有字节 / 行数 / 回溯提交数上限,超限返回 `truncated` |
+
+合并与重置若改变了默认分支,与管理端写文件一致会触发一次 `build_ctl.build_all()` 重建静态站。
+
+新增 API(均要求登录会话,权限与既有 `/api/projects/{id}/*` 一致):
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| `GET` | `/api/projects/{id}/refs?ref=` | 一次性取分支、标签、默认分支、当前 ref 与 head OID |
+| `GET` / `POST` | `/api/projects/{id}/tags` | 标签列表 / 创建(带 `message` 为附注标签) |
+| `DELETE` | `/api/projects/{id}/tags/{*name}` | 删除标签(支持含 `/` 的标签名) |
+| `POST` | `/api/projects/{id}/merge` | 分支合并 `{ source, target?, message? }` |
+| `POST` | `/api/projects/{id}/reset` | 分支重置 `{ ref, commit, force? }` |
+| `GET` | `/api/projects/{id}/file-history?ref=&path=&limit=` | 单文件提交历史 |
+| `GET` | `/api/projects/{id}/blame?ref=&path=` | 单文件逐行追溯 |
+
+`GET /api/projects/{id}` 的返回值同时补上了 `tags`。前端统一通过 `admin/src/api.ts` 发请求(`ProjectRefs` / `TagInfo` / `MergeResult` / `ResetResult` / `FileHistoryEntry` / `BlameResult` 等类型也在此定义),编辑器经 `@admin` 别名复用,见 [deploy/README.md](deploy/README.md)。
 
 ### Git over SSH
 

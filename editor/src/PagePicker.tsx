@@ -14,11 +14,15 @@ const FORMAT_LABEL: Record<string, string> = {
 export function PagePicker({
   pages,
   loading,
+  mode,
+  onMode,
   onOpen,
   onNew,
 }: {
   pages: Content[];
   loading: boolean;
+  mode: "pages" | "projects";
+  onMode: (mode: "pages" | "projects") => void;
   onOpen: (id: string) => void;
   onNew: () => void;
 }) {
@@ -46,6 +50,11 @@ export function PagePicker({
           ＋ 新建
         </button>
       </header>
+
+      <nav className="picker-modes" aria-label="编辑对象">
+        <button type="button" className={mode === "pages" ? "is-active" : ""} onClick={() => onMode("pages")}>📄 页面</button>
+        <button type="button" className={mode === "projects" ? "is-active" : ""} onClick={() => onMode("projects")}>⑂ 项目</button>
+      </nav>
 
       <div className="picker-search">
         <input

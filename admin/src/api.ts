@@ -179,6 +179,62 @@ export type GitSshKey = {
   last_used_at: string | null;
 };
 
+/** 轻量标签或附注标签；oid 始终是最终指向的 commit。 */
+export type TagInfo = {
+  name: string;
+  oid: string;
+  tag_oid: string | null;
+  message: string;
+  author_name: string;
+  created_at: string;
+};
+
+/** 编辑器工作区一次拉取的引用概览。 */
+export type ProjectRefs = {
+  branches: string[];
+  tags: TagInfo[];
+  default_branch: string;
+  ref: string;
+  head: string | null;
+};
+
+export type MergeResult = {
+  commit: string;
+  fast_forward: boolean;
+  already_up_to_date: boolean;
+};
+
+export type ResetResult = {
+  commit: string;
+  previous: string;
+};
+
+export type FileHistoryEntry = {
+  oid: string;
+  author_name: string;
+  message: string;
+  committed_at: string;
+  change: "add" | "modify" | "delete";
+  old_oid: string | null;
+  new_oid: string | null;
+};
+
+export type BlameLine = {
+  line: number;
+  commit: string;
+  author_name: string;
+  message: string;
+  committed_at: string;
+  text: string;
+};
+
+export type BlameResult = {
+  path: string;
+  oid: string;
+  truncated: boolean;
+  lines: BlameLine[];
+};
+
 
 export type PrStatus = "open" | "merged" | "closed";
 
@@ -545,7 +601,7 @@ export const api = {
       },
     ),
   project: (id: string) =>
-    request<{ item: Project; branches: string[] }>(`/projects/${id}`),
+    request<{ item: Project; branches: string[]; tags: TagInfo[] }>(`/projects/${id}`),
   updateProject: (id: string, payload: { description?: string; archived?: boolean }) =>
     request<{ item: Project }>(`/projects/${id}`, {
       method: "PATCH",
@@ -627,6 +683,55 @@ export const api = {
     request<{ branches: string[] }>(
       `/projects/${id}/branches/${encodeURIComponent(name)}`,
       { method: "DELETE" },
+    ),
+
+  /** 一次性取分支、标签、默认分支与当前 ref 的 commit OID。 */
+  projectRefs: (id: string, ref?: string) =>
+    request<ProjectRefs>(
+      `/projects/${id}/refs${ref ? `?ref=${encodeURIComponent(ref)}` : ""}`,
+    ),
+  projectTags: (id: string) =>
+    request<{ items: TagInfo[] }>(`/projects/${id}/tags`),
+  createProjectTag: (
+    id: string,
+    payload: { name: string; ref?: string; message?: string },
+  ) =>
+    request<{ item: TagInfo }>(`/projects/${id}/tags`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  deleteProjectTag: (id: string, name: string) =>
+    request<{ items: TagInfo[] }>(
+      `/projects/${id}/tags/${encodeURIComponent(name)}`,
+      { method: "DELETE" },
+    ),
+  /** 直接合并分支（不经 PR）：快进或生成双亲 merge commit，冲突时报错。 */
+  mergeProjectBranches: (
+    id: string,
+    payload: { source: string; target?: string; message?: string },
+  ) =>
+    request<{ item: MergeResult }>(`/projects/${id}/merge`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  /** 把分支指针移动到某个提交；默认只允许退回当前历史。 */
+  resetProjectBranch: (
+    id: string,
+    payload: { ref: string; commit: string; force?: boolean },
+  ) =>
+    request<{ item: ResetResult }>(`/projects/${id}/reset`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  fileHistory: (id: string, ref: string, path: string, limit = 50) =>
+    request<{ items: FileHistoryEntry[] }>(
+      `/projects/${id}/file-history?ref=${encodeURIComponent(ref)}` +
+        `&path=${encodeURIComponent(path)}&limit=${limit}`,
+    ),
+  blame: (id: string, ref: string, path: string) =>
+    request<{ item: BlameResult }>(
+      `/projects/${id}/blame?ref=${encodeURIComponent(ref)}` +
+        `&path=${encodeURIComponent(path)}`,
     ),
 
   prs: (id: string) => request<{ items: PullRequest[] }>(`/projects/${id}/prs`),
