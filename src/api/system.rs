@@ -15,8 +15,12 @@ use super::*;
 pub(crate) struct DiskUsage {
     pub label: String,
     pub path: String,
+    /// 该路径所在**文件系统**的已用/总量。多个目录同分区时这几个数会一样，
+    /// 所以界面改为主显示 `dir_bytes`，分区用量作为补充信息。
     pub used_bytes: u64,
     pub total_bytes: u64,
+    /// 目录自身（递归）占用的字节数。
+    pub dir_bytes: u64,
 }
 
 #[derive(Serialize, Clone)]
@@ -91,13 +95,14 @@ async fn compute_resources(state: &AppState) -> ApiResult<SystemResources> {
         let disks = disks_for_fs
             .into_iter()
             .map(|(label, path)| {
-                let (used_bytes, total_bytes) =
-                    fs_usage(&path).unwrap_or((0, 0));
+                let (used_bytes, total_bytes) = fs_usage(&path).unwrap_or((0, 0));
+                let dir_bytes = dir_size(&path).unwrap_or(0);
                 DiskUsage {
                     label,
                     path: path.display().to_string(),
                     used_bytes,
                     total_bytes,
+                    dir_bytes,
                 }
             })
             .collect();

@@ -300,8 +300,11 @@ export type PrDetail = PullRequest & {
 export type DiskUsage = {
   label: string;
   path: string;
+  /** 所在文件系统的已用/总量（多个目录同分区时会相同）。 */
   used_bytes: number;
   total_bytes: number;
+  /** 目录自身（递归）占用的字节数。 */
+  dir_bytes: number;
 };
 
 export type SystemResources = {
