@@ -318,6 +318,8 @@ export type RepoCommitStats = {
   size: number;
   /** 提交对象在 PG 里的实际存储字节（压缩后）。 */
   pg_bytes: number;
+  /** 存放位置：pg / disk / missing。 */
+  backend: "pg" | "disk" | "missing";
 };
 
 /** 一个分支的展示信息。 */
@@ -325,6 +327,11 @@ export type RepoBranchStats = {
   name: string;
   tip_oid: string;
   short_oid: string;
+  /** tip 提交对象原始字节。 */
+  size: number;
+  /** tip 提交对象在 PG 中的存储字节（在磁盘上则为 0）。 */
+  stored_bytes: number;
+  backend: "pg" | "disk" | "missing";
 };
 
 /** 单个仓库在 PG 与硬盘上的存储占用。 */
@@ -343,6 +350,13 @@ export type RepoStats = {
   commits: number;
   branches: number;
   tags: number;
+};
+
+/** 展开仓库卡片时才请求的明细。 */
+export type RepoDetail = {
+  id: string;
+  slug: string;
+  default_branch: string;
   branch_list: RepoBranchStats[];
   commit_list: RepoCommitStats[];
 };
@@ -855,6 +869,8 @@ export const api = {
     }),
   projectRuns: (id: string) => request<{ items: WorkflowRun[] }>(`/projects/${id}/runs`),
   systemResources: () => request<SystemResources>("/system/resources"),
+  /// 单个仓库的分支与提交明细（含对象存放位置），展开卡片时按需请求。
+  repoDetail: (id: string) => request<RepoDetail>(`/system/repos/${id}`),
   runners: () => request<{ items: WorkflowRunner[] }>("/runners"),
   createRunner: (name: string, labels: string[]) =>
     request<{ runner_id: string; registration_code: string }>("/runners", {

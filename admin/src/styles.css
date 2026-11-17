@@ -3908,3 +3908,40 @@ code,
   outline: 2px solid color-mix(in srgb, var(--accent) 40%, transparent);
   outline-offset: 1px;
 }
+
+/* ---------- 仓库明细：存放位置徽标与大小 ---------- */
+.res-backend {
+  display: inline-block;
+  padding: 0.05rem 0.35rem;
+  border-radius: 4px;
+  font-size: 0.68rem;
+  font-weight: 600;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+.res-backend-pg {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--accent);
+}
+
+.res-backend-disk {
+  background: color-mix(in srgb, #d97706 18%, transparent);
+  color: #b45309;
+}
+
+.res-backend-missing {
+  background: color-mix(in srgb, #dc2626 16%, transparent);
+  color: #b91c1c;
+}
+
+.res-branch-size {
+  margin-left: 0.35rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+  font-size: 0.76rem;
+}
+
+.res-branch-size small {
+  opacity: 0.75;
+}

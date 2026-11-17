@@ -595,6 +595,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
         .route("/api/projects/{id}/commit", post(project_commit_changes))
         .route("/api/projects/{id}/commits", get(project_commits))
         .route("/api/system/resources", get(system_resources))
+        .route("/api/system/repos/{id}", get(repo_detail))
         .route("/api/projects/{id}/compare", get(project_compare))
         .route(
             "/api/projects/{id}/workflows",

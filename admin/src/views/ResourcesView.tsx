@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   api,
   RepoBranchStats,
   RepoCommitStats,
+  RepoDetail,
   RepoStats,
   SystemResources,
 } from "../api";
@@ -53,7 +54,13 @@ function UsageBar({ used, total }: { used: number; total: number }) {
   );
 }
 
-/** 分支列表：标签形式展示分支名与 tip。 */
+/// 对象存放位置的徽标：PG / 磁盘 / 缺失。
+function BackendTag({ backend }: { backend: "pg" | "disk" | "missing" }) {
+  const label = backend === "pg" ? "PG" : backend === "disk" ? "磁盘" : "缺失";
+  return <span className={`res-backend res-backend-${backend}`}>{label}</span>;
+}
+
+/** 分支列表：分支名、tip、大小与存放位置。 */
 function BranchList({ branches }: { branches: RepoBranchStats[] }) {
   if (branches.length === 0) return <p className="hint">无分支</p>;
   return (
@@ -62,6 +69,13 @@ function BranchList({ branches }: { branches: RepoBranchStats[] }) {
         <span className="res-branch" key={b.name} title={`${b.name} @ ${b.tip_oid}`}>
           <b>{b.name}</b>
           <code>{b.short_oid}</code>
+          <span className="res-branch-size">
+            {fmtBytes(b.size)}
+            {b.backend === "pg" && b.stored_bytes > 0 && (
+              <small> / {fmtBytes(b.stored_bytes)}</small>
+            )}
+          </span>
+          <BackendTag backend={b.backend} />
         </span>
       ))}
     </div>
@@ -78,6 +92,7 @@ function CommitList({ commits }: { commits: RepoCommitStats[] }) {
           <code className="res-commit-oid" title={c.oid}>
             {c.short_oid}
           </code>
+          <BackendTag backend={c.backend} />
           <span className="res-commit-msg" title={c.message}>
             {c.message || "(无提交信息)"}
           </span>
@@ -96,8 +111,28 @@ function CommitList({ commits }: { commits: RepoCommitStats[] }) {
 /** 单个仓库的存储占用卡片，默认折叠明细以免页面过长。 */
 function RepoCard({ repo }: { repo: RepoStats }) {
   const hasDisk = repo.disk_bytes > 0 || repo.disk_packs > 0;
+  const [detail, setDetail] = useState<RepoDetail | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState("");
+  const requested = useRef(false);
+
+  // 展开时才拉明细：逐分支逐提交查对象位置有成本，不该跟着 10 秒轮询跑。
+  async function onToggle(event: React.SyntheticEvent<HTMLDetailsElement>) {
+    if (!event.currentTarget.open || requested.current) return;
+    requested.current = true;
+    setLoading(true);
+    try {
+      setDetail(await api.repoDetail(repo.id));
+      setLoadError("");
+    } catch (e) {
+      setLoadError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
   return (
-    <details className="res-repo">
+    <details className="res-repo" onToggle={onToggle}>
       <summary className="res-repo-summary">
         <span className="res-repo-title">{repo.slug}.git</span>
         <span className="res-repo-quick">
@@ -122,11 +157,21 @@ function RepoCard({ repo }: { repo: RepoStats }) {
           默认分支 <code>{repo.default_branch}</code> · 大小列显示「原始 / PG 存储」，对象在分支间共享，勿按提交累加。
         </p>
 
-        <h5 className="res-repo-subtitle">分支（{repo.branches}）</h5>
-        <BranchList branches={repo.branch_list} />
+        {loading && <p className="hint">加载明细…</p>}
+        {loadError && <p className="hint">明细加载失败：{loadError}</p>}
+        {detail ? (
+          <>
+            <h5 className="res-repo-subtitle">分支（{detail.branch_list.length}）</h5>
+            <BranchList branches={detail.branch_list} />
 
-        <h5 className="res-repo-subtitle">最近提交（{repo.commits} 条中的前 {repo.commit_list.length} 条）</h5>
-        <CommitList commits={repo.commit_list} />
+            <h5 className="res-repo-subtitle">
+              最近提交（{repo.commits} 条中的前 {detail.commit_list.length} 条）
+            </h5>
+            <CommitList commits={detail.commit_list} />
+          </>
+        ) : (
+          !loading && !loadError && <p className="hint">展开后加载分支与提交明细</p>
+        )}
       </div>
     </details>
   );

@@ -37,6 +37,9 @@ pub(crate) struct RepoCommitStats {
     pub size: i64,
     /// 提交对象在 PG 里实际占用字节（octet_length(data)，zlib 压缩后）。
     pub pg_bytes: i64,
+    /// 该提交对象的存放位置：`pg`（PostgreSQL）/ `disk`（磁盘 pack）/
+    /// `missing`（两边都查不到，通常是数据异常）。
+    pub backend: String,
 }
 
 /// 一个分支的展示信息。
@@ -45,6 +48,12 @@ pub(crate) struct RepoBranchStats {
     pub name: String,
     pub tip_oid: String,
     pub short_oid: String,
+    /// tip 提交对象原始字节。
+    pub size: i64,
+    /// tip 提交对象在 PG 中的存储字节（已在磁盘上则为 0）。
+    pub stored_bytes: i64,
+    /// 尖端提交对象的存放位置：`pg` / `disk` / `missing`。
+    pub backend: String,
 }
 
 /// 单个仓库（project）在 PG 与硬盘上的存储占用汇总。
@@ -66,6 +75,17 @@ pub(crate) struct RepoStats {
     pub commits: i64,
     pub branches: usize,
     pub tags: usize,
+}
+
+/// 单个仓库的展开明细：分支与最近提交。
+///
+/// 这部分单独成接口，因为要逐分支、逐提交查对象存放位置，代价明显高于
+/// 汇总统计；页面每 10 秒轮询的应是汇总，展开卡片时才取明细。
+#[derive(Serialize)]
+pub(crate) struct RepoDetail {
+    pub id: String,
+    pub slug: String,
+    pub default_branch: String,
     pub branch_list: Vec<RepoBranchStats>,
     pub commit_list: Vec<RepoCommitStats>,
 }
@@ -128,6 +148,99 @@ pub(crate) async fn system_resources(
         }
     }
     Ok(Json(fresh?))
+}
+
+/// 单个仓库的展开明细：分支与最近提交（含各对象的存放位置）。
+///
+/// 与汇总统计分开，是因为要逐条查 `git_objects` 才知道对象在 PG 还是磁盘，
+/// 代价远高于一个聚合查询；页面展开卡片时才请求一次。
+pub(crate) async fn repo_detail(
+    State(state): State<AppState>,
+    session: Session,
+    // 本文件顶部已 `use std::path::Path`（fs 相关），这里必须全限定。
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+) -> ApiResult<Json<RepoDetail>> {
+    current_admin(&state, &session).await?;
+    let row = sqlx::query("SELECT slug, default_branch FROM projects WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or_else(|| ApiError::with_status(StatusCode::NOT_FOUND, "项目不存在"))?;
+    let slug: String = row.try_get("slug")?;
+    let default_branch: String = row.try_get("default_branch")?;
+
+    let ref_rows = sqlx::query(
+        "SELECT r.name, encode(r.target, 'hex') AS oid,
+                COALESCE(o.size, 0)::bigint AS size,
+                COALESCE(octet_length(o.data), 0)::bigint AS stored_bytes,
+                (o.oid IS NOT NULL) AS in_pg
+         FROM git_refs r
+         LEFT JOIN git_objects o
+                ON o.project_id = r.project_id AND o.oid = r.target
+         WHERE r.project_id = $1 AND r.name LIKE 'refs/heads/%' ORDER BY r.name",
+    )
+    .bind(id)
+    .fetch_all(&state.pool)
+    .await?;
+    let mut branch_list = Vec::with_capacity(ref_rows.len());
+    for r in ref_rows {
+        let name: String = r.try_get("name")?;
+        let tip_oid: String = r.try_get("oid")?;
+        let size: i64 = r.try_get("size")?;
+        let stored_bytes: i64 = r.try_get("stored_bytes")?;
+        let in_pg: bool = r.try_get("in_pg")?;
+        branch_list.push(RepoBranchStats {
+            name: name.strip_prefix("refs/heads/").unwrap_or(&name).to_string(),
+            short_oid: tip_oid.chars().take(7).collect(),
+            tip_oid,
+            size,
+            stored_bytes,
+            backend: backend_of(in_pg, stored_bytes),
+        });
+    }
+
+    let commit_rows = sqlx::query(
+        "SELECT encode(c.oid, 'hex') AS oid, c.message, c.author_name, c.committed_at,
+                COALESCE(o.size, 0)::bigint AS size,
+                COALESCE(octet_length(o.data), 0)::bigint AS pg_bytes,
+                (o.oid IS NOT NULL) AS in_pg
+         FROM git_commits c
+         LEFT JOIN git_objects o ON o.project_id = c.project_id AND o.oid = c.oid
+         WHERE c.project_id = $1
+         ORDER BY c.committed_at DESC LIMIT $2",
+    )
+    .bind(id)
+    .bind(COMMIT_DETAIL_LIMIT)
+    .fetch_all(&state.pool)
+    .await?;
+    let mut commit_list = Vec::with_capacity(commit_rows.len());
+    for c in commit_rows {
+        let oid: String = c.try_get("oid")?;
+        let message: String = c.try_get("message")?;
+        let author_name: String = c.try_get("author_name")?;
+        let committed_at: chrono::DateTime<chrono::Utc> = c.try_get("committed_at")?;
+        let size: i64 = c.try_get("size")?;
+        let pg_bytes: i64 = c.try_get("pg_bytes")?;
+        let in_pg: bool = c.try_get("in_pg")?;
+        commit_list.push(RepoCommitStats {
+            short_oid: oid.chars().take(7).collect(),
+            oid,
+            message: message.lines().next().unwrap_or("").to_string(),
+            author_name,
+            committed_at: committed_at.to_rfc3339(),
+            size,
+            pg_bytes,
+            backend: backend_of(in_pg, pg_bytes),
+        });
+    }
+
+    Ok(Json(RepoDetail {
+        id: id.to_string(),
+        slug,
+        default_branch,
+        branch_list,
+        commit_list,
+    }))
 }
 
 async fn compute_resources(state: &AppState) -> ApiResult<SystemResources> {
@@ -242,58 +355,6 @@ async fn compute_all_repos_stats(pool: &sqlx::PgPool) -> anyhow::Result<Vec<Repo
         let tags: i64 = row.try_get("tags")?;
         let project_id: uuid::Uuid = id.parse()?;
 
-        // 2a) 分支列表。
-        let ref_rows = sqlx::query(
-            "SELECT name, encode(target, 'hex') AS oid FROM git_refs
-             WHERE project_id = $1 AND name LIKE 'refs/heads/%' ORDER BY name",
-        )
-        .bind(project_id)
-        .fetch_all(pool)
-        .await?;
-        let mut branch_list = Vec::with_capacity(ref_rows.len());
-        for r in ref_rows {
-            let name: String = r.try_get("name")?;
-            let tip_oid: String = r.try_get("oid")?;
-            branch_list.push(RepoBranchStats {
-                name: name.strip_prefix("refs/heads/").unwrap_or(&name).to_string(),
-                short_oid: tip_oid.chars().take(7).collect(),
-                tip_oid,
-            });
-        }
-
-        // 2b) 最近提交列表。LEFT JOIN 保证 offload 掉对象行的提交仍会出现。
-        let commit_rows = sqlx::query(
-            "SELECT encode(c.oid, 'hex') AS oid, c.message, c.author_name, c.committed_at,
-                    COALESCE(o.size, 0)::bigint AS size,
-                    COALESCE(octet_length(o.data), 0)::bigint AS pg_bytes
-             FROM git_commits c
-             LEFT JOIN git_objects o ON o.project_id = c.project_id AND o.oid = c.oid
-             WHERE c.project_id = $1
-             ORDER BY c.committed_at DESC LIMIT $2",
-        )
-        .bind(project_id)
-        .bind(COMMIT_DETAIL_LIMIT)
-        .fetch_all(pool)
-        .await?;
-        let mut commit_list = Vec::with_capacity(commit_rows.len());
-        for c in commit_rows {
-            let oid: String = c.try_get("oid")?;
-            let message: String = c.try_get("message")?;
-            let author_name: String = c.try_get("author_name")?;
-            let committed_at: chrono::DateTime<chrono::Utc> = c.try_get("committed_at")?;
-            let size: i64 = c.try_get("size")?;
-            let commit_pg_bytes: i64 = c.try_get("pg_bytes")?;
-            commit_list.push(RepoCommitStats {
-                short_oid: oid.chars().take(7).collect(),
-                oid,
-                message: message.lines().next().unwrap_or("").to_string(),
-                author_name,
-                committed_at: committed_at.to_rfc3339(),
-                size,
-                pg_bytes: commit_pg_bytes,
-            });
-        }
-
         repos.push(RepoStats {
             id,
             slug,
@@ -306,8 +367,6 @@ async fn compute_all_repos_stats(pool: &sqlx::PgPool) -> anyhow::Result<Vec<Repo
             commits,
             branches: branches.max(0) as usize,
             tags: tags.max(0) as usize,
-            branch_list,
-            commit_list,
         });
     }
 
@@ -362,6 +421,20 @@ async fn compute_all_repos_stats(pool: &sqlx::PgPool) -> anyhow::Result<Vec<Repo
 
 /// statvfs 读挂载点用量。路径不存在或跨文件系统读失败时返回 Err，
 /// 调用方按 0 处理，监控页不因一个目录挂掉而整页 500。
+/// 由「是否在 PG 中」与「PG 存储字节」推断对象的存放位置。
+///
+/// 对象在 PG 里但 `octet_length(data)` 为 0 不可能出现；不在 PG 时，
+/// 若磁盘后端启用则多半已被 offload，否则就是数据缺失。
+fn backend_of(in_pg: bool, stored_bytes: i64) -> String {
+    if in_pg && stored_bytes > 0 {
+        "pg".to_string()
+    } else if crate::git::store::disk_store().is_some() {
+        "disk".to_string()
+    } else {
+        "missing".to_string()
+    }
+}
+
 fn fs_usage(path: &Path) -> anyhow::Result<(u64, u64)> {
     use std::os::unix::ffi::OsStrExt;
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
