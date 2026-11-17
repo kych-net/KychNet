@@ -132,7 +132,10 @@ impl KychMcp {
     }
 
     #[tool(
-        description = "列出站点所有已发布页面：输出路径（slug）、源文件名、格式与更新时间。返回 JSON 数组，slug 可直接用于 get_page。"
+        name = "列出站点页面",
+        title = "列出站点页面",
+        description = "列出站点所有已发布页面：输出路径（slug）、源文件名、格式与更新时间。返回 JSON 数组，slug 可直接用于「读取站点页面」。",
+        annotations(read_only_hint = true)
     )]
     async fn list_pages(
         &self,
@@ -157,7 +160,10 @@ impl KychMcp {
     }
 
     #[tool(
-        description = "按路径读取一篇已发布页面的源内容。路径参数接受 xef/index、/xef/index 或 xef/index.html 三种写法。返回源文件名、格式（markdown/html/typst/wikidot）与正文源码。"
+        name = "读取站点页面",
+        title = "读取站点页面",
+        description = "按路径读取一篇已发布页面的源内容。路径参数接受 xef/index、/xef/index 或 xef/index.html 三种写法。返回源文件名、格式（markdown/html/typst/wikidot）与正文源码。",
+        annotations(read_only_hint = true)
     )]
     async fn get_page(
         &self,
@@ -190,7 +196,10 @@ impl KychMcp {
     }
 
     #[tool(
-        description = "全文搜索已发布页面的正文（大小写不敏感的子串匹配）。返回每条结果的路径、源文件名、格式与命中位置附近的一段摘要。"
+        name = "搜索站点内容",
+        title = "搜索站点内容",
+        description = "全文搜索已发布页面的正文（大小写不敏感的子串匹配）。返回每条结果的路径、源文件名、格式与命中位置附近的一段摘要。",
+        annotations(read_only_hint = true)
     )]
     async fn search_content(
         &self,
@@ -233,7 +242,10 @@ impl KychMcp {
     }
 
     #[tool(
-        description = "获取站点基本信息：站点名称、导航、logo、页面总数与 API 地址。调用其他工具前可先用它了解站点概况。"
+        name = "站点信息",
+        title = "站点信息",
+        description = "获取站点基本信息：站点名称、导航、logo、页面总数与 API 地址。调用其他工具前可先用它了解站点概况。",
+        annotations(read_only_hint = true)
     )]
     async fn site_info(
         &self,
@@ -263,6 +275,8 @@ impl KychMcp {
         ))
     }
     #[tool(
+        name = "保存站点内容",
+        title = "保存站点内容",
         description = "新增或更新一篇内容并自动编译该页。format 支持 markdown/html/typst/wikidot/css；slug 使用 /xef/index、/reff/93df/l.html 或 /css/theme 形式。"
     )]
     async fn save_content(
@@ -303,7 +317,11 @@ impl KychMcp {
         Ok(text_result(json!({ "item": item, "built": true }).to_string()))
     }
 
-    #[tool(description = "删除一篇内容并清理静态产物；网站主页 index.html 不允许删除。")]
+    #[tool(
+        name = "删除站点内容",
+        title = "删除站点内容",
+        description = "删除一篇内容并清理静态产物；网站主页 index.html 不允许删除。"
+    )]
     async fn delete_content(
         &self,
         Extension(parts): Extension<Parts>,
@@ -333,7 +351,12 @@ impl KychMcp {
         Ok(text_result(json!({ "deleted": slug }).to_string()))
     }
 
-    #[tool(description = "列出所有项目（项目名 slug、描述、默认分支、更新时间）。")]
+    #[tool(
+        name = "列出项目",
+        title = "列出项目",
+        description = "列出所有项目（项目名 slug、描述、默认分支、更新时间）。",
+        annotations(read_only_hint = true)
+    )]
     async fn list_projects(
         &self,
         Extension(parts): Extension<Parts>,
@@ -345,7 +368,12 @@ impl KychMcp {
         Ok(text_result(json!({ "projects": projects }).to_string()))
     }
 
-    #[tool(description = "列出项目某个目录下的文件；branch 省略时用默认分支，path 省略表示根目录。")]
+    #[tool(
+        name = "列出项目文件",
+        title = "列出项目文件",
+        description = "列出项目某个目录下的文件；branch 省略时用默认分支，path 省略表示根目录。",
+        annotations(read_only_hint = true)
+    )]
     async fn list_project_files(
         &self,
         Extension(parts): Extension<Parts>,
@@ -361,7 +389,12 @@ impl KychMcp {
         Ok(text_result(json!({ "project": p.slug, "branch": branch, "path": path, "items": items }).to_string()))
     }
 
-    #[tool(description = "读取项目中的单个 UTF-8 文件内容。")]
+    #[tool(
+        name = "读取项目文件",
+        title = "读取项目文件",
+        description = "读取项目中的单个 UTF-8 文件内容。",
+        annotations(read_only_hint = true)
+    )]
     async fn read_project_file(
         &self,
         Extension(parts): Extension<Parts>,
@@ -377,7 +410,11 @@ impl KychMcp {
         Ok(text_result(json!({ "project": p.slug, "branch": branch, "file": item }).to_string()))
     }
 
-    #[tool(description = "新增或更新项目文件并提交；默认分支的修改会自动触发整站构建。")]
+    #[tool(
+        name = "写入项目文件",
+        title = "写入项目文件",
+        description = "新增或更新项目文件并提交；默认分支的修改会自动触发整站构建。"
+    )]
     async fn write_project_file(
         &self,
         Extension(parts): Extension<Parts>,
@@ -405,7 +442,11 @@ impl KychMcp {
         Ok(text_result(json!({ "project": p.slug, "branch": branch, "item": result }).to_string()))
     }
 
-    #[tool(description = "删除项目文件并提交；默认分支的修改会自动触发整站构建。")]
+    #[tool(
+        name = "删除项目文件",
+        title = "删除项目文件",
+        description = "删除项目文件并提交；默认分支的修改会自动触发整站构建。"
+    )]
     async fn delete_project_file(
         &self,
         Extension(parts): Extension<Parts>,
@@ -430,12 +471,149 @@ impl KychMcp {
         }
         Ok(text_result(json!({ "project": p.slug, "branch": branch, "item": result }).to_string()))
     }
+
+    #[tool(
+        name = "列出拉取请求",
+        title = "列出拉取请求",
+        description = "列出项目内的拉取请求（PR），按编号倒序返回。参数 project 为项目 slug；limit 默认 50，最大 500。",
+        annotations(read_only_hint = true)
+    )]
+    async fn list_pull_requests(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(params): Parameters<PrListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        require_scope(&parts, "pr:read")?;
+        let p = self.find_project(&params.project).await?;
+        let items = crate::collab::list_prs(&self.pool, p.id, params.limit, params.offset)
+            .await
+            .map_err(tool_error)?;
+        Ok(text_result(
+            json!({ "project": p.slug, "count": items.len(), "items": items }).to_string(),
+        ))
+    }
+
+    #[tool(
+        name = "查看拉取请求",
+        title = "查看拉取请求",
+        description = "查看一个拉取请求的详情，包含文件差异、可合并性、冲突、评论。project 为项目 slug，number 为 PR 编号。",
+        annotations(read_only_hint = true)
+    )]
+    async fn get_pull_request(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(params): Parameters<PrNumberParams>,
+    ) -> Result<CallToolResult, McpError> {
+        require_scope(&parts, "pr:read")?;
+        let p = self.find_project(&params.project).await?;
+        let item = crate::collab::pr_detail(&self.pool, p.id, params.number)
+            .await
+            .map_err(tool_error)?
+            .ok_or_else(|| McpError::invalid_params("PR 不存在", None))?;
+        Ok(text_result(json!({ "project": p.slug, "item": item }).to_string()))
+    }
+
+    #[tool(
+        name = "创建拉取请求",
+        title = "创建拉取请求",
+        description = "创建一个拉取请求。project 为项目 slug；source_branch 为来源分支；target_branch 为目标分支；title 为标题；body 为说明。提交身份取当前 MCP 登录用户。"
+    )]
+    async fn create_pull_request(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(params): Parameters<PrCreateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        require_scope(&parts, "pr:write")?;
+        let actor = mcp_actor(&parts)?;
+        let p = self.find_project(&params.project).await?;
+        let item = crate::collab::create_pr(
+            &self.pool,
+            actor,
+            p.id,
+            &params.title,
+            &params.body,
+            &params.source_branch,
+            &params.target_branch,
+        )
+        .await
+        .map_err(tool_error)?;
+        Ok(text_result(json!({ "project": p.slug, "item": item }).to_string()))
+    }
+
+    #[tool(
+        name = "评论拉取请求",
+        title = "评论拉取请求",
+        description = "给一个拉取请求添加评论。project 为项目 slug，number 为 PR 编号，body 为评论正文。"
+    )]
+    async fn comment_pull_request(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(params): Parameters<PrCommentParams>,
+    ) -> Result<CallToolResult, McpError> {
+        require_scope(&parts, "pr:write")?;
+        let actor = mcp_actor(&parts)?;
+        let p = self.find_project(&params.project).await?;
+        let item = crate::collab::add_pr_comment(
+            &self.pool,
+            actor,
+            p.id,
+            params.number,
+            &params.body,
+        )
+        .await
+        .map_err(tool_error)?;
+        Ok(text_result(json!({ "project": p.slug, "item": item }).to_string()))
+    }
+
+    #[tool(
+        name = "合并拉取请求",
+        title = "合并拉取请求",
+        description = "合并一个开放的拉取请求。project 为项目 slug，number 为 PR 编号。合并前会按站点工作流门禁检查。"
+    )]
+    async fn merge_pull_request(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(params): Parameters<PrNumberParams>,
+    ) -> Result<CallToolResult, McpError> {
+        require_scope(&parts, "pr:write")?;
+        let actor = mcp_actor(&parts)?;
+        let p = self.find_project(&params.project).await?;
+        let outcome = crate::collab::merge_pr(&self.pool, actor, p.id, params.number)
+            .await
+            .map_err(tool_error)?;
+        Ok(text_result(
+            json!({
+                "project": p.slug,
+                "item": outcome.pr,
+                "overwrote_target": outcome.overwrote_target
+            })
+            .to_string(),
+        ))
+    }
+
+    #[tool(
+        name = "关闭拉取请求",
+        title = "关闭拉取请求",
+        description = "关闭一个开放的拉取请求，不删除分支或提交。project 为项目 slug，number 为 PR 编号。"
+    )]
+    async fn close_pull_request(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(params): Parameters<PrNumberParams>,
+    ) -> Result<CallToolResult, McpError> {
+        require_scope(&parts, "pr:write")?;
+        let p = self.find_project(&params.project).await?;
+        let item = crate::collab::close_pr(&self.pool, p.id, params.number)
+            .await
+            .map_err(tool_error)?;
+        Ok(text_result(json!({ "project": p.slug, "item": item }).to_string()))
+    }
 }
 
 #[tool_handler(
     name = "kych-net",
-    version = "0.3.0",
-    instructions = "本站内容与项目接口。查询内容用 search_content/get_page；写内容用 save_content/delete_content；项目用 list_projects、list_project_files、read_project_file、write_project_file、delete_project_file。"
+    version = "0.4.0",
+    instructions = "KychNet 中文 MCP。所有工具名与说明均为中文。查询内容用「列出站点页面」「读取站点页面」「搜索站点内容」「站点信息」；写内容用「保存站点内容」「删除站点内容」；项目读写用「列出项目」「列出项目文件」「读取项目文件」「写入项目文件」「删除项目文件」；PR 协作用「列出拉取请求」「查看拉取请求」「创建拉取请求」「评论拉取请求」「合并拉取请求」「关闭拉取请求」。"
 )]
 impl ServerHandler for KychMcp {}
 
@@ -495,6 +673,53 @@ struct ProjectDeleteParams {
     path: String,
     branch: Option<String>,
     message: Option<String>,
+}
+
+fn default_pr_limit() -> i64 { 50 }
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct PrListParams {
+    /// 项目 slug，例如 跨越晨昏。
+    project: String,
+    /// 每页条数，默认 50，最大 500。
+    #[serde(default = "default_pr_limit")]
+    limit: i64,
+    /// 偏移量，默认 0。
+    #[serde(default)]
+    offset: i64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct PrNumberParams {
+    /// 项目 slug，例如 跨越晨昏。
+    project: String,
+    /// PR 编号。
+    number: i32,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct PrCreateParams {
+    /// 项目 slug，例如 跨越晨昏。
+    project: String,
+    /// PR 标题。
+    title: String,
+    /// PR 说明，可留空。
+    #[serde(default)]
+    body: String,
+    /// 来源分支名。
+    source_branch: String,
+    /// 目标分支名。
+    target_branch: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct PrCommentParams {
+    /// 项目 slug，例如 跨越晨昏。
+    project: String,
+    /// PR 编号。
+    number: i32,
+    /// 评论正文。
+    body: String,
 }
 
 fn mcp_actor(parts: &Parts) -> Result<&User, McpError> {

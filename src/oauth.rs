@@ -26,7 +26,7 @@ use crate::service;
 
 pub const MCP_RESOURCE: &str = "https://kych.net/mcp";
 const OAUTH_ORIGIN: &str = "https://kych.net";
-const SCOPES: &str = "content:read content:write project:read project:write";
+const SCOPES: &str = "content:read content:write project:read project:write pr:read pr:write";
 const ACCESS_TTL_SECS: i64 = 3600;
 const REFRESH_TTL_SECS: i64 = 30 * 24 * 3600;
 const OAUTH_LOGIN_PER_IP: (u32, u64) = (10, 60);

@@ -101,7 +101,7 @@
 │   ├── rate.rs          # 登录/注册接口的有界内存限流
 │   ├── api/             # Axum 路由与处理器(mod/content/project/auth/git)
 │   ├── build.rs         # 静态站生成
-│   ├── mcp.rs           # MCP Streamable HTTP 只读服务器
+│   ├── mcp.rs           # MCP Streamable HTTP 中文工具服务器（内容/项目/PR）
 │   ├── project.rs       # 项目管理
 │   ├── collab.rs        # 分支/PR/讨论协作
 │   ├── workflow/        # 工作流执行(runner 派发、事件出箱)
@@ -221,14 +221,18 @@ MCP 使用标准 **OAuth 2.1**：MCP 客户端通过动态客户端注册、授�
 
 客户端第一次连 `/mcp` 会收到 `401` 和 `WWW-Authenticate: Bearer resource_metadata=...`，然后自动完成发现和注册，并打开 KychNet 授权页。授权页使用现有账号 + 动态验证码登录；登录后确认权限即可。
 
-普通成员和管理员都可以读写 MCP；项目 Git 提交使用当前登录用户作为提交身份。授权页会明确列出读取内容、写入内容、读取项目、写入项目四项权限。
+普通成员和管理员都可以读写 MCP；项目 Git 提交与 PR 操作使用当前登录用户作为提交身份。授权页会明确列出读取内容、写入内容、读取项目、写入项目、读取 PR、写入 PR 六项权限。
 
 ### 工具
 
-- 只读：`list_pages`、`get_page`、`search_content`、`site_info`
-- 内容写入：`save_content`、`delete_content`
-- 项目读取：`list_projects`、`list_project_files`、`read_project_file`
-- 项目写入：`write_project_file`、`delete_project_file`
+从 0.4.0 起，MCP 工具名、标题和说明统一使用中文；JSON 字段保持英文以兼容既有客户端。升级后需要在 MCP 客户端里重新连接以刷新工具列表和 OAuth scope。
+
+- 内容读取：`列出站点页面`、`读取站点页面`、`搜索站点内容`、`站点信息`
+- 内容写入：`保存站点内容`、`删除站点内容`
+- 项目读取：`列出项目`、`列出项目文件`、`读取项目文件`
+- 项目写入：`写入项目文件`、`删除项目文件`
+- PR 读取：`列出拉取请求`、`查看拉取请求`
+- PR 写入：`创建拉取请求`、`评论拉取请求`、`合并拉取请求`、`关闭拉取请求`
 
 ### 客户端安装
 

@@ -34,24 +34,28 @@ dsh plugin --profile <profile> add dsh-mcp-kychnet
 ## 首次授权
 
 第一次调用任一 `mcp__kych-net__*` 工具时，客户端会收到 401 并按资源元数据自动完成发现与
-动态注册，然后打开 KychNet 授权页。用现有账号登录、确认四项权限即可：
+动态注册，然后打开 KychNet 授权页。用现有账号登录、确认六项权限即可：
 
 | 权限 | 覆盖的工具 |
 | --- | --- |
-| `content:read` | `list_pages`、`get_page`、`search_content`、`site_info` |
-| `content:write` | `save_content`、`delete_content` |
-| `project:read` | `list_projects`、`list_project_files`、`read_project_file` |
-| `project:write` | `write_project_file`、`delete_project_file` |
+| `content:read` | `列出站点页面`、`读取站点页面`、`搜索站点内容`、`站点信息` |
+| `content:write` | `保存站点内容`、`删除站点内容` |
+| `project:read` | `列出项目`、`列出项目文件`、`读取项目文件` |
+| `project:write` | `写入项目文件`、`删除项目文件` |
+| `pr:read` | `列出拉取请求`、`查看拉取请求` |
+| `pr:write` | `创建拉取请求`、`评论拉取请求`、`合并拉取请求`、`关闭拉取请求` |
 
 access token 一小时过期，refresh token 最长 30 天；令牌只保存在插件进程内存中，不写入
 profile。站点侧撤销全部授权见仓库 README 的「撤销授权」一节。
 
 ## 工具
 
-安装后工具以 `mcp__kych-net__<tool>` 出现，与 README「MCP 服务器 → 工具」一节列出的
-`list_pages`、`get_page`、`search_content`、`site_info`、`save_content`、`delete_content`、
-`list_projects`、`list_project_files`、`read_project_file`、`write_project_file`、
-`delete_project_file` 一一对应。
+安装后工具以 `mcp__kych-net__<工具名>` 出现，工具名自 0.4.0 起为中文，与 README「MCP 服务器 → 工具」一节列出的
+`列出站点页面`、`读取站点页面`、`搜索站点内容`、`站点信息`、`保存站点内容`、`删除站点内容`、
+`列出项目`、`列出项目文件`、`读取项目文件`、`写入项目文件`、`删除项目文件`、
+`列出拉取请求`、`查看拉取请求`、`创建拉取请求`、`评论拉取请求`、`合并拉取请求`、`关闭拉取请求` 一一对应。
+
+旧客户端需要在「设置 → MCP」里重新连接，以刷新中文工具列表与新增的 PR 权限。
 
 ## 配置
 
