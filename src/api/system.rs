@@ -19,6 +19,57 @@ pub(crate) struct DiskUsage {
     pub total_bytes: u64,
 }
 
+/// 一个提交在监控里的展示信息。
+#[derive(Serialize, Clone)]
+pub(crate) struct RepoCommitStats {
+    pub oid: String,
+    /// 短 OID，前端展示用。
+    pub short_oid: String,
+    pub message: String,
+    pub author_name: String,
+    /// RFC 3339 时间字符串。
+    pub committed_at: String,
+    /// 提交对象原始字节（git_objects.size）。
+    pub size: i64,
+    /// 提交对象在 PG 里实际占用字节（octet_length(data)，zlib 压缩后）。
+    pub pg_bytes: i64,
+}
+
+/// 一个分支的展示信息。
+#[derive(Serialize, Clone)]
+pub(crate) struct RepoBranchStats {
+    pub name: String,
+    pub tip_oid: String,
+    pub short_oid: String,
+}
+
+/// 单个仓库（project）在 PG 与硬盘上的存储占用汇总。
+#[derive(Serialize, Clone)]
+pub(crate) struct RepoStats {
+    pub id: String,
+    pub slug: String,
+    pub default_branch: String,
+    /// git_objects 行数（PG 中的对象数）。
+    pub objects: i64,
+    /// git_objects.data 实际存储字节（zlib 压缩后，近似 PG 占用）。
+    pub pg_bytes: i64,
+    /// git_objects.size 之和（对象原始字节）。
+    pub raw_bytes: i64,
+    /// 磁盘 packfile + idx 占用字节（GIT_OBJECT_BACKEND=disk 时才有值）。
+    pub disk_bytes: u64,
+    /// 磁盘 pack 文件个数。
+    pub disk_packs: usize,
+    pub commits: i64,
+    pub branches: usize,
+    pub tags: usize,
+    pub branch_list: Vec<RepoBranchStats>,
+    pub commit_list: Vec<RepoCommitStats>,
+}
+
+/// 每个仓库提交列表的上限：监控页只需最近的提交，避免把全部历史搬过网络。
+/// 提交总数另用 commits 字段给出，不受此上限影响。
+const COMMIT_DETAIL_LIMIT: i64 = 50;
+
 #[derive(Serialize, Clone)]
 pub(crate) struct SystemResources {
     pub load1: f64,
@@ -38,6 +89,8 @@ pub(crate) struct SystemResources {
     pub git_objects_bytes: i64,
     /// LFS 二进制对象占用的磁盘字节。
     pub lfs_bytes: u64,
+    /// 所有仓库在 PG 与硬盘上的存储占用明细。
+    pub repos: Vec<RepoStats>,
 }
 
 /// 资源统计的短缓存：30 秒内的重复请求直接复用上次结果。
@@ -119,6 +172,10 @@ async fn compute_resources(state: &AppState) -> ApiResult<SystemResources> {
     let git_objects: i64 = row.try_get("git_objects")?;
     let git_objects_bytes: i64 = row.try_get("git_objects_bytes")?;
 
+    // 所有仓库的存储占用明细。任一仓库查询失败就降级为空列表，
+    // 不影响负载 / 内存 / 磁盘等核心指标。
+    let repos = compute_all_repos_stats(&state.pool).await.unwrap_or_default();
+
     let load = proc_loadavg().unwrap_or((0.0, 0.0, 0.0));
     let mem = proc_meminfo().unwrap_or((0, 0));
 
@@ -138,7 +195,164 @@ async fn compute_resources(state: &AppState) -> ApiResult<SystemResources> {
         git_objects,
         git_objects_bytes: git_objects_bytes.max(0),
         lfs_bytes,
+        repos,
     })
+}
+
+/// 统计所有仓库（project）在 PG 与硬盘上的存储占用。
+///
+/// 分三步：
+/// 1. 一次聚合查询拿到每个仓库的对象数 / PG 字节 / 原始字节 / 提交数 / 分支数 / 标签数；
+/// 2. 每个仓库分别取分支列表（git_refs）与最近提交列表（git_commits ⋈ git_objects）；
+/// 3. 若启用磁盘后端，按 project_id 目录扫描 packfile 字节（放进阻塞线程）。
+async fn compute_all_repos_stats(pool: &sqlx::PgPool) -> anyhow::Result<Vec<RepoStats>> {
+    // 1) 所有仓库的聚合计数。用相关子查询，仓库数量有限，读起来直观。
+    let rows = sqlx::query(
+        "SELECT id::text AS id, slug, default_branch,
+            (SELECT count(*) FROM git_objects o WHERE o.project_id = p.id)::bigint AS objects,
+            (SELECT COALESCE(sum(octet_length(o.data)), 0)
+               FROM git_objects o WHERE o.project_id = p.id)::bigint AS pg_bytes,
+            (SELECT COALESCE(sum(o.size), 0)
+               FROM git_objects o WHERE o.project_id = p.id)::bigint AS raw_bytes,
+            (SELECT count(*) FROM git_commits c WHERE c.project_id = p.id)::bigint AS commits,
+            (SELECT count(*) FROM git_refs r
+               WHERE r.project_id = p.id AND r.name LIKE 'refs/heads/%')::bigint AS branches,
+            (SELECT count(*) FROM git_refs r
+               WHERE r.project_id = p.id AND r.name LIKE 'refs/tags/%')::bigint AS tags
+         FROM projects p ORDER BY p.slug",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut repos: Vec<RepoStats> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id: String = row.try_get("id")?;
+        let slug: String = row.try_get("slug")?;
+        let default_branch: String = row.try_get("default_branch")?;
+        let objects: i64 = row.try_get("objects")?;
+        let pg_bytes: i64 = row.try_get("pg_bytes")?;
+        let raw_bytes: i64 = row.try_get("raw_bytes")?;
+        let commits: i64 = row.try_get("commits")?;
+        let branches: i64 = row.try_get("branches")?;
+        let tags: i64 = row.try_get("tags")?;
+        let project_id: uuid::Uuid = id.parse()?;
+
+        // 2a) 分支列表。
+        let ref_rows = sqlx::query(
+            "SELECT name, encode(target, 'hex') AS oid FROM git_refs
+             WHERE project_id = $1 AND name LIKE 'refs/heads/%' ORDER BY name",
+        )
+        .bind(project_id)
+        .fetch_all(pool)
+        .await?;
+        let mut branch_list = Vec::with_capacity(ref_rows.len());
+        for r in ref_rows {
+            let name: String = r.try_get("name")?;
+            let tip_oid: String = r.try_get("oid")?;
+            branch_list.push(RepoBranchStats {
+                name: name.strip_prefix("refs/heads/").unwrap_or(&name).to_string(),
+                short_oid: tip_oid.chars().take(7).collect(),
+                tip_oid,
+            });
+        }
+
+        // 2b) 最近提交列表。LEFT JOIN 保证 offload 掉对象行的提交仍会出现。
+        let commit_rows = sqlx::query(
+            "SELECT encode(c.oid, 'hex') AS oid, c.message, c.author_name, c.committed_at,
+                    COALESCE(o.size, 0)::bigint AS size,
+                    COALESCE(octet_length(o.data), 0)::bigint AS pg_bytes
+             FROM git_commits c
+             LEFT JOIN git_objects o ON o.project_id = c.project_id AND o.oid = c.oid
+             WHERE c.project_id = $1
+             ORDER BY c.committed_at DESC LIMIT $2",
+        )
+        .bind(project_id)
+        .bind(COMMIT_DETAIL_LIMIT)
+        .fetch_all(pool)
+        .await?;
+        let mut commit_list = Vec::with_capacity(commit_rows.len());
+        for c in commit_rows {
+            let oid: String = c.try_get("oid")?;
+            let message: String = c.try_get("message")?;
+            let author_name: String = c.try_get("author_name")?;
+            let committed_at: chrono::DateTime<chrono::Utc> = c.try_get("committed_at")?;
+            let size: i64 = c.try_get("size")?;
+            let commit_pg_bytes: i64 = c.try_get("pg_bytes")?;
+            commit_list.push(RepoCommitStats {
+                short_oid: oid.chars().take(7).collect(),
+                oid,
+                message: message.lines().next().unwrap_or("").to_string(),
+                author_name,
+                committed_at: committed_at.to_rfc3339(),
+                size,
+                pg_bytes: commit_pg_bytes,
+            });
+        }
+
+        repos.push(RepoStats {
+            id,
+            slug,
+            default_branch,
+            objects,
+            pg_bytes,
+            raw_bytes,
+            disk_bytes: 0,
+            disk_packs: 0,
+            commits,
+            branches: branches.max(0) as usize,
+            tags: tags.max(0) as usize,
+            branch_list,
+            commit_list,
+        });
+    }
+
+    // 3) 磁盘后端：按 project_id 目录统计 pack 字节（同步遍历，放阻塞线程）。
+    if let Some(disk) = crate::git::store::disk_store() {
+        let root = disk.root().to_path_buf();
+        let mut ids: Vec<(usize, uuid::Uuid)> = Vec::new();
+        for (i, repo) in repos.iter().enumerate() {
+            if let Ok(uid) = repo.id.parse::<uuid::Uuid>() {
+                ids.push((i, uid));
+            }
+        }
+        let sizes: Vec<(usize, u64, usize)> = tokio::task::spawn_blocking(move || {
+            ids.into_iter()
+                .map(|(i, uid)| {
+                    let dir = root.join(uid.to_string()).join("objects").join("pack");
+                    match std::fs::read_dir(&dir) {
+                        Ok(entries) => {
+                            let mut bytes = 0u64;
+                            let mut packs = 0usize;
+                            for entry in entries.flatten() {
+                                let name = entry.file_name();
+                                let name = name.to_string_lossy();
+                                if name.ends_with(".pack") || name.ends_with(".idx") {
+                                    if let Ok(meta) = entry.metadata() {
+                                        bytes += meta.len();
+                                        if name.ends_with(".pack") {
+                                            packs += 1;
+                                        }
+                                    }
+                                }
+                            }
+                            (i, bytes, packs)
+                        }
+                        Err(_) => (i, 0, 0),
+                    }
+                })
+                .collect()
+        })
+        .await
+        .unwrap_or_default();
+        for (i, bytes, packs) in sizes {
+            if let Some(repo) = repos.get_mut(i) {
+                repo.disk_bytes = bytes;
+                repo.disk_packs = packs;
+            }
+        }
+    }
+
+    Ok(repos)
 }
 
 /// statvfs 读挂载点用量。路径不存在或跨文件系统读失败时返回 Err，

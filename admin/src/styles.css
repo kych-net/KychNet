@@ -3672,6 +3672,189 @@ code,
   background: #d9534f;
 }
 
+/* 资源监控：仓库存储占用区块 */
+.res-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+}
+
+.res-section-title {
+  margin: 0.4rem 0 0;
+  font-size: 1rem;
+}
+
+.res-repos {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.res-repo {
+  background: var(--surface, #fff);
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  overflow: hidden;
+}
+
+.res-repo-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem 1rem;
+  padding: 0.7rem 1rem;
+  cursor: pointer;
+  list-style: none;
+}
+
+.res-repo-summary::-webkit-details-marker {
+  display: none;
+}
+
+.res-repo-summary:hover {
+  background: rgba(127, 127, 127, 0.06);
+}
+
+.res-repo-summary::before {
+  content: "▸";
+  color: var(--muted, #666);
+  margin-right: 0.5rem;
+}
+
+.res-repo[open] .res-repo-summary::before {
+  content: "▾";
+}
+
+.res-repo-title {
+  font-weight: 600;
+}
+
+.res-repo-quick {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem 1rem;
+  font-size: 0.78rem;
+  color: var(--muted, #666);
+}
+
+.res-repo-body {
+  padding: 0.2rem 1rem 1rem;
+  border-top: 1px solid var(--border);
+}
+
+.res-repo-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 0.6rem;
+  margin-top: 0.8rem;
+}
+
+.res-repo-stats > div {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.res-repo-stats b {
+  font-size: 1.05rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.res-repo-stats span {
+  font-size: 0.74rem;
+  color: var(--muted, #666);
+}
+
+.res-repo-note {
+  margin: 0.8rem 0 0;
+  font-size: 0.76rem;
+  color: var(--muted, #666);
+}
+
+.res-repo-subtitle {
+  margin: 1rem 0 0.4rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--muted, #666);
+}
+
+.res-branches {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.res-branch {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.2rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 0.78rem;
+}
+
+.res-branch code {
+  color: var(--accent, #4a7dff);
+  font-size: 0.74rem;
+}
+
+.res-commits {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.res-commit {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  padding: 0.35rem 0;
+  border-top: 1px solid var(--border, rgba(127, 127, 127, 0.18));
+  font-size: 0.82rem;
+}
+
+.res-commit:first-child {
+  border-top: none;
+}
+
+.res-commit-oid {
+  flex: none;
+  color: var(--accent, #4a7dff);
+  font-size: 0.78rem;
+}
+
+.res-commit-msg {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.res-commit-size {
+  flex: none;
+  font-size: 0.72rem;
+  color: var(--muted, #666);
+  font-variant-numeric: tabular-nums;
+}
+
+.res-commit-meta {
+  flex: none;
+  font-size: 0.74rem;
+  color: var(--muted, #666);
+}
+
+@media (max-width: 640px) {
+  .res-commit-meta,
+  .res-commit-size {
+    display: none;
+  }
+}
+
 /* ---------- 页面 <head> 自定义编辑区 ---------- */
 .head-editor {
   margin-top: 0.75rem;
