@@ -838,23 +838,35 @@ pub async fn merge_pr(
         .context("目标分支不存在")?;
 
     // 工作流检查门禁：项目开启 require_workflow_checks 时，与当前来源分支头绑定的
-    // required 检查必须全部 success。执行器缺席不会写 required 检查，因此不阻塞合并。
-    let checks_pass: Option<bool> = sqlx::query_scalar(
-        r#"SELECT COALESCE(bool_and(c.conclusion = 'success'), true)
-             FROM projects p
-             LEFT JOIN pr_checks c
-               ON c.project_id = p.id AND c.pr_number = $2 AND c.required
-              AND c.commit_oid = $3
-            WHERE p.id = $1 AND p.require_workflow_checks
-            GROUP BY p.id"#,
+    // required 检查必须全部 success。执行器缺席写的是 required=false 的 skipped
+    // 检查（见 workflow/dispatch.rs），因此不阻塞合并；项目从未配置工作流时
+    // pr_checks 没有任何记录，同样不阻塞。
+    // 但只要本 PR 有过检查记录，当前 head 就必须也有记录：否则「检查通过后
+    // 再推一个新提交」会让新 head 无记录可用，门禁被绕过（fail-open）。
+    let (gating, has_any, has_head, required_ok): (bool, bool, bool, bool) = sqlx::query_as(
+        r#"SELECT p.require_workflow_checks,
+                  EXISTS(SELECT 1 FROM pr_checks c
+                          WHERE c.project_id = p.id AND c.pr_number = $2),
+                  EXISTS(SELECT 1 FROM pr_checks c
+                          WHERE c.project_id = p.id AND c.pr_number = $2
+                            AND c.commit_oid = $3),
+                  COALESCE((SELECT bool_and(c.conclusion = 'success') FROM pr_checks c
+                             WHERE c.project_id = p.id AND c.pr_number = $2
+                               AND c.commit_oid = $3 AND c.required), true)
+             FROM projects p WHERE p.id = $1"#,
     )
     .bind(project_id)
     .bind(number)
     .bind(&source.as_bytes()[..])
-    .fetch_optional(&mut *tx)
+    .fetch_one(&mut *tx)
     .await?;
-    if checks_pass == Some(false) {
-        bail!("工作流检查未通过，禁止合并");
+    if gating && has_any {
+        if !has_head {
+            bail!("当前来源分支提交没有工作流检查记录，禁止合并");
+        }
+        if !required_ok {
+            bail!("工作流检查未通过，禁止合并");
+        }
     }
 
     let fast_forward = target == source || is_ancestor(&mut tx, project_id, target, source).await?;

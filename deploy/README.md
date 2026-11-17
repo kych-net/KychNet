@@ -97,15 +97,16 @@ install -d -m 755 -o deploy-admin -g deploy-admin /opt/kych-admin
 install -d -m 755 -o deploy-admin -g deploy-admin /opt/kych-editor
 # 把 CI 公钥写入 authorized_keys（chmod 600）
 
-# nginx（本目录 kychnet-eo.conf）
-install -m 644 deploy/nginx/kychnet-eo.conf /etc/nginx/conf.d/kychnet-eo.conf
+# nginx（本目录 kychnet.conf）
+install -m 644 deploy/nginx/kychnet.conf /etc/nginx/conf.d/kychnet.conf
 nginx -t && systemctl reload nginx
 ```
 
-> ⚠️ 仓库内的 `deploy/nginx/kychnet-eo.conf` 是旧入口时期的参考配置，
-> `server_name` 仍写 `eo.kych.net`（80 端口的 301 目标也是它）。部署到当前主域前
-> 必须改成 `kych.net`，否则 vhost 不命中。本次文档更新**未改动该配置文件**，
-> 请以服务器上的实际配置为准。
+> `deploy/nginx/kychnet.conf` 与当前主域架构一致：`kych.net` vhost 同时托管
+> 内容站、管理端、编辑器，并把 `/api/`、`/git/`、`/mcp`、`/oauth/`、
+> `/.well-known/oauth-*` 反代到 `127.0.0.1:8080`；`www.kych.net` 与历史入口
+> `eo.kych.net` 仅 301 到主域。旧文件 `kychnet-eo.conf` 已删除。
+> 若服务器上还有历史遗留的同名旧配置，先移除再安装，避免 vhost 冲突。
 
 ## 历史：域名切换脚本
 
