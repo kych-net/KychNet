@@ -307,6 +307,46 @@ export type DiskUsage = {
   dir_bytes: number;
 };
 
+/** 一条提交在仓库监控里的展示信息。 */
+export type RepoCommitStats = {
+  oid: string;
+  short_oid: string;
+  message: string;
+  author_name: string;
+  committed_at: string;
+  /** 提交对象原始字节。 */
+  size: number;
+  /** 提交对象在 PG 里的实际存储字节（压缩后）。 */
+  pg_bytes: number;
+};
+
+/** 一个分支的展示信息。 */
+export type RepoBranchStats = {
+  name: string;
+  tip_oid: string;
+  short_oid: string;
+};
+
+/** 单个仓库在 PG 与硬盘上的存储占用。 */
+export type RepoStats = {
+  id: string;
+  slug: string;
+  default_branch: string;
+  objects: number;
+  /** git_objects.data 实际存储字节（压缩后，近似 PG 占用）。 */
+  pg_bytes: number;
+  /** git_objects.size 之和（原始字节）。 */
+  raw_bytes: number;
+  /** 磁盘 packfile + idx 字节。 */
+  disk_bytes: number;
+  disk_packs: number;
+  commits: number;
+  branches: number;
+  tags: number;
+  branch_list: RepoBranchStats[];
+  commit_list: RepoCommitStats[];
+};
+
 export type SystemResources = {
   load1: number;
   load5: number;
@@ -321,6 +361,8 @@ export type SystemResources = {
   git_objects: number;
   git_objects_bytes: number;
   lfs_bytes: number;
+  /** 所有仓库在 PG 与硬盘上的存储占用明细。 */
+  repos: RepoStats[];
 };
 
 export type CommitSummary = {
