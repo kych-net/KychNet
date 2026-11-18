@@ -53,11 +53,13 @@ pub fn files_digest(files: &ProjectFiles) -> String {
 ///
 /// Typst 源里的图片/包含是通过字面量路径引用的（`#image("/图片/x.svg")`），
 /// 因此可以只对这些文件求摘要：改一张没有被本页引用的图时，本页缓存不再失效。
+/// 依赖集合沿 include/import 链递归展开：被包含的 .typ 自己引用的文件也算依赖。
 ///
-/// 正确性优先：只要发现无法静态确定的写法（拼接路径、变量路径），
-/// 或一个引用都没找到，就回退到全项目摘要——宁可多失效，不能命中旧内容。
+/// 正确性优先：只要发现无法静态确定的写法（拼接路径、变量路径、函数别名、
+/// eval 等），或一个引用都没找到，就回退到全项目摘要——宁可多失效，
+/// 不能命中旧内容。
 pub fn page_files_digest(body: &str, files: &ProjectFiles) -> String {
-    let Some(refs) = collect_literal_refs(body) else {
+    let Some(refs) = collect_refs_recursive(body, files) else {
         return files_digest(files);
     };
     if refs.is_empty() {
@@ -78,59 +80,136 @@ pub fn page_files_digest(body: &str, files: &ProjectFiles) -> String {
     hex::encode(h.finalize())
 }
 
-/// 提取源码里 `#image(...)` / `#include` / `#import` 的字面量路径。
+/// 从页面正文出发，沿 include/import 的源文件链递归收集全部字面量依赖。
+///
+/// 任何一环无法静态解析（返回 None）都整体回退；被包含的源文件不在项目
+/// 快照里（落在磁盘内容目录）时，它的依赖无法在这里展开，同样回退——
+/// 磁盘文件本身的变化由缓存键里的内容目录快照覆盖，但它再引用的项目文件
+/// 不在那份快照里，不能漏。`@preview/...` 包文件按版本固定、不可变，
+/// 且读不到项目文件，无需展开。
+fn collect_refs_recursive(body: &str, files: &ProjectFiles) -> Option<Vec<String>> {
+    let mut all: Vec<String> = Vec::new();
+    // (待展开的源文件路径, 深度)。include 渲染上限 8 层，import 链给到 16 层。
+    let mut queue: Vec<(String, usize)> = Vec::new();
+    let push_refs = |refs: Vec<(String, bool)>,
+                         depth: usize,
+                         all: &mut Vec<String>,
+                         queue: &mut Vec<(String, usize)>|
+     -> Option<()> {
+        for (path, is_source) in refs {
+            if !all.iter().any(|existing| existing == &path) {
+                all.push(path.clone());
+            }
+            if !is_source || path.starts_with('@') {
+                continue;
+            }
+            if depth >= 16 {
+                return None;
+            }
+            match files.get(&path) {
+                Some(_) => queue.push((path, depth + 1)),
+                // 源文件在磁盘上，依赖无法展开，整体回退。
+                None => return None,
+            }
+        }
+        Some(())
+    };
+    push_refs(collect_literal_refs(body)?, 0, &mut all, &mut queue)?;
+    while let Some((path, depth)) = queue.pop() {
+        let data = files.get(&path)?;
+        let text = std::str::from_utf8(data).ok()?;
+        push_refs(collect_literal_refs(text)?, depth, &mut all, &mut queue)?;
+    }
+    all.sort();
+    Some(all)
+}
+
+/// 会读取文件的 Typst 内置函数/关键字。任何一处出现都必须能被静态解析，
+/// 否则整页回退到全项目摘要。
+const FILE_READERS: &[&str] = &[
+    "image", "read", "csv", "json", "yaml", "xml", "cbor", "toml", "plugin", "bibliography", "eval",
+];
+const SOURCE_READERS: &[&str] = &["include", "import"];
+
+/// 提取源码里所有读文件写法的字面量路径，返回 (路径, 是否为 include/import 源文件)。
 ///
 /// 全部按字节扫描：源码是 UTF-8，模式本身是 ASCII，用字节偏移匹配既能
 /// 避免多字节字符的切片 panic，也不需要为解析引入额外依赖。
 ///
-/// 返回 `None` 表示存在无法静态解析的写法，调用方应回退到全项目摘要。
-fn collect_literal_refs(body: &str) -> Option<Vec<String>> {
+/// 与旧版只认识 `#image(` / `#include ` / `#import ` 三个前缀不同，这里按
+/// **标识符**扫描全部读文件入口（含代码模式里的裸 `image(...)`、`#read(...)`、
+/// `#let f = image("x")` 等），并覆盖 csv/json/yaml/xml/cbor/toml/plugin/
+/// bibliography。识别到标识符但后面不是可静态解析的字面量调用（变量路径、
+/// 函数别名如 `#let f = image`、把函数当参数传递、eval）一律返回 None，
+/// 由调用方回退到全项目摘要。正文里偶然出现这些英文单词也会触发回退——
+/// 这是「宁可多失效」的明确取舍。
+fn collect_literal_refs(body: &str) -> Option<Vec<(String, bool)>> {
     let bytes = body.as_bytes();
-    let mut refs: Vec<String> = Vec::new();
+    let mut refs: Vec<(String, bool)> = Vec::new();
     let mut i = 0usize;
     while i < bytes.len() {
-        let (pattern, paren): (&[u8], bool) = if bytes[i..].starts_with(b"#image(") {
-            (b"#image(", true)
-        } else if bytes[i..].starts_with(b"#include ") {
-            (b"#include ", false)
-        } else if bytes[i..].starts_with(b"#import ") {
-            (b"#import ", false)
-        } else {
+        // 找下一个 ASCII 标识符起点；非 ASCII 字节视为标识符的一部分
+        // （Typst 标识符允许 Unicode，`中文image` 是一个整体，不能拆出 image）。
+        if !bytes[i].is_ascii_alphabetic() && bytes[i] != b'_' {
             i += 1;
             continue;
-        };
-        i += pattern.len();
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        }
+        if i > 0 && is_ident_byte(bytes[i - 1]) {
             i += 1;
+            continue;
         }
-        if i >= bytes.len() || bytes[i] != b'"' {
-            // `#image(name)` / `#include path`：动态写法，无法确定。
-            return None;
-        }
-        i += 1;
         let start = i;
-        while i < bytes.len() && bytes[i] != b'"' {
+        while i < bytes.len() && is_ident_byte(bytes[i]) {
             i += 1;
         }
-        if i >= bytes.len() {
+        let word = &body[start..i];
+        let is_source = SOURCE_READERS.contains(&word);
+        if !is_source && !FILE_READERS.contains(&word) {
+            continue;
+        }
+        if word == "eval" {
             return None;
         }
-        // 引号都在 ASCII 边界上，切片安全。
-        let raw = &body[start..i];
-        i += 1;
-        if paren {
-            let mut j = i;
+        let mut j = i;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if !is_source {
+            // 函数调用：必须是 `name("字面量"...)`。别名（`= image`）、
+            // 传参（`map(image, ...)`）、动态路径都在这里回退。
+            if j >= bytes.len() || bytes[j] != b'(' {
+                return None;
+            }
+            j += 1;
             while j < bytes.len() && bytes[j].is_ascii_whitespace() {
                 j += 1;
             }
-            // image 之后应当是 `)` 或 `,`（还可能有命名参数）。
-            if j >= bytes.len() || (bytes[j] != b')' && bytes[j] != b',') {
+        }
+        if j >= bytes.len() || bytes[j] != b'"' {
+            return None;
+        }
+        j += 1;
+        let str_start = j;
+        while j < bytes.len() && bytes[j] != b'"' {
+            j += 1;
+        }
+        if j >= bytes.len() {
+            return None;
+        }
+        let raw = &body[str_start..j];
+        j += 1;
+        if !is_source {
+            let mut k = j;
+            while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            // 字面量之后应当是 `)` 或 `,`（还可能有命名参数）。
+            if k >= bytes.len() || (bytes[k] != b')' && bytes[k] != b',') {
                 return None;
             }
         } else {
             // include/import 后应当是行尾、空白、注释或 `:`
-            let rest = &body[i..];
-            let rest = rest.trim_start();
+            let rest = body[j..].trim_start();
             if !rest.is_empty()
                 && !rest.starts_with('\n')
                 && !rest.starts_with("//")
@@ -139,15 +218,22 @@ fn collect_literal_refs(body: &str) -> Option<Vec<String>> {
                 return None;
             }
         }
+        i = j;
         let path = raw.trim_start_matches('/').replace('\\', "/");
         if path.is_empty() || path.contains(' ') {
             return None;
         }
-        if !refs.iter().any(|existing| existing == &path) {
-            refs.push(path);
+        if !refs.iter().any(|(existing, _)| existing == &path) {
+            refs.push((path, is_source));
         }
     }
     Some(refs)
+}
+
+/// Typst 标识符字节：ASCII 字母/数字/`-`/`_`，以及所有非 ASCII 字节
+/// （Unicode 标识符的一部分）。
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b >= 0x80
 }
 
 pub struct Rendered {
@@ -709,13 +795,73 @@ mod ref_digest_tests {
 #include "另一页.typ"
 "#;
         let refs = collect_literal_refs(src).expect("应当能解析");
-        assert_eq!(refs, vec!["图片/地图.svg", "图片/分区图.svg", "另一页.typ"]);
+        assert_eq!(
+            refs,
+            vec![
+                ("图片/地图.svg".to_string(), false),
+                ("图片/分区图.svg".to_string(), false),
+                ("另一页.typ".to_string(), true),
+            ]
+        );
     }
 
     #[test]
     fn dynamic_paths_fall_back() {
         let src = "#let n = \"x\"\n#image(\"/图片/\" + n + \".svg\")";
         assert!(collect_literal_refs(src).is_none(), "动态路径必须回退");
+    }
+
+    /// 代码模式里的裸调用与 #read 也必须被识别，不能漏依赖。
+    #[test]
+    fn bare_calls_and_read_are_collected() {
+        let src = "#let x = {\n  image(\"图/a.svg\")\n}\n#read(\"数据.txt\")";
+        let refs = collect_literal_refs(src).expect("应当能解析");
+        assert_eq!(
+            refs,
+            vec![
+                ("图/a.svg".to_string(), false),
+                ("数据.txt".to_string(), false),
+            ]
+        );
+    }
+
+    /// 函数别名 / 把读文件函数当值传递：无法静态确定，必须回退。
+    #[test]
+    fn function_alias_falls_back() {
+        assert!(collect_literal_refs("#let f = image\n#f(\"a.svg\")").is_none());
+        assert!(collect_literal_refs("#let arr = (image, read)").is_none());
+        assert!(collect_literal_refs("#eval(\"#include \\\"a.typ\\\"\")").is_none());
+    }
+
+    /// include/import 链上的间接依赖也要进摘要：改被包含页引用的图必须失效。
+    #[test]
+    fn transitive_deps_change_digest() {
+        let body = "#include \"章节.typ\"";
+        let base = files(&[
+            ("章节.typ", "#image(\"图/a.svg\")"),
+            ("图/a.svg", "<svg>a</svg>"),
+            ("图/b.svg", "<svg>b</svg>"),
+        ]);
+        let touched = files(&[
+            ("章节.typ", "#image(\"图/a.svg\")"),
+            ("图/a.svg", "<svg>A2</svg>"),
+            ("图/b.svg", "<svg>b</svg>"),
+        ]);
+        let untouched = files(&[
+            ("章节.typ", "#image(\"图/a.svg\")"),
+            ("图/a.svg", "<svg>a</svg>"),
+            ("图/b.svg", "<svg>CHANGED</svg>"),
+        ]);
+        assert_ne!(page_files_digest(body, &base), page_files_digest(body, &touched));
+        assert_eq!(page_files_digest(body, &base), page_files_digest(body, &untouched));
+    }
+
+    /// 被包含的源文件不在项目快照里时无法展开依赖，必须回退全项目摘要。
+    #[test]
+    fn disk_source_include_falls_back() {
+        let body = "#include \"磁盘页.typ\"";
+        let f = files(&[("图/a.svg", "1")]);
+        assert_eq!(page_files_digest(body, &f), files_digest(&f));
     }
 
     #[test]
