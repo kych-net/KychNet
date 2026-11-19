@@ -46,8 +46,9 @@ export function formatForPath(path: string): ContentFormat {
     case "htm":
     case "vue":
     case "xml":
-    case "svg":
       return "html";
+    case "svg":
+      return "svg";
     case "css":
       return "css";
     case "typ":
