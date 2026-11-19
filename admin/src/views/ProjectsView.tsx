@@ -25,9 +25,14 @@ function formatForPath(path: string): ContentFormat {
   const extension = path.split(".").pop()?.toLowerCase();
   switch (extension) {
     case "md":
+    case "markdown":
       return "markdown";
     case "html":
+    case "htm":
+    case "xml":
       return "html";
+    case "svg":
+      return "svg";
     case "css":
       return "css";
     case "typ":
@@ -37,6 +42,26 @@ function formatForPath(path: string): ContentFormat {
     default:
       return "markdown";
   }
+}
+
+/** 项目内 SVG 预览：沙箱 iframe 里白底居中展示，禁用脚本，避免仓库里的 SVG 执行代码。 */
+function svgPreviewDocument(svg: string): string {
+  return `<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { color-scheme: light; }
+  html, body { margin: 0; padding: 0; min-height: 100%; }
+  body { display: grid; place-items: center; min-height: 100vh; padding: 1rem;
+    background-color: #fff;
+    background-image:
+      linear-gradient(45deg, #eee 25%, transparent 25%),
+      linear-gradient(-45deg, #eee 25%, transparent 25%),
+      linear-gradient(45deg, transparent 75%, #eee 75%),
+      linear-gradient(-45deg, transparent 75%, #eee 75%);
+    background-size: 16px 16px;
+    background-position: 0 0, 0 8px, 8px -8px, -8px 0; }
+  svg { max-width: 100%; max-height: 85vh; width: auto; height: auto; }
+</style></head><body>${svg}</body></html>`;
 }
 
 function joinPath(dir: string, name: string): string {
@@ -139,6 +164,8 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
   const [file, setFile] = useState<ProjectFile | null>(null);
   const [draftPath, setDraftPath] = useState("");
   const [content, setContent] = useState("");
+  // SVG 文件默认展开预览；用户对单个文件切换后保持到下次打开别的类型。
+  const [svgPreviewOn, setSvgPreviewOn] = useState(true);
   const [commitMessage, setCommitMessage] = useState("");
   // 提交面板内的就地反馈：全局 error/notice 在 section 顶部，滚到工作区时看不见。
   const [commitError, setCommitError] = useState("");
@@ -859,6 +886,9 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
   }
 
   const crumbs = dir ? dir.split("/") : [];
+  const currentFormat = draftPath ? formatForPath(draftPath) : null;
+  const isSvg = currentFormat === "svg";
+  const workbenchClasses = `project-editor-workbench${isSvg && svgPreviewOn ? " with-preview" : ""}`;
 
   return (
     <section>
@@ -1200,32 +1230,58 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
                           {Object.prototype.hasOwnProperty.call(drafts, draftPath) && (
                             <span className="staged-badge">待提交</span>
                           )}
-                          {formatForPath(draftPath)} · {content.length} 字符
+                          {currentFormat} · {content.length} 字符
+                          {isSvg && (
+                            <button
+                              type="button"
+                              className="preview-toggle"
+                              onClick={() => setSvgPreviewOn((value) => !value)}
+                            >
+                              {svgPreviewOn ? "隐藏预览" : "预览"}
+                            </button>
+                          )}
                         </span>
                       </div>
-                      <CodeEditor
-                        value={content}
-                        format={formatForPath(draftPath)}
-                        onChange={(value) => {
-                          setContent(value);
-                          setDrafts((current) => {
-                            // 内容改回磁盘上的原样时把草稿删掉，
-                            // 否则「敲一个字再删掉」会一直挂在待提交列表里。
-                            // file 为 null 表示这是新建的还没落盘的文件，
-                            // 没有「原样」可比，保持留痕。
-                            const original = file?.content;
-                            if (original !== undefined && value === original) {
-                              if (!Object.prototype.hasOwnProperty.call(current, draftPath)) {
-                                return current;
-                              }
-                              const rest = { ...current };
-                              delete rest[draftPath];
-                              return rest;
-                            }
-                            return { ...current, [draftPath]: value };
-                          });
-                        }}
-                      />
+                      <div className={workbenchClasses}>
+                        <div className="project-editor-code">
+                          <CodeEditor
+                            value={content}
+                            format={currentFormat ?? "markdown"}
+                            onChange={(value) => {
+                              setContent(value);
+                              setDrafts((current) => {
+                                // 内容改回磁盘上的原样时把草稿删掉，
+                                // 否则「敲一个字再删掉」会一直挂在待提交列表里。
+                                // file 为 null 表示这是新建的还没落盘的文件，
+                                // 没有「原样」可比，保持留痕。
+                                const original = file?.content;
+                                if (original !== undefined && value === original) {
+                                  if (!Object.prototype.hasOwnProperty.call(current, draftPath)) {
+                                    return current;
+                                  }
+                                  const rest = { ...current };
+                                  delete rest[draftPath];
+                                  return rest;
+                                }
+                                return { ...current, [draftPath]: value };
+                              });
+                            }}
+                          />
+                        </div>
+                        {isSvg && svgPreviewOn && (
+                          <div className="preview-pane svg-preview-pane">
+                            <div className="preview-head">
+                              <span>SVG 预览</span>
+                            </div>
+                            <iframe
+                              className="preview-frame"
+                              title="SVG 预览"
+                              sandbox=""
+                              srcDoc={svgPreviewDocument(content)}
+                            />
+                          </div>
+                        )}
+                      </div>
                       <div className="row align editor-actions">
                         {file && (
                           <>
