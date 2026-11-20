@@ -75,7 +75,7 @@ export function SshKeysView() {
         <div>
           <h2>SSH 公钥</h2>
           <p className="hint">
-            用于 <code>git clone ssh://git@kych.net:2222/&lt;项目&gt;.git</code>。
+            用于 <code>git clone ssh://git@git.kych.net:2222/&lt;项目&gt;.git</code>。
             私钥只留在你的电脑，服务端只保存公钥和指纹。
           </p>
         </div>

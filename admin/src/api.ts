@@ -451,21 +451,14 @@ export function gitUrl(slug: string): string {
   return `${siteOrigin()}/git/${slug}.git`;
 }
 
-/** Git over SSH 地址；端口固定 2222，host 跟随 API 基址（同域则用当前域名）。 */
+/** Git over SSH 的对外主机：SSH 直连源站，不走 EdgeOne（CDN 不转发 2222）。 */
+const GIT_SSH_HOST = (import.meta.env.VITE_GIT_SSH_HOST ?? "git.kych.net").trim();
+/** Git over SSH 的对外端口，服务端 SSH_BIND 默认 2222。 */
+const GIT_SSH_PORT = (import.meta.env.VITE_GIT_SSH_PORT ?? "2222").trim();
+
+/** Git over SSH 地址；项目名保留原始 UTF-8，避免克隆出百分号编码的目录名。 */
 export function sshGitUrl(slug: string): string {
-  const origin = siteOrigin();
-  let host = "";
-  if (origin) {
-    try {
-      host = new URL(origin).hostname;
-    } catch {
-      // 配置异常时下面回退到当前域名。
-    }
-  }
-  if (!host && typeof window !== "undefined") {
-    host = window.location.hostname;
-  }
-  return `ssh://git@${host}:2222/${slug}.git`;
+  return `ssh://git@${GIT_SSH_HOST}:${GIT_SSH_PORT}/${slug}.git`;
 }
 
 export class ApiError extends Error {
