@@ -1,5 +1,8 @@
 import { useEffect, useState } from "react";
 import { api, GitSshKey } from "../api";
+import { useFeedback } from "../hooks/useFeedback";
+import { useBusy } from "../hooks/useBusy";
+import { useConfirm } from "../components/ConfirmProvider";
 
 function fmt(value: string | null): string {
   return value ? new Date(value).toLocaleString() : "从未使用";
@@ -9,9 +12,10 @@ export function SshKeysView() {
   const [items, setItems] = useState<GitSshKey[]>([]);
   const [name, setName] = useState("");
   const [publicKey, setPublicKey] = useState("");
-  const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
-  const [busy, setBusy] = useState(false);
+  const { error, notice, setError, setNotice } = useFeedback();
+  const { busy, run } = useBusy();
+  const confirm = useConfirm();
+  const [busyId, setBusyId] = useState<string | null>(null);
 
   useEffect(() => {
     void load();
@@ -27,33 +31,41 @@ export function SshKeysView() {
 
   async function add(event: React.FormEvent) {
     event.preventDefault();
-    setBusy(true);
-    setError("");
-    setNotice("");
-    try {
-      await api.createSshKey(name.trim(), publicKey.trim());
-      setName("");
-      setPublicKey("");
-      setNotice("公钥已添加，可以用 SSH 推送或拉取仓库");
-      await load();
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setBusy(false);
-    }
+    await run(async () => {
+      setError("");
+      setNotice("");
+      try {
+        await api.createSshKey(name.trim(), publicKey.trim());
+        setName("");
+        setPublicKey("");
+        setNotice("公钥已添加，可以用 SSH 推送或拉取仓库");
+        await load();
+      } catch (e) {
+        setError((e as Error).message);
+      }
+    });
   }
 
   async function remove(item: GitSshKey) {
-    if (!window.confirm(`撤销公钥「${item.name}」？使用该私钥的 SSH 客户端将立即失效。`)) {
+    if (
+      !(await confirm(`撤销公钥「${item.name}」？使用该私钥的 SSH 客户端将立即失效。`, {
+        title: "撤销公钥",
+        confirmLabel: "撤销",
+        danger: true,
+      }))
+    ) {
       return;
     }
     setError("");
+    setBusyId(item.id);
     try {
       await api.revokeSshKey(item.id);
       setNotice("公钥已撤销");
       await load();
     } catch (e) {
       setError((e as Error).message);
+    } finally {
+      setBusyId(null);
     }
   }
 
@@ -70,8 +82,8 @@ export function SshKeysView() {
         <span className="ssh-count">{items.length}</span>
       </div>
 
-      {error && <p className="error">{error}</p>}
-      {notice && <p className="notice">{notice}</p>}
+      {error && <p className="error" role="alert">{error}</p>}
+      {notice && <p className="notice" role="status">{notice}</p>}
 
       <form className="ssh-add" onSubmit={add}>
         <label>
@@ -113,8 +125,13 @@ export function SshKeysView() {
                   <strong>{item.name}</strong>
                   <span className="mono small">{item.fingerprint}</span>
                 </div>
-                <button type="button" className="danger-text" onClick={() => remove(item)}>
-                  撤销
+                <button
+                  type="button"
+                  className="danger-text"
+                  disabled={busyId === item.id}
+                  onClick={() => void remove(item)}
+                >
+                  {busyId === item.id ? "撤销中…" : "撤销"}
                 </button>
               </div>
               <code className="ssh-public-key">{item.public_key}</code>

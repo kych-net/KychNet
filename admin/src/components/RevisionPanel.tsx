@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, Content, ContentRevision } from "../api";
+import { useFeedback } from "../hooks/useFeedback";
+import { useConfirm } from "../components/ConfirmProvider";
 
 type Mode =
   | { kind: "list" }
@@ -157,8 +159,8 @@ export function RevisionPanel({
   const [diff, setDiff] = useState("");
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [blame, setBlame] = useState<Blame | null>(null);
-  const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
+  const { error, notice, setError, setNotice } = useFeedback();
+  const confirm = useConfirm();
   const [busy, setBusy] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const [busyLabel, setBusyLabel] = useState("");
@@ -265,7 +267,15 @@ export function RevisionPanel({
   }
 
   async function revert(seq: number) {
-    if (!window.confirm(`回滚到版本 ${seq}？指针将直接移动，之后的版本仍保留在历史中。`)) return;
+    if (
+      !(await confirm(`回滚到版本 ${seq}？指针将直接移动，之后的版本仍保留在历史中。`, {
+        title: "回滚版本",
+        confirmLabel: "回滚",
+        danger: true,
+      }))
+    ) {
+      return;
+    }
     setBusy(true);
     setBusyLabel("回滚…");
     try {
@@ -341,8 +351,8 @@ export function RevisionPanel({
         </div>
       </div>
 
-      {error && <p className="error">{error}</p>}
-      {notice && <p className="notice">{notice}</p>}
+      {error && <p className="error" role="alert">{error}</p>}
+      {notice && <p className="notice" role="status">{notice}</p>}
       {busy && busyLabel && <p className="hint">{busyLabel}</p>}
 
       {/* git diff A B：任意两版本自由对比 */}

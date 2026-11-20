@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, WorkflowRunner } from "../api";
+import { useFeedback } from "../hooks/useFeedback";
+import { useBusy } from "../hooks/useBusy";
 
 function fmt(value: string | null): string {
   return value ? new Date(value).toLocaleString() : "—";
@@ -13,8 +15,9 @@ export function RunnersView() {
   const [runners, setRunners] = useState<WorkflowRunner[]>([]);
   const [runnerName, setRunnerName] = useState("");
   const [code, setCode] = useState("");
-  const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
+  const { error, notice, setError, setNotice } = useFeedback();
+  const { busy, run } = useBusy();
+  const [busyId, setBusyId] = useState<string | null>(null);
 
   async function loadRunners() {
     try {
@@ -30,27 +33,32 @@ export function RunnersView() {
 
   async function registerRunner(event: React.FormEvent) {
     event.preventDefault();
-    setCode("");
-    setError("");
-    setNotice("");
-    try {
-      const result = await api.createRunner(runnerName, []);
-      setCode(result.registration_code);
-      setRunnerName("");
-      setNotice("注册码只显示一次，请立即交给 kychrunner");
-      await loadRunners();
-    } catch (e) {
-      setError((e as Error).message);
-    }
+    await run(async () => {
+      setCode("");
+      setError("");
+      setNotice("");
+      try {
+        const result = await api.createRunner(runnerName, []);
+        setCode(result.registration_code);
+        setRunnerName("");
+        setNotice("注册码只显示一次，请立即交给 kychrunner");
+        await loadRunners();
+      } catch (e) {
+        setError((e as Error).message);
+      }
+    });
   }
 
   async function toggleRunner(runner: WorkflowRunner) {
     setError("");
+    setBusyId(runner.id);
     try {
       await api.setRunnerEnabled(runner.id, !runner.enabled);
       await loadRunners();
     } catch (e) {
       setError((e as Error).message);
+    } finally {
+      setBusyId(null);
     }
   }
 
@@ -58,14 +66,16 @@ export function RunnersView() {
     <section>
       <h2>执行器</h2>
       <p className="hint">执行器由全站共享，用于运行各项目的工作流；项目内的定义与记录请在「项目 → 工作流」中查看。</p>
-      {error && <p className="error">{error}</p>}
-      {notice && <p className="notice">{notice}</p>}
-      <form className="row" onSubmit={registerRunner}>
+      {error && <p className="error" role="alert">{error}</p>}
+      {notice && <p className="notice" role="status">{notice}</p>}
+      <form className="row" onSubmit={(e) => void registerRunner(e)}>
         <label>
           名称
           <input value={runnerName} onChange={(e) => setRunnerName(e.target.value)} required placeholder="runner-1" />
         </label>
-        <button type="submit">生成注册码</button>
+        <button type="submit" disabled={busy}>
+          {busy ? "生成中…" : "生成注册码"}
+        </button>
       </form>
       {code && <p className="notice">注册码（只显示一次）：<code>{code}</code></p>}
       <table>
@@ -76,7 +86,15 @@ export function RunnersView() {
               <td>{runner.name}</td>
               <td>v{runner.protocol_version}</td>
               <td>{runner.last_seen_at ? fmt(runner.last_seen_at) : "从未"}</td>
-              <td><button type="button" onClick={() => toggleRunner(runner)}>{runner.enabled ? "禁用" : "启用"}</button></td>
+              <td>
+                <button
+                  type="button"
+                  disabled={busyId === runner.id}
+                  onClick={() => void toggleRunner(runner)}
+                >
+                  {busyId === runner.id ? "处理中…" : runner.enabled ? "禁用" : "启用"}
+                </button>
+              </td>
             </tr>
           ))}
           {runners.length === 0 && <tr><td colSpan={4}>暂无执行器。</td></tr>}

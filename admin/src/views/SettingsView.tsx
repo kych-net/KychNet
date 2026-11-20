@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, BuildStatus, NavLink } from "../api";
+import { useFeedback } from "../hooks/useFeedback";
+import { useBusy } from "../hooks/useBusy";
 
 function formatTime(ts: number): string {
   return new Date(ts * 1000).toLocaleString();
@@ -13,8 +15,8 @@ export function SettingsView() {
   const [policeBeian, setPoliceBeian] = useState("");
   const [policeBeianCode, setPoliceBeianCode] = useState("");
   const [nav, setNav] = useState<NavLink[]>([]);
-  const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
+  const { error, notice, setError, setNotice } = useFeedback();
+  const { busy, run } = useBusy();
   const [build, setBuild] = useState<BuildStatus | null>(null);
   const [buildError, setBuildError] = useState("");
 
@@ -63,28 +65,30 @@ export function SettingsView() {
 
   async function save(event: React.FormEvent) {
     event.preventDefault();
-    setError("");
-    try {
-      await api.saveSettings({
-        site_name: siteName,
-        description,
-        logo_url: logoUrl,
-        nav,
-        icp_beian: icpBeian,
-        police_beian: policeBeian,
-        police_beian_code: policeBeianCode,
-      });
-      setNotice("站点设置已保存,重新构建后生效");
-    } catch (e) {
-      setError((e as Error).message);
-    }
+    await run(async () => {
+      setError("");
+      try {
+        await api.saveSettings({
+          site_name: siteName,
+          description,
+          logo_url: logoUrl,
+          nav,
+          icp_beian: icpBeian,
+          police_beian: policeBeian,
+          police_beian_code: policeBeianCode,
+        });
+        setNotice("站点设置已保存,重新构建后生效");
+      } catch (e) {
+        setError((e as Error).message);
+      }
+    });
   }
 
   return (
     <section>
       <h2>站点设置</h2>
-      {error && <p className="error">{error}</p>}
-      {notice && <p className="notice">{notice}</p>}
+      {error && <p className="error" role="alert">{error}</p>}
+      {notice && <p className="notice" role="status">{notice}</p>}
 
       <form onSubmit={save}>
         <div className="row">
@@ -168,7 +172,7 @@ export function SettingsView() {
           新增链接
         </button>
         <div className="row align">
-          <button type="submit">保存</button>
+          <button type="submit" disabled={busy}>{busy ? "保存中…" : "保存"}</button>
         </div>
       </form>
 

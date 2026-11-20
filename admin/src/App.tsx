@@ -2,6 +2,8 @@ import { lazy, Suspense, useEffect, useState } from "react";
 import { api, SiteSettings, User } from "./api";
 import { AuthPage } from "./pages/AuthPage";
 import { applyTheme, readTheme, Theme } from "./theme";
+import { ConfirmProvider } from "./components/ConfirmProvider";
+import { NavigationGuardProvider } from "./components/NavigationGuardProvider";
 
 // 登录后再加载管理端 Shell，避免把 CodeMirror 等重依赖塞进首屏。
 const Shell = lazy(() => import("./components/Shell").then((module) => ({ default: module.Shell })));
@@ -19,6 +21,16 @@ const defaultSite: SiteSettings = {
 };
 
 export function App() {
+  return (
+    <ConfirmProvider>
+      <NavigationGuardProvider>
+        <AppContent />
+      </NavigationGuardProvider>
+    </ConfirmProvider>
+  );
+}
+
+function AppContent() {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
   // 内容站地址以 API 返回的 SITE_URL 为准；这里只是首帧渲染前的兜底，

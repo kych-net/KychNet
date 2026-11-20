@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, WorkflowItem, WorkflowRun } from "../api";
+import { useFeedback } from "../hooks/useFeedback";
 
 function fmt(value: string | null): string {
   return value ? new Date(value).toLocaleString() : "—";
@@ -19,8 +20,7 @@ export function ProjectWorkflowsPanel({ projectId, projectSlug }: Props) {
   const [workflowDir, setWorkflowDir] = useState("");
   const [items, setItems] = useState<WorkflowItem[]>([]);
   const [runs, setRuns] = useState<WorkflowRun[]>([]);
-  const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
+  const { error, notice, setError, setNotice } = useFeedback();
   const [refreshKey, setRefreshKey] = useState(0);
 
   useEffect(() => {
@@ -91,8 +91,8 @@ export function ProjectWorkflowsPanel({ projectId, projectSlug }: Props) {
           刷新
         </button>
       </div>
-      {error && <p className="error">{error}</p>}
-      {notice && <p className="notice">{notice}</p>}
+      {error && <p className="error" role="alert">{error}</p>}
+      {notice && <p className="notice" role="status">{notice}</p>}
       <h4>工作流定义</h4>
       <table>
         <thead>

@@ -17,6 +17,8 @@ import {
 } from "../api";
 import { CodeEditor } from "../components/CodeEditor";
 import { ProjectWorkflowsPanel } from "./WorkflowsView";
+import { useFeedback } from "../hooks/useFeedback";
+import { useConfirm } from "../components/ConfirmProvider";
 
 /** 提交历史每次加载的页大小。 */
 const COMMIT_PAGE = 100;
@@ -151,8 +153,8 @@ function DiffList({ files }: { files: PrDetail["files"] }) {
 export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [showArchived, setShowArchived] = useState(false);
-  const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
+  const { error, notice, setError, setNotice } = useFeedback();
+  const confirm = useConfirm();
   const [busy, setBusy] = useState(false);
 
   const [selected, setSelected] = useState<Project | null>(null);
@@ -242,7 +244,13 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
       selected &&
       selected.id !== project.id &&
       pendingCount > 0 &&
-      !window.confirm("切换项目会丢弃当前待提交的更改，继续？")
+      !(
+        await confirm("切换项目会丢弃当前待提交的更改，继续？", {
+          title: "未提交的更改",
+          confirmLabel: "继续切换",
+          danger: true,
+        })
+      )
     ) {
       return;
     }
@@ -360,7 +368,13 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
   async function revertCommit() {
     if (!selected || !commitDetail) return;
     const short = commitDetail.oid.slice(0, 7);
-    if (!window.confirm(`在 ${branch} 上反向应用提交 ${short}？`)) return;
+    if (
+      !(await confirm(`在 ${branch} 上反向应用提交 ${short}？`, {
+        title: "反向应用提交",
+        confirmLabel: "反向应用",
+        danger: true,
+      }))
+    ) return;
     setBusy(true);
     setError("");
     setNotice("");
@@ -403,7 +417,9 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
 
   async function removeBranch(name: string) {
     if (!selected || name === selected.default_branch) return;
-    if (!window.confirm(`删除分支 ${name}？`)) return;
+    if (
+      !(await confirm(`删除分支 ${name}？`, { title: "删除分支", confirmLabel: "删除", danger: true }))
+    ) return;
     setBusy(true);
     setError("");
     setNotice("");
@@ -497,7 +513,12 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
     const warning = prDetail.is_fast_forward
       ? ""
       : "\n\n这不是快进合并：服务端会生成双亲 merge commit，并逐文件三方合并，两侧改动都会保留。";
-    if (!window.confirm(`合并 PR #${prDetail.number} 到 ${prDetail.target_branch}？${warning}`)) {
+    if (
+      !(await confirm(`合并 PR #${prDetail.number} 到 ${prDetail.target_branch}？${warning}`, {
+        title: "合并 Pull Request",
+        confirmLabel: "合并",
+      }))
+    ) {
       return;
     }
     setBusy(true);
@@ -727,9 +748,15 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
     }
   }
 
-  function removeFile() {
+  async function removeFile() {
     if (!file) return;
-    if (!window.confirm(`将 ${file.path} 标记为删除？提交项目时生效。`)) return;
+    if (
+      !(await confirm(`将 ${file.path} 标记为删除？提交项目时生效。`, {
+        title: "删除文件",
+        confirmLabel: "标记删除",
+        danger: true,
+      }))
+    ) return;
     fileGen.current += 1;
     setDeletions((current) => Array.from(new Set([...current, file.path])));
     setDrafts((current) => {
@@ -843,7 +870,12 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
 
   async function archiveProject() {
     if (!selected) return;
-    if (!window.confirm(`归档项目「${selected.slug}」？归档后不再出现在列表和站点中。`)) return;
+    if (
+      !(await confirm(`归档项目「${selected.slug}」？归档后不再出现在列表和站点中。`, {
+        title: "归档项目",
+        confirmLabel: "归档",
+      }))
+    ) return;
     try {
       await api.updateProject(selected.id, { archived: true });
       setSelected(null);
@@ -1150,11 +1182,15 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
                   分支
                   <select
                     value={branch}
-                    onChange={(e) => {
+                    onChange={async (e) => {
                       const next = e.target.value;
                       if (
                         pendingCount > 0 &&
-                        !window.confirm("切换分支会丢弃当前待提交的更改，继续？")
+                        !(await confirm("切换分支会丢弃当前待提交的更改，继续？", {
+                          title: "未提交的更改",
+                          confirmLabel: "继续切换",
+                          danger: true,
+                        }))
                       ) {
                         return;
                       }
@@ -1545,11 +1581,15 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
                       <div className="row align">
                         <select
                           value={branch}
-                          onChange={(e) => {
+                          onChange={async (e) => {
                             const next = e.target.value;
                             if (
                               pendingCount > 0 &&
-                              !window.confirm("切换分支会丢弃当前待提交的更改，继续？")
+                              !(await confirm("切换分支会丢弃当前待提交的更改，继续？", {
+                                title: "未提交的更改",
+                                confirmLabel: "继续切换",
+                                danger: true,
+                              }))
                             ) {
                               return;
                             }

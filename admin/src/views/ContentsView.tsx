@@ -4,6 +4,10 @@ import { api, Content, ContentFormat, ContentSummary, editorPath, sourcePath } f
 import { CodeEditor } from "../components/CodeEditor";
 import { DirTree } from "../components/DirTree";
 import { RevisionPanel } from "../components/RevisionPanel";
+import { useFeedback } from "../hooks/useFeedback";
+import { useBusy } from "../hooks/useBusy";
+import { useConfirm } from "../components/ConfirmProvider";
+import { useNavigationGuard } from "../components/NavigationGuardProvider";
 
 function formatLabel(format: ContentFormat): string {
   switch (format) {
@@ -73,8 +77,10 @@ function previewDocument(html: string): string {
 
 export function ContentsView() {
   const [items, setItems] = useState<ContentSummary[]>([]);
-  const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
+  const { error, notice, setError, setNotice } = useFeedback();
+  const { busy, run } = useBusy();
+  const confirm = useConfirm();
+  const guard = useNavigationGuard();
 
   const [contentId, setContentId] = useState<string | null>(null);
   const [slug, setSlug] = useState("");
@@ -101,6 +107,72 @@ export function ContentsView() {
   const slugRef = useRef(slug);
   bodyRef.current = body;
   slugRef.current = slug;
+
+  // ---- 未保存改动保护 ----
+  // 记录「已保存」时的编辑器快照；当前快照与之不同即视为有未保存改动。
+  // 初值必须是空编辑器对应的快照，否则首次加载会误报「有改动」。
+  const savedRef = useRef(JSON.stringify([null, "", "markdown", "", "", false]));
+  const [dirty, setDirty] = useState(false);
+  const dirtyRef = useRef(false);
+  dirtyRef.current = dirty;
+  const { setGuard, setDirty: setGlobalDirty } = guard;
+
+  function snap(
+    id: string | null,
+    path: string,
+    fmt: ContentFormat,
+    text: string,
+    headText: string,
+    isPublished: boolean,
+  ): string {
+    return JSON.stringify([id, path, fmt, text, headText, isPublished]);
+  }
+
+  // 保存快照后同步刷新 dirty（用当前渲染值比对）。
+  useEffect(() => {
+    const current = snap(contentId, slug, format, body, head, published);
+    setDirty(current !== savedRef.current);
+  }, [contentId, slug, format, body, head, published]);
+
+  // 把未保存状态同步给导航守卫，并注册离开确认。
+  useEffect(() => {
+    setGlobalDirty(dirty);
+  }, [dirty, setGlobalDirty]);
+
+  useEffect(() => {
+    setGuard(async () => {
+      if (!dirtyRef.current) return true;
+      return confirm("当前内容有未保存的改动，离开将丢失这些改动。确定离开吗？", {
+        title: "未保存的改动",
+        confirmLabel: "放弃改动并离开",
+        cancelLabel: "继续编辑",
+        danger: true,
+      });
+    });
+    return () => setGuard(null);
+  }, [setGuard, confirm]);
+
+  // 刷新/关闭标签页时，浏览器原生提示未保存改动。
+  useEffect(() => {
+    if (!dirty) return;
+    const onBeforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [dirty]);
+
+  // 切换内容/新建前若脏则确认。
+  async function discardOk(): Promise<boolean> {
+    if (!dirtyRef.current) return true;
+    return confirm("当前内容有未保存的改动，继续将丢失这些改动。确定继续吗？", {
+      title: "未保存的改动",
+      confirmLabel: "放弃改动",
+      cancelLabel: "继续编辑",
+      danger: true,
+    });
+  }
 
   useEffect(() => {
     void refresh();
@@ -192,37 +264,62 @@ export function ContentsView() {
 
   async function save(event: React.FormEvent) {
     event.preventDefault();
-    setError("");
-    // 记录提交时的内容快照，响应回来时据此判断是否回写。
-    const submittedBody = body;
-    const submittedSlug = slug;
-    try {
-      const result = await api.saveContent({
-        id: contentId ?? undefined,
-        slug,
-        format,
-        body,
-        head,
-        published,
-        message: message.trim() || undefined,
-      });
-      // 服务端会把 /xef/index、/eoe/index.md 归一化成输出路径，这里回显源文件路径。
-      // 守卫：保存后用户已继续输入（正文或路径变了）就丢弃回写，
-      // 避免慢响应覆盖新输入；同一路径只保留一条内容，下次保存仍会命中它。
-      if (bodyRef.current === submittedBody && slugRef.current === submittedSlug) {
-        setContentId(result.item.id);
-        setSlug(editorPath(result.item));
-        setMessage("");
+    await run(async () => {
+      setError("");
+      // 记录提交时的内容快照，响应回来时据此判断是否回写。
+      const submittedBody = body;
+      const submittedSlug = slug;
+      const submittedFormat = format;
+      const submittedHead = head;
+      const submittedPublished = published;
+      try {
+        const result = await api.saveContent({
+          id: contentId ?? undefined,
+          slug,
+          format,
+          body,
+          head,
+          published,
+          message: message.trim() || undefined,
+        });
+        // 已保存基线 = 服务端实际保存的内容（规范化后的路径）。
+        // 若保存期间用户继续输入（未回写），当前状态与基线不同，dirty 会继续保持。
+        savedRef.current = snap(
+          result.item.id,
+          editorPath(result.item),
+          submittedFormat,
+          submittedBody,
+          submittedHead,
+          submittedPublished,
+        );
+        // 服务端会把 /xef/index、/eoe/index.md 归一化成输出路径，这里回显源文件路径。
+        // 守卫：保存后用户已继续输入（正文或路径变了）就丢弃回写，
+        // 避免慢响应覆盖新输入；同一路径只保留一条内容，下次保存仍会命中它。
+        if (bodyRef.current === submittedBody && slugRef.current === submittedSlug) {
+          setContentId(result.item.id);
+          setSlug(editorPath(result.item));
+          setMessage("");
+        }
+        setNotice(published ? "内容已保存，并已自动编译当前页" : "内容已保存（草稿，暂不生成页面）");
+        await refresh();
+        setHistoryKey((value) => value + 1);
+      } catch (e) {
+        setError((e as Error).message);
       }
-      setNotice(published ? "内容已保存，并已自动编译当前页" : "内容已保存（草稿，暂不生成页面）");
-      await refresh();
-      setHistoryKey((value) => value + 1);
-    } catch (e) {
-      setError((e as Error).message);
-    }
+    });
   }
 
-  async function remove(id: string) {
+  async function remove(id: string, label: string) {
+    if (
+      !(await confirm(`删除内容「${label}」？该页面将从站点移除，此操作不可撤销。`, {
+        title: "删除内容",
+        confirmLabel: "删除",
+        danger: true,
+      }))
+    ) {
+      return;
+    }
+    setError("");
     try {
       await api.deleteContent(id);
       if (id === contentId) newContent();
@@ -234,6 +331,7 @@ export function ContentsView() {
   }
 
   async function edit(item: ContentSummary) {
+    if (!(await discardOk())) return;
     setContentId(item.id);
     setSlug(sourcePath(item));
     setFormat(item.format);
@@ -247,7 +345,9 @@ export function ContentsView() {
       if (editGeneration.current !== generation) return;
       setBody(full.body);
       setHead(full.head ?? "");
-      setSlug(editorPath(full));
+      const loadedSlug = editorPath(full);
+      setSlug(loadedSlug);
+      savedRef.current = snap(item.id, loadedSlug, item.format, full.body, full.head ?? "", item.published);
     } catch (error) {
       if (editGeneration.current !== generation) return;
       setError((error as Error).message);
@@ -260,7 +360,7 @@ export function ContentsView() {
   }
 
   function editFromTree(item: ContentSummary) {
-    edit(item);
+    void edit(item);
     // 从目录打开文件后回到编辑器视图。
     setMobilePane("editor");
   }
@@ -276,13 +376,18 @@ export function ContentsView() {
     setMessage("");
     setError("");
     setNotice("");
+    savedRef.current = snap(null, "", "markdown", "", "", false);
+  }
+
+  async function resetEditor() {
+    if (await discardOk()) newContent();
   }
 
   return (
     <section>
       <h2>内容</h2>
-      {error && <p className="error">{error}</p>}
-      {notice && <p className="notice">{notice}</p>}
+      {error && <p className="error" role="alert">{error}</p>}
+      {notice && <p className="notice" role="status">{notice}</p>}
 
       {/* 窄屏选项卡：一次只显示一个视图，默认编辑器；宽屏三栏同屏不显示。 */}
       <div className="contents-mobile-tabs" role="tablist" aria-label="内容视图">
@@ -425,8 +530,8 @@ export function ContentsView() {
             />
             发布
           </label>
-          <button type="submit">保存</button>
-          <button type="button" onClick={newContent}>
+          <button type="submit" disabled={busy}>{busy ? "保存中…" : "保存"}</button>
+          <button type="button" onClick={() => void resetEditor()}>
             新建内容
           </button>
         </div>
@@ -452,11 +557,11 @@ export function ContentsView() {
                 <td>{item.format}</td>
                 <td>{item.published ? "已发布" : "草稿"}</td>
                 <td>
-                  <button onClick={() => edit(item)}>编辑</button>
+                  <button onClick={() => void edit(item)}>编辑</button>
                   {item.slug === "index.html" ? (
                     <span className="hint"> 主页不可删除</span>
                   ) : (
-                    <button onClick={() => remove(item.id)}>删除</button>
+                    <button onClick={() => void remove(item.id, editorPath(item))}>删除</button>
                   )}
                 </td>
               </tr>
@@ -497,12 +602,21 @@ export function ContentsView() {
               refreshKey={historyKey}
               onReverted={(item) => {
                 // 回滚是移动指针：编辑器同步显示回滚后的正文与格式。
+                const revertSlug = editorPath(item);
                 setContentId(item.id);
-                setSlug(editorPath(item));
+                setSlug(revertSlug);
                 setFormat(item.format);
                 setBody(item.body);
                 setHead(item.head ?? "");
                 setPublished(item.published);
+                savedRef.current = snap(
+                  item.id,
+                  revertSlug,
+                  item.format,
+                  item.body,
+                  item.head ?? "",
+                  item.published,
+                );
                 setNotice(`已回滚到版本 ${item.rev_seq}`);
                 setHistoryKey((value) => value + 1);
                 void refresh();

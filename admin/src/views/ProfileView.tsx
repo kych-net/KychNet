@@ -3,6 +3,9 @@ import { startRegistration } from "@simplewebauthn/browser";
 import { api, avatarUrl, GitToken, isStepUpRequired, User } from "../api";
 import { StepUpDialog } from "../components/StepUpDialog";
 import { SshKeysView } from "./SshKeysView";
+import { useFeedback } from "../hooks/useFeedback";
+import { useBusy } from "../hooks/useBusy";
+import { useConfirm } from "../components/ConfirmProvider";
 
 type Props = {
   user: User;
@@ -12,8 +15,10 @@ type Props = {
 };
 
 export function ProfileView({ user, avatarVersion, onUserChange, onAvatarChange }: Props) {
-  const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
+  const { error, notice, setError, setNotice } = useFeedback();
+  const { busy, run } = useBusy();
+  const confirm = useConfirm();
+  const [busyTokenId, setBusyTokenId] = useState<string | null>(null);
 
   const [avatarPreview, setAvatarPreview] = useState("");
   const [avatarFailed, setAvatarFailed] = useState(false);
@@ -37,26 +42,40 @@ export function ProfileView({ user, avatarVersion, onUserChange, onAvatarChange 
 
   async function createToken(event: React.FormEvent) {
     event.preventDefault();
-    setError("");
-    try {
-      const result = await api.createGitToken(tokenName);
-      setTokens((items) => [result.item, ...items]);
-      setNewToken(result.token);
-      setTokenName("");
-      setNotice("令牌已创建，请立即复制保存，之后无法再次查看");
-    } catch (e) {
-      setError((e as Error).message);
-    }
+    await run(async () => {
+      setError("");
+      try {
+        const result = await api.createGitToken(tokenName);
+        setTokens((items) => [result.item, ...items]);
+        setNewToken(result.token);
+        setTokenName("");
+        setNotice("令牌已创建，请立即复制保存，之后无法再次查看");
+      } catch (e) {
+        setError((e as Error).message);
+      }
+    });
   }
 
-  async function revokeToken(id: string) {
+  async function revokeToken(id: string, name: string) {
+    if (
+      !(await confirm(`吊销令牌「${name}」？使用该令牌的 Git 客户端将立即失效。`, {
+        title: "吊销令牌",
+        confirmLabel: "吊销",
+        danger: true,
+      }))
+    ) {
+      return;
+    }
     setError("");
+    setBusyTokenId(id);
     try {
       await api.revokeGitToken(id);
       setTokens((items) => items.filter((item) => item.id !== id));
       setNotice("令牌已吊销");
     } catch (e) {
       setError((e as Error).message);
+    } finally {
+      setBusyTokenId(null);
     }
   }
 
@@ -139,8 +158,8 @@ export function ProfileView({ user, avatarVersion, onUserChange, onAvatarChange 
   return (
     <section>
       <h2>用户设置</h2>
-      {error && <p className="error">{error}</p>}
-      {notice && <p className="notice">{notice}</p>}
+      {error && <p className="error" role="alert">{error}</p>}
+      {notice && <p className="notice" role="status">{notice}</p>}
 
       <div className="avatar-preview">
         <div className="avatar avatar-large">
@@ -207,7 +226,9 @@ export function ProfileView({ user, avatarVersion, onUserChange, onAvatarChange 
           onChange={(e) => setTokenName(e.target.value)}
           placeholder="令牌名称，如 笔记本"
         />
-        <button type="submit">创建令牌</button>
+        <button type="submit" disabled={busy}>
+          {busy ? "创建中…" : "创建令牌"}
+        </button>
       </form>
       {newToken && (
         <p>
@@ -227,8 +248,12 @@ export function ProfileView({ user, avatarVersion, onUserChange, onAvatarChange 
                     : "尚未使用"}
                 </span>
               </span>
-              <button className="danger" onClick={() => revokeToken(token.id)}>
-                吊销
+              <button
+                className="danger"
+                disabled={busyTokenId === token.id}
+                onClick={() => void revokeToken(token.id, token.name)}
+              >
+                {busyTokenId === token.id ? "吊销中…" : "吊销"}
               </button>
             </li>
           ))}

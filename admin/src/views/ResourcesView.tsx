@@ -7,6 +7,7 @@ import {
   RepoStats,
   SystemResources,
 } from "../api";
+import { useFeedback } from "../hooks/useFeedback";
 
 const POLL_MS = 10_000;
 
@@ -183,7 +184,7 @@ function RepoCard({ repo }: { repo: RepoStats }) {
  */
 export function ResourcesView() {
   const [res, setRes] = useState<SystemResources | null>(null);
-  const [error, setError] = useState("");
+  const { error, setError } = useFeedback();
 
   useEffect(() => {
     let alive = true;

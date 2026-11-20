@@ -3949,3 +3949,23 @@ code,
 .res-branch-size small {
   opacity: 0.75;
 }
+
+/* ---------- 统一确认框 ---------- */
+.confirm-backdrop{z-index:200;}
+.confirm-dialog{width:min(24rem,100%);}
+.confirm-message{margin:.4rem 0 .2rem;color:var(--muted);white-space:pre-wrap;overflow-wrap:anywhere;}
+.confirm-message:empty{display:none;}
+.confirm-dialog .modal-actions button.danger{
+  background:#c62828;
+  border-color:#c62828;
+  color:#fff;
+}
+.confirm-dialog .modal-actions button.danger:hover{filter:brightness(1.08);}
+
+/* ---------- 未保存标记 ---------- */
+.unsaved-badge{
+  display:inline-flex;align-items:center;gap:.3rem;
+  padding:.15rem .55rem;border-radius:999px;font-size:.75rem;font-weight:600;
+  color:var(--error-text);background:var(--error-bg);border:1px solid var(--error-border);
+  white-space:nowrap;
+}

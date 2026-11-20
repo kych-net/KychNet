@@ -1,6 +1,7 @@
-import { lazy, Suspense, useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { api, avatarUrl, SiteSettings, User } from "../api";
 import { Theme } from "../theme";
+import { useNavigationGuard } from "../components/NavigationGuardProvider";
 const ContentsView = lazy(() => import("../views/ContentsView").then((module) => ({ default: module.ContentsView })));
 const InvitesView = lazy(() => import("../views/InvitesView").then((module) => ({ default: module.InvitesView })));
 const ProfileView = lazy(() => import("../views/ProfileView").then((module) => ({ default: module.ProfileView })));
@@ -25,6 +26,9 @@ type Props = {
 };
 
 const adminViews: View[] = ["runners", "invites", "users", "settings", "system"];
+const validViews: View[] = [
+  "contents", "projects", "runners", "invites", "users", "settings", "profile", "system",
+];
 
 const viewMeta: Record<View, { title: string; subtitle: string }> = {
   contents: { title: "内容", subtitle: "维护页面、样式与发布状态" },
@@ -37,6 +41,18 @@ const viewMeta: Record<View, { title: string; subtitle: string }> = {
   system: { title: "资源监控", subtitle: "负载、内存、磁盘与存储占用" },
 };
 
+function hashFor(view: View): string {
+  return `#/${view}`;
+}
+
+function viewFromHash(isAdmin: boolean): View {
+  const raw = window.location.hash.replace(/^#\/?/, "");
+  const found = validViews.find((view) => view === raw);
+  if (!found) return "contents";
+  if (!isAdmin && adminViews.includes(found)) return "contents";
+  return found;
+}
+
 export function Shell({
   user,
   site,
@@ -48,18 +64,76 @@ export function Shell({
   onAvatarChange,
   onLogout,
 }: Props) {
-  const [view, setView] = useState<View>("contents");
+  const [view, setView] = useState<View>(() => viewFromHash(user.is_admin));
+  const viewRef = useRef(view);
+  viewRef.current = view;
   const [menuOpen, setMenuOpen] = useState(false);
   const [avatarFailed, setAvatarFailed] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const { canLeave, dirty } = useNavigationGuard();
   const initial = user.username.slice(0, 1).toUpperCase();
 
   useEffect(() => {
     setAvatarFailed(false);
   }, [avatarVersion, user.id]);
 
-  function go(next: View) {
-    setView(next);
+  // 首次挂载把当前视图写进地址栏（replace 不新增历史记录）。
+  useEffect(() => {
+    const target = hashFor(viewRef.current);
+    if (window.location.hash !== target) {
+      window.history.replaceState(null, "", target);
+    }
+  }, []);
+
+  // 浏览器前进/后退：从地址栏恢复视图，离开前同样经过守卫。
+  useEffect(() => {
+    async function onPop() {
+      const next = viewFromHash(user.is_admin);
+      if (next === viewRef.current) return;
+      if (!(await canLeave())) {
+        // 守卫拒绝：把地址栏恢复到当前视图。
+        window.history.pushState(null, "", hashFor(viewRef.current));
+        return;
+      }
+      setView(next);
+      viewRef.current = next;
+      setMenuOpen(false);
+    }
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, [canLeave, user.is_admin]);
+
+  // 头像菜单：点击外部或 Esc 关闭。
+  useEffect(() => {
+    if (!menuOpen) return;
+    function onDown(event: MouseEvent) {
+      if (menuRef.current && !menuRef.current.contains(event.target as Node)) {
+        setMenuOpen(false);
+      }
+    }
+    function onKey(event: KeyboardEvent) {
+      if (event.key === "Escape") setMenuOpen(false);
+    }
+    document.addEventListener("mousedown", onDown);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [menuOpen]);
+
+  async function go(next: View) {
     setMenuOpen(false);
+    if (next === viewRef.current) return;
+    if (!(await canLeave())) return;
+    setView(next);
+    viewRef.current = next;
+    const target = hashFor(next);
+    if (window.location.hash !== target) {
+      // pushState 不触发 popstate/hashchange，视图状态由这里直接更新。
+      window.history.pushState(null, "", target);
+    }
+    window.scrollTo?.({ top: 0 });
   }
 
   function switchTheme() {
@@ -85,10 +159,10 @@ export function Shell({
         </a>
 
         <nav className="appnav">
-          <button className={view === "contents" ? "active" : ""} onClick={() => go("contents")}>
+          <button className={view === "contents" ? "active" : ""} onClick={() => void go("contents")}>
             内容
           </button>
-          <button className={view === "projects" ? "active" : ""} onClick={() => go("projects")}>
+          <button className={view === "projects" ? "active" : ""} onClick={() => void go("projects")}>
             项目
           </button>
           {user.is_admin &&
@@ -96,7 +170,7 @@ export function Shell({
               <button
                 key={item}
                 className={view === item ? "active" : ""}
-                onClick={() => go(item)}
+                onClick={() => void go(item)}
               >
                 {viewMeta[item].title}
               </button>
@@ -104,14 +178,17 @@ export function Shell({
         </nav>
 
         <div className="appactions">
+          {dirty && <span className="unsaved-badge" title="当前视图有未保存的改动">未保存</span>}
           <button className="theme-button" onClick={switchTheme}>
             {theme === "dark" ? "浅色" : "深色"}
           </button>
-          <div className="avatar-wrap">
+          <div className="avatar-wrap" ref={menuRef}>
             <button
               className="avatar"
               onClick={() => setMenuOpen((open) => !open)}
               aria-label="用户菜单"
+              aria-expanded={menuOpen}
+              aria-haspopup="menu"
             >
               {avatarFailed ? (
                 initial
@@ -125,15 +202,16 @@ export function Shell({
               )}
             </button>
             {menuOpen && (
-              <div className="avatar-menu">
-                <button onClick={() => go("profile")}>用户设置</button>
-                {user.is_admin && <button onClick={() => go("contents")}>网站管理</button>}
+              <div className="avatar-menu" role="menu">
+                <button role="menuitem" onClick={() => void go("profile")}>用户设置</button>
+                {user.is_admin && <button role="menuitem" onClick={() => void go("contents")}>网站管理</button>}
                 {siteUrl && (
-                  <a href={siteUrl} target="_blank" rel="noreferrer">
+                  <a role="menuitem" href={siteUrl} target="_blank" rel="noreferrer">
                     前往内容端
                   </a>
                 )}
                 <button
+                  role="menuitem"
                   onClick={async () => {
                     await api.logout().catch(() => undefined);
                     onLogout();
