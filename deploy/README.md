@@ -20,7 +20,7 @@ EdgeOne 只做加速回源，静态文件全部由源站 nginx 托管。旧入�
 | 名称 | 记录 | 值 | 说明 |
 | --- | --- | --- | --- |
 | `kych.net` | CNAME | `kych.net.eo.dnse0.com` | 主域接入 EdgeOne，递归返回 EO 节点 A 记录 |
-| `www.kych.net` | A | `49.232.71.240` | 直连源站，nginx 301 → `https://kych.net/` |
+| `www.kych.net` | A | `<源站IP>` | 直连源站，nginx 301 → `https://kych.net/` |
 | `eo` / `c` / `m` / `api.kych.net` | — | 无记录（NXDOMAIN） | 历史入口，已删除 |
 
 权威 DNS 仍在 DNSPod（`phecda.dnspod.net` / `hospital.dnspod.net`），
@@ -33,7 +33,7 @@ EdgeOne 只做加速回源，静态文件全部由源站 nginx 托管。旧入�
 | 配置 | 值 | 作用 |
 | --- | --- | --- |
 | 边缘证书 | EO 托管（免费证书自动申请/续期） | 浏览器 → EO 的 HTTPS |
-| 回源地址 | `49.232.71.240:443` | EO → 源站 nginx |
+| 回源地址 | `<源站IP>:443` | EO → 源站 nginx |
 | 回源 HOST / SNI | `kych.net` | nginx 按它选证书与 vhost，复用主域那张 Let's Encrypt 证书 |
 
 实测源站行为（SNI 固定 `kych.net`）：
@@ -52,7 +52,7 @@ EdgeOne 只做加速回源，静态文件全部由源站 nginx 托管。旧入�
 
 ```bash
 printf 'GET / HTTP/1.1\r\nHost: kych.net\r\nConnection: close\r\n\r\n' \
-  | openssl s_client -quiet -connect 49.232.71.240:443 -servername kych.net
+  | openssl s_client -quiet -connect <源站IP>:443 -servername kych.net
 ```
 
 ## 管理端的子路径
@@ -151,8 +151,8 @@ gh run download <run-id> --name kych-net-x86_64-unknown-linux-gnu -D /tmp/kych-b
 cd /tmp/kych-build && tar -xzf kych-net-x86_64-unknown-linux-gnu.tar.gz
 
 # 3. 备份旧二进制后替换
-scp kych-net root@49.232.71.240:/tmp/kych-net.new
-ssh root@49.232.71.240 '
+scp kych-net root@<源站IP>:/tmp/kych-net.new
+ssh root@<源站IP> '
   set -e
   systemctl stop kych-net
   cp -a /opt/kych-net/kych-net /opt/kych-net/kych-net.pre-$(date +%Y%m%d%H%M%S)
@@ -162,7 +162,7 @@ ssh root@49.232.71.240 '
 '
 
 # 4. 模板或 SITE_URL 有变动时重建内容站
-ssh root@49.232.71.240 "sudo -u kych-net bash -c 'cd /opt/kych-net && ./kych-net build'"
+ssh root@<源站IP> "sudo -u kych-net bash -c 'cd /opt/kych-net && ./kych-net build'"
 ```
 
 替换二进制不会动 `.env`；若本次改了配置项，需同步修改 `/opt/kych-net/.env` 并重启。
@@ -171,7 +171,7 @@ ssh root@49.232.71.240 "sudo -u kych-net bash -c 'cd /opt/kych-net && ./kych-net
 
 | Secret | 值 |
 | --- | --- |
-| `DEPLOY_HOST` | `49.232.71.240` |
+| `DEPLOY_HOST` | `<源站IP>` |
 | `DEPLOY_USER` | `deploy-admin` |
 | `DEPLOY_PATH` | `/opt/kych-admin/` |
 | `DEPLOY_SSH_KEY` | 部署私钥全文 |
@@ -186,7 +186,7 @@ ssh root@49.232.71.240 "sudo -u kych-net bash -c 'cd /opt/kych-net && ./kych-net
 
 ```bash
 cd admin && VITE_API_BASE_URL=https://kych.net pnpm build
-rsync -az --delete admin/dist/ deploy-admin@49.232.71.240:/opt/kych-admin/ \
+rsync -az --delete admin/dist/ deploy-admin@<源站IP>:/opt/kych-admin/ \
   -e "ssh -i ~/.ssh/kych-deploy"
 ```
 
@@ -194,7 +194,7 @@ rsync -az --delete admin/dist/ deploy-admin@49.232.71.240:/opt/kych-admin/ \
 
 ```bash
 cd editor && VITE_API_BASE_URL=https://kych.net pnpm build
-rsync -az --delete editor/dist/ deploy-admin@49.232.71.240:/opt/kych-editor/ \
+rsync -az --delete editor/dist/ deploy-admin@<源站IP>:/opt/kych-editor/ \
   -e "ssh -i ~/.ssh/kych-deploy"
 ```
 
@@ -209,7 +209,7 @@ rsync -az --delete editor/dist/ deploy-admin@49.232.71.240:/opt/kych-editor/ \
 | 前端发版有问题 | `git revert` 后重新发布 |
 | 域名配置要退回 | `cp -a /opt/kych-net/.env.bak-<时间戳> /opt/kych-net/.env`，重启后端并重建内容站 |
 | nginx 配置要退回 | 配置备份在服务器 `/root/nginx-backup-<时间戳>/` |
-| EO 出问题 | 控制台暂停加速域名，或 DNS 直指 `49.232.71.240` |
+| EO 出问题 | 控制台暂停加速域名，或 DNS 直指 `<源站IP>` |
 
 ## 已验证响应
 
