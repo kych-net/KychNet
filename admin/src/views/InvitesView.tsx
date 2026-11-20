@@ -12,6 +12,8 @@ export function InvitesView() {
   const { busy, run } = useBusy();
   const confirm = useConfirm();
   const [busyCode, setBusyCode] = useState<string | null>(null);
+  // 最新生成的邀请码：一次性凭据，单独常驻展示，不被提示的超时清掉。
+  const [createdCode, setCreatedCode] = useState("");
 
   useEffect(() => {
     void refresh();
@@ -29,9 +31,11 @@ export function InvitesView() {
     event.preventDefault();
     await run(async () => {
       setError("");
+      setNotice("邀请码已生成");
       try {
         const created = await api.createInvite(maxUses, expiresInDays);
-        setNotice(`邀请码: ${created.item.code}`);
+        // 邀请码只显示一次：像执行器注册码一样常驻展示，不吃 notice 的自动消失。
+        setCreatedCode(created.item.code);
         await refresh();
       } catch (e) {
         setError((e as Error).message);
@@ -91,6 +95,12 @@ export function InvitesView() {
           {busy ? "生成中…" : "生成"}
         </button>
       </form>
+
+      {createdCode && (
+        <p className="notice">
+          邀请码（只显示一次）：<code>{createdCode}</code>
+        </p>
+      )}
 
       <div className="table-wrap">
       <table>

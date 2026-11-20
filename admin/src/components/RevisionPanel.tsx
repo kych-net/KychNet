@@ -146,10 +146,13 @@ export function RevisionPanel({
   contentId,
   refreshKey = 0,
   onReverted,
+  beforeRevert,
 }: {
   contentId: string | null;
   refreshKey?: number;
   onReverted: (item: Content) => void;
+  /** 回滚会覆盖编辑器内容：父组件在此确认是否有未保存改动，返回 false 则中止。 */
+  beforeRevert?: () => Promise<boolean>;
 }) {
   const [items, setItems] = useState<ContentRevision[]>([]);
   const [currentSeq, setCurrentSeq] = useState<number | null>(null);
@@ -267,6 +270,8 @@ export function RevisionPanel({
   }
 
   async function revert(seq: number) {
+    // 回滚会覆盖编辑器里的正文：先问父组件有没有未保存改动要保护。
+    if (beforeRevert && !(await beforeRevert())) return;
     if (
       !(await confirm(`回滚到版本 ${seq}？指针将直接移动，之后的版本仍保留在历史中。`, {
         title: "回滚版本",

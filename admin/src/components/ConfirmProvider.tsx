@@ -34,24 +34,27 @@ export function useConfirm(): Ask {
 
 export function ConfirmProvider({ children }: { children: ReactNode }) {
   const [request, setRequest] = useState<ConfirmRequest | null>(null);
+  // 当前未结算的请求。并发调用时用它把上一个请求按「取消」结算掉，
+  // 否则旧的 Promise 永远不会 resolve，调用方（useBusy）的 busy 状态会卡死。
+  const requestRef = useRef<ConfirmRequest | null>(null);
   const confirmRef = useRef<HTMLButtonElement | null>(null);
   const cancelRef = useRef<HTMLButtonElement | null>(null);
 
   const ask = useCallback<Ask>((message, options = {}) => {
     return new Promise<boolean>((resolve) => {
-      setRequest({ message, options, resolve });
+      requestRef.current?.resolve(false);
+      const next: ConfirmRequest = { message, options, resolve };
+      requestRef.current = next;
+      setRequest(next);
     });
   }, []);
 
-  const settle = useCallback(
-    (ok: boolean) => {
-      setRequest((current) => {
-        current?.resolve(ok);
-        return null;
-      });
-    },
-    [],
-  );
+  const settle = useCallback((ok: boolean) => {
+    const current = requestRef.current;
+    requestRef.current = null;
+    setRequest(null);
+    current?.resolve(ok);
+  }, []);
 
   // 打开时把焦点放到默认按钮；支持 Esc 取消。
   useEffect(() => {

@@ -128,8 +128,13 @@ export function ContentsView() {
     return JSON.stringify([id, path, fmt, text, headText, isPublished]);
   }
 
+  // 加载另一个内容的正文期间，state 会短暂处于「新 id/新路径 + 旧正文」的中间态。
+  // 该窗口内不参与 dirty 计算，否则会误报「未保存」并弹出不必要的离开确认。
+  const loadingRef = useRef(false);
+
   // 保存快照后同步刷新 dirty（用当前渲染值比对）。
   useEffect(() => {
+    if (loadingRef.current) return;
     const current = snap(contentId, slug, format, body, head, published);
     setDirty(current !== savedRef.current);
   }, [contentId, slug, format, body, head, published]);
@@ -332,6 +337,11 @@ export function ContentsView() {
 
   async function edit(item: ContentSummary) {
     if (!(await discardOk())) return;
+    // 进入加载态：正文到达前不参与 dirty 计算（见 loadingRef 的注释）。
+    loadingRef.current = true;
+    dirtyRef.current = false;
+    setDirty(false);
+    setGlobalDirty(false);
     setContentId(item.id);
     setSlug(sourcePath(item));
     setFormat(item.format);
@@ -351,6 +361,9 @@ export function ContentsView() {
     } catch (error) {
       if (editGeneration.current !== generation) return;
       setError((error as Error).message);
+    } finally {
+      // 只有最后一次 edit 才能解除加载态，被新一代覆盖时新的 edit 已自行接管。
+      if (editGeneration.current === generation) loadingRef.current = false;
     }
   }
 
@@ -600,6 +613,7 @@ export function ContentsView() {
             <RevisionPanel
               contentId={contentId}
               refreshKey={historyKey}
+              beforeRevert={discardOk}
               onReverted={(item) => {
                 // 回滚是移动指针：编辑器同步显示回滚后的正文与格式。
                 const revertSlug = editorPath(item);

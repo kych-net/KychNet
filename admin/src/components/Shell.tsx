@@ -53,6 +53,15 @@ function viewFromHash(isAdmin: boolean): View {
   return found;
 }
 
+/** 读取我们自己写进 history.state 的视图索引；外部条目返回 null。 */
+function readHistoryIndex(state: unknown): number | null {
+  if (state && typeof state === "object" && "viewIndex" in state) {
+    const value = (state as { viewIndex?: unknown }).viewIndex;
+    if (typeof value === "number") return value;
+  }
+  return null;
+}
+
 export function Shell({
   user,
   site,
@@ -77,24 +86,52 @@ export function Shell({
     setAvatarFailed(false);
   }, [avatarVersion, user.id]);
 
-  // 首次挂载把当前视图写进地址栏（replace 不新增历史记录）。
+  // 视图在浏览器历史里的位置索引。用于前进/后退时判断方向，
+  // 并在守卫拒绝时精确回拨到原条目，而不是用 pushState 覆盖地址栏
+  // （后者会把前进历史整段丢掉）。
+  const historyIndexRef = useRef(0);
+  // 守卫拒绝后主动回拨历史产生的 popstate，需要忽略一次。
+  const restoringRef = useRef(false);
+  // go() 的防重入：连点两个不同视图时，避免两次 pushState 把历史栈写乱。
+  const navigatingRef = useRef(false);
+
+  // 首次挂载把当前视图写进地址栏（replace 不新增历史记录），并打上索引 0。
   useEffect(() => {
-    const target = hashFor(viewRef.current);
-    if (window.location.hash !== target) {
-      window.history.replaceState(null, "", target);
-    }
+    window.history.replaceState({ viewIndex: 0 }, "", hashFor(viewRef.current));
   }, []);
 
   // 浏览器前进/后退：从地址栏恢复视图，离开前同样经过守卫。
   useEffect(() => {
-    async function onPop() {
-      const next = viewFromHash(user.is_admin);
-      if (next === viewRef.current) return;
-      if (!(await canLeave())) {
-        // 守卫拒绝：把地址栏恢复到当前视图。
-        window.history.pushState(null, "", hashFor(viewRef.current));
+    async function onPop(event: PopStateEvent) {
+      if (restoringRef.current) {
+        // 这是守卫拒绝后我们自己发起的回拨，不重复处理。
+        restoringRef.current = false;
         return;
       }
+      const next = viewFromHash(user.is_admin);
+      const nextIndex = readHistoryIndex(event.state);
+      if (next === viewRef.current) {
+        // 地址栏与当前视图一致（例如非管理员访问管理端视图被回退），
+        // 顺手把地址栏修正回当前视图。
+        if (nextIndex !== null) historyIndexRef.current = nextIndex;
+        const target = hashFor(viewRef.current);
+        if (window.location.hash !== target) {
+          window.history.replaceState({ viewIndex: historyIndexRef.current }, "", target);
+        }
+        return;
+      }
+      const currentIndex = historyIndexRef.current;
+      if (!(await canLeave())) {
+        if (nextIndex !== null && nextIndex !== currentIndex) {
+          restoringRef.current = true;
+          window.history.go(currentIndex - nextIndex);
+        } else {
+          // 条目上没有我们的索引（例如从外部直接打开）：只能重写地址栏。
+          window.history.pushState({ viewIndex: currentIndex }, "", hashFor(viewRef.current));
+        }
+        return;
+      }
+      if (nextIndex !== null) historyIndexRef.current = nextIndex;
       setView(next);
       viewRef.current = next;
       setMenuOpen(false);
@@ -125,15 +162,22 @@ export function Shell({
   async function go(next: View) {
     setMenuOpen(false);
     if (next === viewRef.current) return;
-    if (!(await canLeave())) return;
-    setView(next);
-    viewRef.current = next;
-    const target = hashFor(next);
-    if (window.location.hash !== target) {
-      // pushState 不触发 popstate/hashchange，视图状态由这里直接更新。
-      window.history.pushState(null, "", target);
+    if (navigatingRef.current) return;
+    navigatingRef.current = true;
+    try {
+      if (!(await canLeave())) return;
+      setView(next);
+      viewRef.current = next;
+      const target = hashFor(next);
+      if (window.location.hash !== target) {
+        // pushState 不触发 popstate/hashchange，视图状态由这里直接更新。
+        historyIndexRef.current += 1;
+        window.history.pushState({ viewIndex: historyIndexRef.current }, "", target);
+      }
+      window.scrollTo?.({ top: 0 });
+    } finally {
+      navigatingRef.current = false;
     }
-    window.scrollTo?.({ top: 0 });
   }
 
   function switchTheme() {
