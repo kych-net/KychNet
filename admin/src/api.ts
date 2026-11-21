@@ -461,6 +461,11 @@ export function sshGitUrl(slug: string): string {
   return `ssh://git@${GIT_SSH_HOST}:${GIT_SSH_PORT}/${slug}.git`;
 }
 
+/** SSH 克隆地址的模板（界面上展示 `<项目>` 占位符用），跟随上面的主机配置。 */
+export function sshCloneTemplate(): string {
+  return `ssh://git@${GIT_SSH_HOST}:${GIT_SSH_PORT}/<项目>.git`;
+}
+
 export class ApiError extends Error {
   status: number;
 
