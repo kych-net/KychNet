@@ -283,6 +283,12 @@ export function ContentsView() {
     event.preventDefault();
     await run(async () => {
       setError("");
+      // 唯一的提交入口在 Git 栏，其按钮带 formNoValidate（窄屏下表单是隐藏的），
+      // 浏览器不会再校验必填项，这里手工兜底空路径。
+      if (!slug.trim()) {
+        setError("请填写路径");
+        return;
+      }
       // 保存发起时的会话代际：期间用户若点了「新建内容」或切到别的内容，
       // editGeneration 会递增，此时响应只提示，不再回写 savedRef / 路径 / id。
       const session = editGeneration.current;
@@ -637,7 +643,6 @@ export function ContentsView() {
             />
             发布
           </label>
-          <button type="submit" disabled={busy}>{busy ? "保存中…" : "保存"}</button>
           <button type="button" onClick={() => void resetEditor()} disabled={busy}>
             新建内容
           </button>
@@ -707,8 +712,19 @@ export function ContentsView() {
                 />
               </label>
               <p className="hint">
-                在编辑器点「保存」时，说明随新版本一起记录；正文或格式没有变化则不会产生新版本。
+                填写说明后点「保存并提交」，说明随新版本一起记录；正文或格式没有变化则不会产生新版本。
               </p>
+              {/* 与左栏「保存」共用同一个表单：窄屏 Git 标签下编辑器表单是隐藏的，
+                  formNoValidate 绕开浏览器对隐藏必填项的拦截，保证这里也能提交。 */}
+              <button
+                type="submit"
+                form="content-editor-form"
+                formNoValidate
+                disabled={busy}
+                className="contents-git-save"
+              >
+                {busy ? "保存中…" : "保存并提交"}
+              </button>
             </div>
             <RevisionPanel
               contentId={contentId}
