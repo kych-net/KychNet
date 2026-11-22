@@ -2469,6 +2469,21 @@ code,
   line-height: 1.5;
 }
 
+/* Git 栏里唯一的保存入口，作为主操作强调；与左栏原「保存」共用同一个表单。 */
+.contents-git-save {
+  align-self: stretch;
+  margin-top: 0.1rem;
+  color: var(--accent-text);
+  background: var(--accent);
+  border-color: var(--accent);
+  font-weight: 600;
+}
+
+.contents-git-save:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 88%, #000);
+  border-color: var(--accent);
+}
+
 /* 精简版历史面板（右栏 Git 区域内） */
 .revision-panel {
   display: flex;
