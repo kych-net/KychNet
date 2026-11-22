@@ -559,6 +559,9 @@ export function ContentsView() {
               <option value="svg">SVG</option>
             </select>
           </label>
+          <button type="button" onClick={() => void resetEditor()} disabled={busy}>
+            新建内容
+          </button>
         </div>
         <p className="hint">
           目录主页必须写 <code>/eoe/index</code>，不再接受 <code>/eoe/</code>；普通页面用 <code>/reff/93df/l.html</code>。
@@ -643,9 +646,6 @@ export function ContentsView() {
             />
             发布
           </label>
-          <button type="button" onClick={() => void resetEditor()} disabled={busy}>
-            新建内容
-          </button>
         </div>
       </form>
 
