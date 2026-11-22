@@ -817,7 +817,13 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
             } else {
                 String::new()
             };
-            let icon = project_icon_href(&content.slug, &project_icons);
+            // 项目页优先用项目自带的 icon.svg，没有则回退站点图标。
+            let project_icon = project_icon_href(&content.slug, &project_icons);
+            let icon = if project_icon.is_empty() {
+                settings.icon_url.clone()
+            } else {
+                project_icon
+            };
             let template = PageTemplate {
                 site: settings,
                 admin_url,
@@ -877,7 +883,7 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
             posts: project_links,
             tree: tree_html.clone(),
             styles: Vec::new(),
-            icon: String::new(),
+            icon: settings.icon_url.clone(),
             head: String::new(),
         }
         .render()?;
@@ -913,7 +919,7 @@ pub async fn run(pool: &PgPool, cfg: &Config, out: &Path) -> Result<()> {
                 posts: links,
                 tree: tree_html.clone(),
                 styles: Vec::new(),
-                icon: String::new(),
+                icon: settings.icon_url.clone(),
                 head: String::new(),
             }
             .render()?,
@@ -1152,7 +1158,7 @@ pub async fn run_one(
         pdf_url,
         tree: tree_html,
         styles,
-        icon: String::new(),
+        icon: settings.icon_url.clone(),
         head: content.head.clone(),
     }
     .render()?;

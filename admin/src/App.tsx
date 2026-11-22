@@ -14,6 +14,7 @@ const defaultSite: SiteSettings = {
   site_name: "",
   description: "",
   logo_url: "",
+  icon_url: "",
   nav: [],
   icp_beian: "",
   police_beian: "",

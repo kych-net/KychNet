@@ -11,6 +11,7 @@ export function SettingsView() {
   const [siteName, setSiteName] = useState("");
   const [description, setDescription] = useState("");
   const [logoUrl, setLogoUrl] = useState("");
+  const [iconUrl, setIconUrl] = useState("");
   const [icpBeian, setIcpBeian] = useState("");
   const [policeBeian, setPoliceBeian] = useState("");
   const [policeBeianCode, setPoliceBeianCode] = useState("");
@@ -27,6 +28,7 @@ export function SettingsView() {
         setSiteName(result.site.site_name);
         setDescription(result.site.description);
         setLogoUrl(result.site.logo_url);
+        setIconUrl(result.site.icon_url ?? "");
         setIcpBeian(result.site.icp_beian ?? "");
         setPoliceBeian(result.site.police_beian ?? "");
         setPoliceBeianCode(result.site.police_beian_code ?? "");
@@ -72,6 +74,7 @@ export function SettingsView() {
           site_name: siteName,
           description,
           logo_url: logoUrl,
+          icon_url: iconUrl,
           nav,
           icp_beian: icpBeian,
           police_beian: policeBeian,
@@ -97,7 +100,7 @@ export function SettingsView() {
             <input value={siteName} onChange={(e) => setSiteName(e.target.value)} required />
           </label>
           <label>
-            图标 URL
+            页头 Logo URL
             <input
               value={logoUrl}
               onChange={(e) => setLogoUrl(e.target.value)}
@@ -105,6 +108,14 @@ export function SettingsView() {
             />
           </label>
         </div>
+        <label>
+          网站图标（favicon）
+          <input
+            value={iconUrl}
+            onChange={(e) => setIconUrl(e.target.value)}
+            placeholder="浏览器标签页图标 URL，如 https://…/icon.svg；留空用内置默认图标"
+          />
+        </label>
         <label>
           站点描述
           <input

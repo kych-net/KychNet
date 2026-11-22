@@ -42,6 +42,8 @@ export type SiteSettings = {
   site_name: string;
   description: string;
   logo_url: string;
+  /** 站点图标（浏览器标签页 favicon）；留空时用内置默认图标。 */
+  icon_url: string;
   nav: NavLink[];
   icp_beian: string;
   police_beian: string;

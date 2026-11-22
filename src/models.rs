@@ -24,6 +24,10 @@ pub struct SiteSettings {
     #[serde(default)]
     pub description: String,
     pub logo_url: String,
+    /// 站点图标（favicon）URL；留空时回退内置默认图标。
+    /// 项目页若有自己的 icon.svg，仍以项目图标优先。
+    #[serde(default)]
+    pub icon_url: String,
     pub nav: Vec<NavLink>,
     /// ICP 备案号，如「京ICP备12345678号-1」；留空则页脚不显示备案信息。
     #[serde(default)]
@@ -90,6 +94,7 @@ impl Default for SiteSettings {
                 .unwrap_or_else(|_| "个人站点".to_string())
                 .into(),
             logo_url: String::new(),
+            icon_url: String::new(),
             nav: vec![
                 NavLink {
                     label: "文章".into(),
