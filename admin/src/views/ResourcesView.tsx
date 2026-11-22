@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   api,
   RepoBranchStats,
@@ -7,7 +7,6 @@ import {
   RepoStats,
   SystemResources,
 } from "../api";
-import { useFeedback } from "../hooks/useFeedback";
 
 const POLL_MS = 10_000;
 
@@ -118,8 +117,7 @@ function RepoCard({ repo }: { repo: RepoStats }) {
   const requested = useRef(false);
 
   // 展开时才拉明细：逐分支逐提交查对象位置有成本，不该跟着 10 秒轮询跑。
-  async function onToggle(event: React.SyntheticEvent<HTMLDetailsElement>) {
-    if (!event.currentTarget.open || requested.current) return;
+  async function loadDetail() {
     requested.current = true;
     setLoading(true);
     try {
@@ -127,9 +125,16 @@ function RepoCard({ repo }: { repo: RepoStats }) {
       setLoadError("");
     } catch (e) {
       setLoadError((e as Error).message);
+      // 失败后清掉「已请求」标记：收起再展开、或点「重试」都要能再拉一次。
+      requested.current = false;
     } finally {
       setLoading(false);
     }
+  }
+
+  async function onToggle(event: React.SyntheticEvent<HTMLDetailsElement>) {
+    if (!event.currentTarget.open || requested.current) return;
+    await loadDetail();
   }
 
   return (
@@ -159,7 +164,14 @@ function RepoCard({ repo }: { repo: RepoStats }) {
         </p>
 
         {loading && <p className="hint">加载明细…</p>}
-        {loadError && <p className="hint">明细加载失败：{loadError}</p>}
+        {loadError && !loading && (
+          <p className="error">
+            明细加载失败：{loadError}
+            <button type="button" onClick={() => void loadDetail()}>
+              重试
+            </button>
+          </p>
+        )}
         {detail ? (
           <>
             <h5 className="res-repo-subtitle">分支（{detail.branch_list.length}）</h5>
@@ -184,51 +196,79 @@ function RepoCard({ repo }: { repo: RepoStats }) {
  */
 export function ResourcesView() {
   const [res, setRes] = useState<SystemResources | null>(null);
-  const { error, setError } = useFeedback();
+  // 错误只由这里持有：不用 useFeedback 的自动清除，否则 12 秒后横幅消失、
+  // 页面看起来「正常」但其实停在旧数据上，形成闪烁与误判。
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+  // 上一次结果的时间戳：标签页切回来时不必立刻重扫（后端那次统计要扫
+  // git_objects 与 LFS 目录），短时间内直接用现有数据。
+  const lastLoadedAt = useRef(0);
+  const alive = useRef(true);
+  const timer = useRef<number | undefined>(undefined);
+
+  const load = useCallback(async (force = false) => {
+    if (!force && Date.now() - lastLoadedAt.current < POLL_MS / 2) return;
+    try {
+      const result = await api.systemResources();
+      lastLoadedAt.current = Date.now();
+      if (!alive.current) return;
+      setRes(result);
+      setError("");
+    } catch (e) {
+      // 已渲染的指标保持不动，只在顶部加一条错误横幅。
+      if (!alive.current) return;
+      setError((e as Error).message);
+    } finally {
+      if (alive.current) setLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
-    let alive = true;
-    // 上一次结果的时间戳：标签页切回来时不必立刻重扫（后端那次统计要扫
-    // git_objects 与 LFS 目录），短时间内直接用现有数据。
-    let lastLoadedAt = 0;
-    async function load(force = false) {
-      if (!force && Date.now() - lastLoadedAt < POLL_MS / 2) return;
-      try {
-        const result = await api.systemResources();
-        lastLoadedAt = Date.now();
-        if (alive) {
-          setRes(result);
-          setError("");
-        }
-      } catch (e) {
-        if (alive) setError((e as Error).message);
-      }
-    }
-    load(true);
-    const timer = window.setInterval(() => void load(), POLL_MS);
+    alive.current = true;
+    void load(true);
+    const startPolling = () => {
+      if (timer.current !== undefined) window.clearInterval(timer.current);
+      timer.current = window.setInterval(() => void load(), POLL_MS);
+    };
+    const stopPolling = () => {
+      if (timer.current !== undefined) window.clearInterval(timer.current);
+      timer.current = undefined;
+    };
+    startPolling();
     // 页面隐藏时停掉轮询：后台标签页没必要每 10 秒让服务器扫一遍磁盘。
     const onVisible = () => {
       if (document.hidden) {
-        window.clearInterval(timer);
+        stopPolling();
       } else {
+        startPolling();
         void load();
       }
     };
     document.addEventListener("visibilitychange", onVisible);
     return () => {
-      alive = false;
-      window.clearInterval(timer);
+      alive.current = false;
+      stopPolling();
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, []);
+  }, [load]);
 
-  if (error) return <p className="hint">加载失败：{error}</p>;
-  if (!res) return <p className="hint">加载中…</p>;
-
-  const memUsed = res.mem_total > res.mem_available ? res.mem_total - res.mem_available : 0;
+  const memUsed =
+    res && res.mem_total > res.mem_available ? res.mem_total - res.mem_available : 0;
 
   return (
     <div className="res-wrap">
+      {error && (
+        <p className="error res-error-banner" role="alert">
+          数据刷新失败：{error}（下面是最近一次成功获取的数据）
+          <button type="button" onClick={() => void load(true)} disabled={loading}>
+            重试
+          </button>
+        </p>
+      )}
+      {!res ? (
+        <p className="hint">{loading ? "加载中…" : "暂时没有可显示的指标，请点上方「重试」重新加载。"}</p>
+      ) : (
+      <>
       <div className="res-grid">
         <div className="res-card">
           <h4>负载</h4>
@@ -274,6 +314,8 @@ export function ResourcesView() {
             <RepoCard repo={repo} key={repo.id} />
           ))}
         </div>
+      )}
+      </>
       )}
     </div>
   );

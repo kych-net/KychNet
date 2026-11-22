@@ -18,12 +18,17 @@ export function RunnersView() {
   const { error, notice, setError, setNotice } = useFeedback();
   const { busy, run } = useBusy();
   const [busyId, setBusyId] = useState<string | null>(null);
+  // 首屏加载中：区分「加载中 / 空列表 / 有数据」，避免首帧就闪一下「暂无执行器」。
+  const [loading, setLoading] = useState(true);
 
   async function loadRunners() {
+    setLoading(true);
     try {
       setRunners((await api.runners()).items);
     } catch (e) {
       setError((e as Error).message);
+    } finally {
+      setLoading(false);
     }
   }
 
@@ -66,7 +71,14 @@ export function RunnersView() {
     <section>
       <h2>执行器</h2>
       <p className="hint">执行器由全站共享，用于运行各项目的工作流；项目内的定义与记录请在「项目 → 工作流」中查看。</p>
-      {error && <p className="error" role="alert">{error}</p>}
+      {error && (
+        <p className="error" role="alert">
+          {error}
+          <button type="button" onClick={() => void loadRunners()}>
+            重试
+          </button>
+        </p>
+      )}
       {notice && <p className="notice" role="status">{notice}</p>}
       <form className="row" onSubmit={(e) => void registerRunner(e)}>
         <label>
@@ -97,7 +109,19 @@ export function RunnersView() {
               </td>
             </tr>
           ))}
-          {runners.length === 0 && <tr><td colSpan={4}>暂无执行器。</td></tr>}
+          {loading && runners.length === 0 ? (
+            <tr>
+              <td colSpan={4} className="hint">
+                加载中…
+              </td>
+            </tr>
+          ) : runners.length === 0 ? (
+            <tr>
+              <td colSpan={4} className="hint">
+                还没有执行器。在上方填写名称并生成注册码，交给 kychrunner 注册后即可运行工作流。
+              </td>
+            </tr>
+          ) : null}
         </tbody>
       </table>
     </section>

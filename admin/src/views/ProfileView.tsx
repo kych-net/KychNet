@@ -19,6 +19,9 @@ export function ProfileView({ user, avatarVersion, onUserChange, onAvatarChange 
   const { busy, run } = useBusy();
   const confirm = useConfirm();
   const [busyTokenId, setBusyTokenId] = useState<string | null>(null);
+  // 通行密钥与 TOTP 各自独立 busy：连点会发两次请求，后到的 secret 会覆盖先到的。
+  const passkeyBusy = useBusy();
+  const totpBusy = useBusy();
 
   const [avatarPreview, setAvatarPreview] = useState("");
   const [avatarFailed, setAvatarFailed] = useState(false);
@@ -104,41 +107,45 @@ export function ProfileView({ user, avatarVersion, onUserChange, onAvatarChange 
   }
 
   async function bindPasskey() {
-    setError("");
-    try {
-      const started = await api.passkeySetup();
-      // webauthn-rs 返回 { publicKey: {...} }，SimpleWebAuthn 需要里面的 publicKey 对象
-      const options = started.options.publicKey ?? started.options;
-      const credential = await startRegistration({ optionsJSON: options });
-      await api.passkeySetupFinish(started.flow_id, credential);
-      setNotice("通行密钥已绑定");
-    } catch (e) {
-      if (isStepUpRequired(e)) {
-        setError("");
-        setPendingAction(() => bindPasskey);
-        setStepUpOpen(true);
-      } else {
-        setError((e as Error).message);
+    await passkeyBusy.run(async () => {
+      setError("");
+      try {
+        const started = await api.passkeySetup();
+        // webauthn-rs 返回 { publicKey: {...} }，SimpleWebAuthn 需要里面的 publicKey 对象
+        const options = started.options.publicKey ?? started.options;
+        const credential = await startRegistration({ optionsJSON: options });
+        await api.passkeySetupFinish(started.flow_id, credential);
+        setNotice("通行密钥已绑定");
+      } catch (e) {
+        if (isStepUpRequired(e)) {
+          setError("");
+          setPendingAction(() => bindPasskey);
+          setStepUpOpen(true);
+        } else {
+          setError((e as Error).message);
+        }
       }
-    }
+    });
   }
 
   async function setupTotp() {
-    setError("");
-    try {
-      const result = await api.totpSetup();
-      setTotpSecret(result.secret);
-      setTotpUrl(result.otpauth_url);
-      setNotice("请用认证器 App 添加该密钥,然后输入动态码确认");
-    } catch (e) {
-      if (isStepUpRequired(e)) {
-        setError("");
-        setPendingAction(() => setupTotp);
-        setStepUpOpen(true);
-      } else {
-        setError((e as Error).message);
+    await totpBusy.run(async () => {
+      setError("");
+      try {
+        const result = await api.totpSetup();
+        setTotpSecret(result.secret);
+        setTotpUrl(result.otpauth_url);
+        setNotice("请用认证器 App 添加该密钥,然后输入动态码确认");
+      } catch (e) {
+        if (isStepUpRequired(e)) {
+          setError("");
+          setPendingAction(() => setupTotp);
+          setStepUpOpen(true);
+        } else {
+          setError((e as Error).message);
+        }
       }
-    }
+    });
   }
 
   async function confirmTotp(event: React.FormEvent) {
@@ -193,7 +200,9 @@ export function ProfileView({ user, avatarVersion, onUserChange, onAvatarChange 
       </label>
 
       <h3>通行密钥</h3>
-      <button onClick={bindPasskey}>绑定新通行密钥</button>
+      <button onClick={() => void bindPasskey()} disabled={passkeyBusy.busy}>
+        {passkeyBusy.busy ? "绑定中…" : "绑定新通行密钥"}
+      </button>
 
       <h3>动态验证码</h3>
       {totpSecret ? (
@@ -213,7 +222,9 @@ export function ProfileView({ user, avatarVersion, onUserChange, onAvatarChange 
           </form>
         </>
       ) : (
-        <button onClick={setupTotp}>生成 TOTP 密钥</button>
+        <button onClick={() => void setupTotp()} disabled={totpBusy.busy}>
+          {totpBusy.busy ? "生成中…" : "生成 TOTP 密钥"}
+        </button>
       )}
 
       <h3>Git 访问令牌</h3>

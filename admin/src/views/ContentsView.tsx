@@ -75,6 +75,15 @@ function previewDocument(html: string): string {
 </html>`;
 }
 
+/** 窄屏三选一视图：顺序同时决定 Tab / 方向键的移动方向。 */
+const MOBILE_PANES = [
+  ["editor", "编辑器"],
+  ["tree", "目录"],
+  ["git", "Git"],
+] as const;
+
+type MobilePane = (typeof MOBILE_PANES)[number][0];
+
 export function ContentsView() {
   const [items, setItems] = useState<ContentSummary[]>([]);
   const { error, notice, setError, setNotice } = useFeedback();
@@ -97,7 +106,7 @@ export function ContentsView() {
   const [previewError, setPreviewError] = useState("");
   const [previewLoading, setPreviewLoading] = useState(false);
   // 窄屏三选一视图：编辑器（默认）/ 目录 / Git 区域。
-  const [mobilePane, setMobilePane] = useState<"editor" | "tree" | "git">("editor");
+  const [mobilePane, setMobilePane] = useState<MobilePane>("editor");
   // 保存/删除会让右栏 Git 区域的版本历史重新拉取（contentId 不变时也需要）。
   const [historyKey, setHistoryKey] = useState(0);
 
@@ -107,6 +116,9 @@ export function ContentsView() {
   const slugRef = useRef(slug);
   bodyRef.current = body;
   slugRef.current = slug;
+  // 最新 contentId 的同步副本：异步回调（回滚等）用它与发起时的 id 比对。
+  const contentIdRef = useRef<string | null>(null);
+  contentIdRef.current = contentId;
 
   // ---- 未保存改动保护 ----
   // 记录「已保存」时的编辑器快照；当前快照与之不同即视为有未保存改动。
@@ -271,6 +283,9 @@ export function ContentsView() {
     event.preventDefault();
     await run(async () => {
       setError("");
+      // 保存发起时的会话代际：期间用户若点了「新建内容」或切到别的内容，
+      // editGeneration 会递增，此时响应只提示，不再回写 savedRef / 路径 / id。
+      const session = editGeneration.current;
       // 记录提交时的内容快照，响应回来时据此判断是否回写。
       const submittedBody = body;
       const submittedSlug = slug;
@@ -287,6 +302,13 @@ export function ContentsView() {
           published,
           message: message.trim() || undefined,
         });
+        if (editGeneration.current !== session) {
+          // 保存期间已切到别的内容 / 新建内容：结果只做提示，不污染当前编辑器状态。
+          setNotice(published ? "上一次保存已完成并已编译" : "上一次保存已完成（草稿）");
+          await refresh();
+          setHistoryKey((value) => value + 1);
+          return;
+        }
         // 已保存基线 = 服务端实际保存的内容（规范化后的路径）。
         // 若保存期间用户继续输入（未回写），当前状态与基线不同，dirty 会继续保持。
         savedRef.current = snap(
@@ -337,6 +359,17 @@ export function ContentsView() {
 
   async function edit(item: ContentSummary) {
     if (!(await discardOk())) return;
+    // 切换前的完整快照：加载失败时用它回滚，绝不留下「新路径 + 旧正文」的混合态。
+    const previous = {
+      contentId,
+      slug,
+      format,
+      body,
+      head,
+      published,
+      saved: savedRef.current,
+      dirty: dirtyRef.current,
+    };
     // 进入加载态：正文到达前不参与 dirty 计算（见 loadingRef 的注释）。
     loadingRef.current = true;
     dirtyRef.current = false;
@@ -360,7 +393,21 @@ export function ContentsView() {
       savedRef.current = snap(item.id, loadedSlug, item.format, full.body, full.head ?? "", item.published);
     } catch (error) {
       if (editGeneration.current !== generation) return;
-      setError((error as Error).message);
+      // 回滚到切换前的状态：路径、正文、head、发布状态与保存基线一起恢复，
+      // 否则用户此时点保存会把旧正文写到新路径上。
+      setContentId(previous.contentId);
+      setSlug(previous.slug);
+      setFormat(previous.format);
+      setBody(previous.body);
+      setHead(previous.head);
+      setPublished(previous.published);
+      savedRef.current = previous.saved;
+      setDirty(previous.dirty);
+      setGlobalDirty(previous.dirty);
+      loadingRef.current = false;
+      setError(
+        `加载「${editorPath(item)}」失败，已保持原内容未改动：${(error as Error).message}`,
+      );
     } finally {
       // 只有最后一次 edit 才能解除加载态，被新一代覆盖时新的 edit 已自行接管。
       if (editGeneration.current === generation) loadingRef.current = false;
@@ -379,6 +426,9 @@ export function ContentsView() {
   }
 
   function newContent() {
+    // 作废仍在途的加载与保存回写。
+    editGeneration.current += 1;
+    loadingRef.current = false;
     setMobilePane("editor");
     setContentId(null);
     setSlug("");
@@ -392,6 +442,35 @@ export function ContentsView() {
     savedRef.current = snap(null, "", "markdown", "", "", false);
   }
 
+  /** tablist 的方向键模型：左右/上下移动，Home/End 跳到首尾，焦点跟随选中项。 */
+  function onMobileTabKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {
+    const order = MOBILE_PANES.map(([pane]) => pane);
+    const index = order.indexOf(mobilePane);
+    let next = -1;
+    switch (event.key) {
+      case "ArrowRight":
+      case "ArrowDown":
+        next = (index + 1) % order.length;
+        break;
+      case "ArrowLeft":
+      case "ArrowUp":
+        next = (index - 1 + order.length) % order.length;
+        break;
+      case "Home":
+        next = 0;
+        break;
+      case "End":
+        next = order.length - 1;
+        break;
+      default:
+        return;
+    }
+    event.preventDefault();
+    const pane = order[next];
+    setMobilePane(pane);
+    document.getElementById(`contents-tab-${pane}`)?.focus();
+  }
+
   async function resetEditor() {
     if (await discardOk()) newContent();
   }
@@ -403,19 +482,22 @@ export function ContentsView() {
       {notice && <p className="notice" role="status">{notice}</p>}
 
       {/* 窄屏选项卡：一次只显示一个视图，默认编辑器；宽屏三栏同屏不显示。 */}
-      <div className="contents-mobile-tabs" role="tablist" aria-label="内容视图">
-        {(
-          [
-            ["editor", "编辑器"],
-            ["tree", "目录"],
-            ["git", "Git"],
-          ] as const
-        ).map(([pane, label]) => (
+      <div
+        className="contents-mobile-tabs"
+        role="tablist"
+        aria-label="内容视图"
+        onKeyDown={onMobileTabKeyDown}
+      >
+        {MOBILE_PANES.map(([pane, label]) => (
           <button
             key={pane}
             type="button"
             role="tab"
+            id={`contents-tab-${pane}`}
             aria-selected={mobilePane === pane}
+            aria-controls={`contents-panel-${pane}`}
+            // roving tabindex：只有当前 tab 在 Tab 序列里，其余用方向键访问。
+            tabIndex={mobilePane === pane ? 0 : -1}
             className={mobilePane === pane ? "active" : ""}
             onClick={() => setMobilePane(pane)}
           >
@@ -425,7 +507,13 @@ export function ContentsView() {
       </div>
 
       <div className="contents-layout" data-pane={mobilePane}>
-        <aside className="contents-tree">
+        <aside
+          className="contents-tree"
+          id="contents-panel-tree"
+          role="tabpanel"
+          aria-labelledby="contents-tab-tree"
+          tabIndex={0}
+        >
           <div className="contents-tree-head">
             <div>
               <span className="contents-tree-kicker">URL</span>
@@ -436,7 +524,13 @@ export function ContentsView() {
           <DirTree items={items} onEdit={editFromTree} />
         </aside>
 
-        <div className="contents-main">
+        <div
+          className="contents-main"
+          id="contents-panel-editor"
+          role="tabpanel"
+          aria-labelledby="contents-tab-editor"
+          tabIndex={0}
+        >
       <form id="content-editor-form" onSubmit={save}>
         <div className="row">
           <label>
@@ -544,7 +638,7 @@ export function ContentsView() {
             发布
           </label>
           <button type="submit" disabled={busy}>{busy ? "保存中…" : "保存"}</button>
-          <button type="button" onClick={() => void resetEditor()}>
+          <button type="button" onClick={() => void resetEditor()} disabled={busy}>
             新建内容
           </button>
         </div>
@@ -584,7 +678,13 @@ export function ContentsView() {
         </div>
       </details>
         </div>
-        <aside className="contents-aux">
+        <aside
+          className="contents-aux"
+          id="contents-panel-git"
+          role="tabpanel"
+          aria-labelledby="contents-tab-git"
+          tabIndex={0}
+        >
           {/* 内容页的所有 Git 操作集中在这一栏：提交说明 + 版本历史 / 对比 / 快照 / 回滚。
               输入框用 form 属性关联回编辑器表单，按 Enter 与表单内的行为保持一致。 */}
           <div className="contents-git">
@@ -615,6 +715,15 @@ export function ContentsView() {
               refreshKey={historyKey}
               beforeRevert={discardOk}
               onReverted={(item) => {
+                // 回滚期间编辑器已切到别的内容：丢弃结果，不覆盖当前正文。
+                if (item.id !== contentIdRef.current) {
+                  setNotice(
+                    `版本 ${item.rev_seq} 已回滚，但编辑器已切换到其他内容，未自动载入`,
+                  );
+                  setHistoryKey((value) => value + 1);
+                  void refresh();
+                  return;
+                }
                 // 回滚是移动指针：编辑器同步显示回滚后的正文与格式。
                 const revertSlug = editorPath(item);
                 setContentId(item.id);

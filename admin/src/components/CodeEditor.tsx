@@ -24,6 +24,8 @@ type Props = {
   fontSize?: number;
   /** 站内页面链接补全候选。 */
   pages?: PageLink[];
+  /** 只读模式：禁止编辑（用于预览 / 对比等场景），仍可选中复制。 */
+  readOnly?: boolean;
 };
 
 // 标记「由外部 setValue 引起的文档变更」。
@@ -179,6 +181,11 @@ const editorTheme = EditorView.theme(
   { dark: false },
 );
 
+/** 只读模式对应的编辑器扩展；编辑能力与命令层一起切换。 */
+function readOnlyExtension(readOnly: boolean): Extension {
+  return [EditorState.readOnly.of(readOnly), EditorView.editable.of(!readOnly)];
+}
+
 function fontTheme(fontSize: number) {
   return EditorView.theme({
     "&": { fontSize: `${fontSize}px` },
@@ -193,6 +200,7 @@ export function CodeEditor({
   onViewReady,
   fontSize = 14.4,
   pages = [],
+  readOnly = false,
 }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
@@ -201,6 +209,7 @@ export function CodeEditor({
   const pagesRef = useRef(pages);
   const languageCompartment = useRef(new Compartment()).current;
   const fontCompartment = useRef(new Compartment()).current;
+  const readOnlyCompartment = useRef(new Compartment()).current;
   // 语言包加载的代际守卫：快速切换格式时丢弃过期的加载结果。
   const languageGen = useRef(0);
   // 补全源在挂载时稳定注册（动态 reconfigure 的 languageData 不会被补全扩展拾取），
@@ -237,6 +246,7 @@ export function CodeEditor({
         languageCompartment.of([]),
         EditorState.languageData.of(() => [{ autocomplete: completionSource }]),
         fontCompartment.of(fontTheme(fontSize)),
+        readOnlyCompartment.of(readOnlyExtension(readOnly)),
         autocompletion({ activateOnTyping: true, maxRenderedOptions: 40 }),
         syntaxHighlighting(highlightStyle),
         editorTheme,
@@ -309,6 +319,15 @@ export function CodeEditor({
     if (!view) return;
     view.dispatch({ effects: fontCompartment.reconfigure(fontTheme(fontSize)) });
   }, [fontSize, fontCompartment]);
+
+  // 只读开关：不重建编辑器，只重配编辑能力。
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({
+      effects: readOnlyCompartment.reconfigure(readOnlyExtension(!!readOnly)),
+    });
+  }, [readOnly, readOnlyCompartment]);
 
   return <div ref={hostRef} className="code-editor" />;
 }

@@ -79,6 +79,8 @@ export function Shell({
   const [menuOpen, setMenuOpen] = useState(false);
   const [avatarFailed, setAvatarFailed] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
+  const menuPanelRef = useRef<HTMLDivElement | null>(null);
+  const avatarRef = useRef<HTMLButtonElement | null>(null);
   const { canLeave, dirty } = useNavigationGuard();
   const initial = user.username.slice(0, 1).toUpperCase();
 
@@ -140,6 +142,51 @@ export function Shell({
     return () => window.removeEventListener("popstate", onPop);
   }, [canLeave, user.is_admin]);
 
+  // 头像菜单打开时把焦点放到第一项，符合 role="menu" 的键盘模型。
+  useEffect(() => {
+    if (!menuOpen) return;
+    const first = menuPanelRef.current?.querySelector<HTMLElement>('[role="menuitem"]');
+    first?.focus();
+  }, [menuOpen]);
+
+  /** 头像菜单的方向键模型：上下循环、Home/End 跳首尾、Esc 关闭并回焦头像按钮。 */
+  function onMenuKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {
+    const nodes = Array.from(
+      event.currentTarget.querySelectorAll<HTMLElement>('[role="menuitem"]'),
+    );
+    if (nodes.length === 0) return;
+    const active = document.activeElement as HTMLElement | null;
+    const index = active ? nodes.indexOf(active) : -1;
+    let next = -1;
+    switch (event.key) {
+      case "ArrowDown":
+        next = index < 0 ? 0 : (index + 1) % nodes.length;
+        break;
+      case "ArrowUp":
+        next = index < 0 ? nodes.length - 1 : (index - 1 + nodes.length) % nodes.length;
+        break;
+      case "Home":
+        next = 0;
+        break;
+      case "End":
+        next = nodes.length - 1;
+        break;
+      case "Escape":
+        event.preventDefault();
+        setMenuOpen(false);
+        avatarRef.current?.focus();
+        return;
+      case "Tab":
+        // 离开菜单时收起，避免焦点落到菜单外但菜单还开着。
+        setMenuOpen(false);
+        return;
+      default:
+        return;
+    }
+    event.preventDefault();
+    nodes[next]?.focus();
+  }
+
   // 头像菜单：点击外部或 Esc 关闭。
   useEffect(() => {
     if (!menuOpen) return;
@@ -187,20 +234,33 @@ export function Shell({
   return (
     <div className="shell">
       <header className="appbar">
-        <a
-          className="brand"
-          href={siteUrl || undefined}
-          target="_blank"
-          rel="noreferrer"
-          title={site.site_name}
-        >
-          {site.logo_url ? (
-            <img src={site.logo_url} alt={site.site_name} />
-          ) : (
-            <span className="brand-mark">{site.site_name.slice(0, 1)}</span>
-          )}
-          <span className="brand-name">{site.site_name}</span>
-        </a>
+        {siteUrl ? (
+          <a
+            className="brand"
+            href={siteUrl}
+            target="_blank"
+            rel="noreferrer"
+            title={site.site_name}
+            aria-label={site.site_name}
+          >
+            {site.logo_url ? (
+              <img src={site.logo_url} alt={site.site_name} />
+            ) : (
+              <span className="brand-mark">{site.site_name.slice(0, 1)}</span>
+            )}
+            <span className="brand-name">{site.site_name}</span>
+          </a>
+        ) : (
+          // 未配置站点地址时不做成链接：没有 href 的 <a> 不可聚焦、语义也错。
+          <span className="brand" aria-label={site.site_name}>
+            {site.logo_url ? (
+              <img src={site.logo_url} alt={site.site_name} />
+            ) : (
+              <span className="brand-mark">{site.site_name.slice(0, 1)}</span>
+            )}
+            <span className="brand-name">{site.site_name}</span>
+          </span>
+        )}
 
         <nav className="appnav">
           <button className={view === "contents" ? "active" : ""} onClick={() => void go("contents")}>
@@ -229,6 +289,7 @@ export function Shell({
           <div className="avatar-wrap" ref={menuRef}>
             <button
               className="avatar"
+              ref={avatarRef}
               onClick={() => setMenuOpen((open) => !open)}
               aria-label="用户菜单"
               aria-expanded={menuOpen}
@@ -246,7 +307,12 @@ export function Shell({
               )}
             </button>
             {menuOpen && (
-              <div className="avatar-menu" role="menu">
+              <div
+                className="avatar-menu"
+                role="menu"
+                ref={menuPanelRef}
+                onKeyDown={onMenuKeyDown}
+              >
                 <button role="menuitem" onClick={() => void go("profile")}>用户设置</button>
                 {user.is_admin && <button role="menuitem" onClick={() => void go("contents")}>网站管理</button>}
                 {siteUrl && (
@@ -257,6 +323,8 @@ export function Shell({
                 <button
                   role="menuitem"
                   onClick={async () => {
+                    // 与切换视图一样先过离开守卫：有未保存改动时先确认。
+                    if (!(await canLeave())) return;
                     await api.logout().catch(() => undefined);
                     onLogout();
                   }}

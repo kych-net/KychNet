@@ -3,6 +3,21 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <script>
+      // 主题必须在首屏绘制前落到 <html> 上，否则深色模式用户会先看到一帧白底。
+      (function () {
+        var root = document.documentElement;
+        try {
+          var saved = localStorage.getItem("kych-net-theme");
+          var dark = saved
+            ? saved === "dark"
+            : window.matchMedia("(prefers-color-scheme: dark)").matches;
+          root.setAttribute("data-theme", dark ? "dark" : "light");
+        } catch (e) {
+          root.setAttribute("data-theme", "light");
+        }
+      })();
+    </script>
     <title>{% block title %}{{ site.site_name }}{% endblock %}</title>
     {% if !site.description.is_empty() %}
     <meta name="description" content="{{ site.description }}" />
@@ -148,10 +163,49 @@
       .content img { max-width: 100%; }
       .content table { border-collapse: collapse; }
       .content pre { overflow-x: auto; padding: 1rem; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
-      .wj-code-copy { display: inline-flex; align-items: center; gap: .3rem; border: 0; background: transparent; color: var(--muted); cursor: pointer; font: inherit; }
-      .wj-code-copy:hover { color: var(--text); }
-      .wj-code-copy .wj-sprite { width: 1rem; height: 1rem; }
-      .wj-code-copy.copied { color: #16a34a; }
+      /* 键盘用户可以直接跳过顶栏 */
+      .skip-link {
+        position: absolute;
+        left: -9999px;
+        top: 0.5rem;
+        z-index: 50;
+        padding: 0.45rem 0.9rem;
+        border-radius: 6px;
+        background: var(--accent);
+        color: #fff;
+        text-decoration: none;
+        font-size: 0.9rem;
+      }
+      .skip-link:focus { left: 0.8rem; }
+      /* sticky 顶栏会盖住锚点标题，给带 id 的标题留出偏移 */
+      main :is(h1, h2, h3, h4, h5, h6)[id] { scroll-margin-top: 5rem; }
+
+      /* 代码块复制按钮：由页面脚本插入，悬停或聚焦时出现 */
+      .content pre { position: relative; }
+      .wj-code-copy {
+        position: absolute;
+        top: 0.45rem;
+        right: 0.45rem;
+        display: inline-flex;
+        align-items: center;
+        gap: 0.3rem;
+        padding: 0.15rem 0.5rem;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        background: var(--panel);
+        color: var(--muted);
+        font: inherit;
+        font-size: 0.78rem;
+        cursor: pointer;
+        opacity: 0;
+        transition: opacity 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+      }
+      .content pre:hover .wj-code-copy,
+      .content pre:focus-within .wj-code-copy,
+      .wj-code-copy.copied { opacity: 1; }
+      .wj-code-copy:hover { color: var(--text); border-color: var(--accent); }
+      .wj-code-copy.copied { color: #16a34a; border-color: #16a34a; }
+      .wj-code-copy:focus-visible { opacity: 1; outline: 2px solid var(--accent); outline-offset: 1px; }
       .site-footer {
         display: flex;
         flex-wrap: wrap;
@@ -250,6 +304,7 @@
     {% endif %}
   </head>
   <body>
+    <a class="skip-link" href="#main">跳到主要内容</a>
     <header class="topbar">
       <a class="brand" href="/">
         {% if site.logo_url.is_empty() %}
@@ -258,14 +313,14 @@
         <img src="{{ site.logo_url }}" alt="{{ site.site_name }}" />
         {% endif %}
       </a>
-      <button id="dir-tree-toggle" class="dir-tree-toggle" type="button" aria-expanded="false" aria-controls="dir-tree-panel">目录</button>
+      <button id="dir-tree-toggle" class="dir-tree-toggle" type="button" aria-expanded="false" aria-controls="dir-tree-panel" aria-haspopup="true">目录</button>
       <nav class="nav">
         {% for link in site.nav %}
         <a href="{{ link.href }}">{{ link.label }}</a>
         {% endfor %}
       </nav>
       <div class="actions">
-        <button id="theme-toggle" type="button" aria-label="切换主题">主题</button>
+        <button id="theme-toggle" type="button" aria-label="切换主题" aria-pressed="false" title="切换深色/浅色主题">主题</button>
         <a class="btn" href="{{ admin_url }}">管理端</a>
       </div>
       <div id="dir-tree-panel" class="dir-tree-panel" hidden>
@@ -273,7 +328,7 @@
         {{ tree|safe }}
       </div>
     </header>
-    <main>
+    <main id="main" tabindex="-1">
       {% block content %}{% endblock %}
     </main>
     {% if site.has_beian() %}
@@ -295,28 +350,65 @@
     <script>
       (function () {
         var root = document.documentElement;
-        var saved = localStorage.getItem("kych-net-theme");
-        var initial = saved || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
-        root.setAttribute("data-theme", initial);
-        document.getElementById("theme-toggle").addEventListener("click", function () {
+        var toggle = document.getElementById("theme-toggle");
+        function sync() {
+          var dark = root.getAttribute("data-theme") === "dark";
+          if (!toggle) return;
+          toggle.setAttribute("aria-pressed", String(dark));
+          toggle.title = dark ? "切换到浅色主题" : "切换到深色主题";
+        }
+        sync();
+        if (!toggle) return;
+        toggle.addEventListener("click", function () {
           var next = root.getAttribute("data-theme") === "dark" ? "light" : "dark";
           root.setAttribute("data-theme", next);
-          localStorage.setItem("kych-net-theme", next);
+          try { localStorage.setItem("kych-net-theme", next); } catch (e) {}
+          sync();
         });
       })();
     </script>
     <script>
+      // 代码块由后端渲染成 <pre><code>，页面加载后补上复制按钮（含键盘可达与降级方案）。
       (function () {
-        document.addEventListener("click", function (event) {
-          var button = event.target.closest && event.target.closest("wj-code-copy");
-          if (!button) return;
-          var code = button.closest("wj-code");
-          var source = code && code.querySelector("pre code");
-          if (!source || !navigator.clipboard) return;
-          navigator.clipboard.writeText(source.innerText).then(function () {
-            button.classList.add("copied");
-            setTimeout(function () { button.classList.remove("copied"); }, 1200);
-          }).catch(function () {});
+        var blocks = document.querySelectorAll(".content pre");
+        if (!blocks.length) return;
+        Array.prototype.forEach.call(blocks, function (pre) {
+          var button = document.createElement("button");
+          button.type = "button";
+          button.className = "wj-code-copy";
+          button.setAttribute("aria-label", "复制代码");
+          button.textContent = "复制";
+          button.addEventListener("click", function () {
+            var source = pre.querySelector("code") || pre;
+            var text = source.innerText;
+            function done() {
+              button.textContent = "已复制";
+              button.classList.add("copied");
+              setTimeout(function () {
+                button.textContent = "复制";
+                button.classList.remove("copied");
+              }, 1400);
+            }
+            function fallback() {
+              var area = document.createElement("textarea");
+              area.value = text;
+              area.setAttribute("readonly", "");
+              area.style.position = "fixed";
+              area.style.top = "-1000px";
+              document.body.appendChild(area);
+              area.select();
+              var ok = false;
+              try { ok = document.execCommand("copy"); } catch (e) {}
+              document.body.removeChild(area);
+              if (ok) done();
+            }
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+              navigator.clipboard.writeText(text).then(done, fallback);
+            } else {
+              fallback();
+            }
+          });
+          pre.appendChild(button);
         });
       })();
     </script>
@@ -325,11 +417,34 @@
         var toggle = document.getElementById("dir-tree-toggle");
         var panel = document.getElementById("dir-tree-panel");
         if (!toggle || !panel) return;
-        toggle.addEventListener("click", function () {
-          var open = panel.hidden;
+
+        function setOpen(open) {
           panel.hidden = !open;
           toggle.setAttribute("aria-expanded", String(open));
+          if (open) {
+            var first = panel.querySelector(".dir-toggle, a");
+            if (first) first.focus();
+          }
+        }
+
+        toggle.addEventListener("click", function (event) {
+          event.stopPropagation();
+          setOpen(panel.hidden);
         });
+
+        // 点击面板外部关闭；Esc 关闭并把焦点还给触发按钮。
+        document.addEventListener("click", function (event) {
+          if (panel.hidden) return;
+          if (panel.contains(event.target) || toggle.contains(event.target)) return;
+          setOpen(false);
+        });
+
+        document.addEventListener("keydown", function (event) {
+          if (event.key !== "Escape" || panel.hidden) return;
+          setOpen(false);
+          toggle.focus();
+        });
+
         panel.addEventListener("click", function (event) {
           var button = event.target.closest(".dir-toggle");
           if (!button) return;

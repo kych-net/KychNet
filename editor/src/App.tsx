@@ -1,9 +1,11 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, type Content, type ContentFormat, type Project, type User } from "@admin/api";
 import type { PageLink } from "@admin/components/editorCompletions";
 import { PagePicker } from "./PagePicker";
 import { ProjectPicker } from "./project/ProjectPicker";
+import { Modal } from "./Modal";
 import { useVisualViewport } from "./hooks";
+import { errText } from "./project/types";
 
 // 编辑器与项目工作区（CodeMirror 核心较重）都按需加载，页面选择器先轻量呈现。
 const EditorShell = lazy(() =>
@@ -44,14 +46,20 @@ export function App() {
 
   const [pages, setPages] = useState<Content[]>([]);
   const [loading, setLoading] = useState(true);
+  const [pagesError, setPagesError] = useState("");
   const [active, setActive] = useState<Content | null>(null);
   const [newOpen, setNewOpen] = useState(false);
+  // 编辑器实例由「打开动作」决定，而不是页面 id：自动保存把新建页变成有 id
+  // 的页面时不能重建组件，否则输入内容 / undo / 光标都会丢。
+  const [editorKey, setEditorKey] = useState(0);
 
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectsLoading, setProjectsLoading] = useState(true);
+  const [projectsError, setProjectsError] = useState("");
   const [activeProject, setActiveProject] = useState<Project | null>(null);
   const [projectRef, setProjectRef] = useState<string | undefined>(undefined);
   const [projectFile, setProjectFile] = useState<string | undefined>(undefined);
+  const deepLinkOpened = useRef(false);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -64,11 +72,14 @@ export function App() {
 
   const loadPages = useCallback(async () => {
     setLoading(true);
+    setPagesError("");
     try {
       const res = await api.contents();
       setPages(res.items);
-    } catch {
+    } catch (error) {
+      // 失败与「没有页面」必须区分：否则用户会以为内容被清空了。
       setPages([]);
+      setPagesError(errText(error));
     } finally {
       setLoading(false);
     }
@@ -76,11 +87,13 @@ export function App() {
 
   const loadProjects = useCallback(async () => {
     setProjectsLoading(true);
+    setProjectsError("");
     try {
       const res = await api.projects();
       setProjects(res.items);
-    } catch {
+    } catch (error) {
       setProjects([]);
+      setProjectsError(errText(error));
     } finally {
       setProjectsLoading(false);
     }
@@ -93,14 +106,21 @@ export function App() {
   }, [user, loadPages, loadProjects]);
 
   // 深链 ?page=<id> 直达某页；?project=<id> 直达项目工作区。
+  // 只在首次拿到列表时处理一次：保存后列表刷新不能把用户踢回别的页面。
   useEffect(() => {
-    if (!user || loading) return;
+    if (!user || loading || deepLinkOpened.current) return;
     const params = new URLSearchParams(window.location.search);
     const id = params.get("page");
-    if (id) {
-      const found = pages.find((p) => p.id === id);
-      if (found) setActive(found);
+    if (!id) {
+      deepLinkOpened.current = true;
+      return;
     }
+    const found = pages.find((p) => p.id === id);
+    if (found) {
+      deepLinkOpened.current = true;
+      setActive(found);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user, loading, pages]);
 
   useEffect(() => {
@@ -133,6 +153,7 @@ export function App() {
   );
 
   const onSaved = useCallback((item: Content) => {
+    // 只同步数据，不动 editorKey：组件保持同一个实例。
     setActive(item);
     setPages((prev) => {
       const idx = prev.findIndex((p) => p.id === item.id);
@@ -150,6 +171,7 @@ export function App() {
 
   const onBack = useCallback(() => {
     setActive(null);
+    deepLinkOpened.current = true;
     const url = new URL(window.location.href);
     url.searchParams.delete("page");
     window.history.replaceState(null, "", url);
@@ -168,7 +190,13 @@ export function App() {
       updated_at: "",
       rev_seq: 0,
     });
+    setEditorKey((value) => value + 1);
     setNewOpen(false);
+  }, []);
+
+  const openPage = useCallback((found: Content) => {
+    setActive(found);
+    setEditorKey((value) => value + 1);
   }, []);
 
   const switchMode = useCallback((next: Mode) => {
@@ -253,11 +281,13 @@ export function App() {
         <PagePicker
           pages={pages}
           loading={loading}
+          error={pagesError}
+          onRetry={() => void loadPages()}
           mode={mode}
           onMode={switchMode}
           onOpen={(id) => {
             const found = pages.find((p) => p.id === id);
-            if (found) setActive(found);
+            if (found) openPage(found);
           }}
           onNew={() => setNewOpen(true)}
         />
@@ -267,6 +297,8 @@ export function App() {
         <ProjectPicker
           projects={projects}
           loading={projectsLoading}
+          error={projectsError}
+          onRetry={() => void loadProjects()}
           onMode={switchMode}
           onOpen={(id) => void openProject(id)}
           onCreate={createProject}
@@ -277,7 +309,7 @@ export function App() {
       {user && active && mode === "pages" && (
         <Suspense fallback={<Loading text="编辑器加载中…" />}>
           <EditorShell
-            key={active.id || "new"}
+            key={editorKey}
             page={active}
             pages={pageLinks}
             onBack={onBack}
@@ -320,34 +352,31 @@ function NewPageModal({
   const [format, setFormat] = useState<ContentFormat>("markdown");
   const valid = slug.trim().length > 0;
   return (
-    <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()} role="dialog" aria-label="新建页面">
-        <h2>新建页面</h2>
-        <label className="field">
-          <span>路径</span>
-          <input
-            value={slug}
-            onChange={(e) => setSlug(e.target.value)}
-            placeholder="如 notes/hello.md"
-            autoFocus
-            autoCapitalize="off"
-            autoCorrect="off"
-            spellCheck={false}
-          />
-        </label>
-        <label className="field">
-          <span>格式</span>
-          <select value={format} onChange={(e) => setFormat(e.target.value as ContentFormat)}>
-            {FORMATS.map((f) => (
-              <option key={f} value={f}>{f}</option>
-            ))}
-          </select>
-        </label>
-        <div className="modal-actions">
-          <button type="button" className="btn" onClick={onClose}>取消</button>
-          <button type="button" className="btn btn-accent" disabled={!valid} onClick={() => onCreate(slug.trim(), format)}>创建</button>
-        </div>
+    <Modal title="新建页面" onClose={onClose}>
+      <label className="field">
+        <span>路径</span>
+        <input
+          value={slug}
+          onChange={(e) => setSlug(e.target.value)}
+          placeholder="如 notes/hello.md"
+          autoFocus
+          autoCapitalize="off"
+          autoCorrect="off"
+          spellCheck={false}
+        />
+      </label>
+      <label className="field">
+        <span>格式</span>
+        <select value={format} onChange={(e) => setFormat(e.target.value as ContentFormat)}>
+          {FORMATS.map((f) => (
+            <option key={f} value={f}>{f}</option>
+          ))}
+        </select>
+      </label>
+      <div className="modal-actions">
+        <button type="button" className="btn" onClick={onClose}>取消</button>
+        <button type="button" className="btn btn-accent" disabled={!valid} onClick={() => onCreate(slug.trim(), format)}>创建</button>
       </div>
-    </div>
+    </Modal>
   );
 }

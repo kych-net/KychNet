@@ -14,6 +14,8 @@ const FORMAT_LABEL: Record<string, string> = {
 export function PagePicker({
   pages,
   loading,
+  error,
+  onRetry,
   mode,
   onMode,
   onOpen,
@@ -21,6 +23,9 @@ export function PagePicker({
 }: {
   pages: Content[];
   loading: boolean;
+  /** 加载失败信息：与「没有页面」区分开，失败时给重试按钮。 */
+  error?: string;
+  onRetry?: () => void;
   mode: "pages" | "projects";
   onMode: (mode: "pages" | "projects") => void;
   onOpen: (id: string) => void;
@@ -52,8 +57,8 @@ export function PagePicker({
       </header>
 
       <nav className="picker-modes" aria-label="编辑对象">
-        <button type="button" className={mode === "pages" ? "is-active" : ""} onClick={() => onMode("pages")}>📄 页面</button>
-        <button type="button" className={mode === "projects" ? "is-active" : ""} onClick={() => onMode("projects")}>⑂ 项目</button>
+        <button type="button" className={mode === "pages" ? "is-active" : ""} aria-current={mode === "pages" ? "page" : undefined} onClick={() => onMode("pages")}>📄 页面</button>
+        <button type="button" className={mode === "projects" ? "is-active" : ""} aria-current={mode === "projects" ? "page" : undefined} onClick={() => onMode("projects")}>⑂ 项目</button>
       </nav>
 
       <div className="picker-search">
@@ -69,10 +74,19 @@ export function PagePicker({
 
       <div className="picker-list">
         {loading && <div className="picker-empty">加载中…</div>}
-        {!loading && filtered.length === 0 && (
+        {!loading && error && (
+          <div className="picker-error" role="alert">
+            <p>加载页面失败：{error}</p>
+            {onRetry && (
+              <button type="button" className="btn" onClick={onRetry}>重试</button>
+            )}
+          </div>
+        )}
+        {!loading && !error && filtered.length === 0 && (
           <div className="picker-empty">没有匹配的页面</div>
         )}
         {!loading &&
+          !error &&
           filtered.map((p) => (
             <button
               key={p.id}

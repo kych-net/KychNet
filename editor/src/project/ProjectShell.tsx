@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "@admin/api";
 import { useMediaQuery } from "../hooks";
+import { useConfirm } from "../confirm";
 import type { ChangeMap, LocalChange } from "./drafts";
-import { draftKey, loadChanges, normalizeChange, persistChanges } from "./drafts";
+import { draftKey, flushPersist, loadChanges, normalizeChange, persistChanges } from "./drafts";
 import { FileTree } from "./FileTree";
 import { FileEditor, type OpenFile } from "./FileEditor";
 import { ChangesView } from "./ChangesView";
@@ -57,8 +58,11 @@ export function ProjectShell({
   const [newOpen, setNewOpen] = useState(false);
   const [newPath, setNewPath] = useState("");
   const [dir, setDir] = useState("");
+  const [refsStatus, setRefsStatus] = useState<"loading" | "ready" | "error">("loading");
+  const [refsError, setRefsError] = useState("");
   const openEpoch = useRef(0);
   const refsEpoch = useRef(0);
+  const { confirm, confirmNode } = useConfirm();
 
   const isBranch = refs?.branches.includes(refName) ?? refName === project.default_branch;
   const readOnly = !isBranch;
@@ -80,12 +84,19 @@ export function ProjectShell({
 
   const loadRefs = useCallback(
     async (token: number) => {
+      setRefsStatus((current) => (current === "error" ? "loading" : current));
+      setRefsError("");
       try {
         const res = await api.projectRefs(project.id, refName);
         if (refsEpoch.current !== token) return;
         setRefs(res);
+        setRefsStatus("ready");
       } catch (e) {
-        if (refsEpoch.current === token) setError(errText(e));
+        if (refsEpoch.current !== token) return;
+        // 引用加载失败不能当成「空项目」：保留错误态，界面给出重试入口。
+        setRefsError(errText(e));
+        setRefsStatus("error");
+        setError(errText(e));
       }
     },
     [project.id, refName],
@@ -100,6 +111,7 @@ export function ProjectShell({
 
   const refresh = useCallback(async () => {
     setRefreshKey((value) => value + 1);
+    setError("");
     await loadRefs(++refsEpoch.current);
     if (openPath) {
       const token = ++openEpoch.current;
@@ -163,17 +175,58 @@ export function ProjectShell({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // 有未提交改动时，关闭 / 刷新页面先让浏览器确认，并把待写草稿立刻落盘。
+  useEffect(() => {
+    if (pendingCount === 0) return;
+    const handler = (event: BeforeUnloadEvent) => {
+      flushPersist();
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", handler);
+    return () => window.removeEventListener("beforeunload", handler);
+  }, [pendingCount]);
+
   const switchRef = useCallback(
-    (next: string, path?: string) => {
+    async (next: string, path?: string) => {
+      if (next === refName) {
+        if (path) void openFileAt(path, next);
+        return;
+      }
+      if (pendingCount > 0) {
+        const ok = await confirm({
+          title: "切换引用？",
+          body: `当前引用下还有 ${pendingCount} 个未提交的本地变更。切换后这些草稿会留在原分支，稍后切回来可以继续提交。`,
+          confirmText: "切换",
+        });
+        if (!ok) return;
+        flushPersist();
+      }
       setRefName(next);
       setOpenPath(null);
       setOpenFile(null);
       setError("");
       setTab("files");
+      if (pendingCount > 0) {
+        notify(`草稿已保留在 ${refName}，切回即可继续提交`);
+      }
       if (path) void openFileAt(path, next);
     },
-    [openFileAt],
+    [refName, pendingCount, confirm, notify, openFileAt],
   );
+
+  const requestBack = useCallback(async () => {
+    if (pendingCount > 0) {
+      const ok = await confirm({
+        title: "返回项目列表？",
+        body: `还有 ${pendingCount} 个未提交的本地变更。草稿会保留在本机，重新打开项目后还能继续提交。`,
+        confirmText: "返回",
+      });
+      if (!ok) return;
+    }
+    flushPersist();
+    onBack();
+  }, [pendingCount, confirm, onBack]);
 
   const onDraft = useCallback(
     (value: string) => {
@@ -297,7 +350,7 @@ export function ProjectShell({
   return (
     <div className="pv-shell">
       <header className="pv-topbar">
-        <button type="button" className="icon-btn back-btn" onClick={onBack} aria-label="返回项目列表">‹</button>
+        <button type="button" className="icon-btn back-btn" onClick={() => void requestBack()} aria-label="返回项目列表">‹</button>
         <button type="button" className="pv-title" onClick={() => setTab("branches")} title="引用与分支">
           <span className="pv-title-slug">{project.slug}</span>
           <span className="pv-title-ref">{refName.length === 40 ? shortOid(refName) : refName}</span>
@@ -307,15 +360,19 @@ export function ProjectShell({
         </button>
         <div className="pv-topbar-actions">
           <button type="button" className="icon-btn" onClick={() => void refresh()} title="刷新" aria-label="刷新">⟳</button>
-          <button type="button" className="icon-btn" onClick={onToggleTheme} title="切换主题" aria-label="切换主题">◐</button>
+          <button type="button" className="icon-btn" onClick={onToggleTheme} title={theme === "dark" ? "切换为浅色主题" : "切换为深色主题"} aria-label={theme === "dark" ? "切换为浅色主题" : "切换为深色主题"}>◐</button>
         </div>
       </header>
 
-      <nav className="pv-tabs" aria-label="项目功能">
+      <nav className="pv-tabs" role="tablist" aria-label="项目功能">
         {TABS.map((item) => (
           <button
             key={item.key}
             type="button"
+            role="tab"
+            id={`pv-tab-${item.key}`}
+            aria-selected={tab === item.key}
+            aria-controls="pv-main"
             className={`pv-main-tab${tab === item.key ? " is-active" : ""}`}
             onClick={() => setTab(item.key)}
           >
@@ -326,12 +383,29 @@ export function ProjectShell({
       </nav>
 
       {(error || notice) && (
-        <div className={`pv-flash${error ? " is-error" : ""}`} onClick={() => { setError(""); setNotice(""); }}>
-          {error || notice}
+        <div
+          className={`pv-flash${error ? " is-error" : ""}`}
+          role={error ? "alert" : "status"}
+          aria-live={error ? "assertive" : "polite"}
+        >
+          <span className="pv-flash-text">{error || notice}</span>
+          <button
+            type="button"
+            className="pv-flash-close"
+            aria-label="关闭提示"
+            onClick={() => { setError(""); setNotice(""); }}
+          >
+            ✕
+          </button>
         </div>
       )}
 
-      <main className="pv-main">
+      <main
+        className="pv-main"
+        id="pv-main"
+        role="tabpanel"
+        aria-labelledby={`pv-tab-${tab}`}
+      >
         {tab === "files" && (
           <div className={`pv-files${openPath ? " has-file" : ""}`}>
             <aside className="pv-tree-col">
@@ -346,6 +420,12 @@ export function ProjectShell({
                 </div>
               )}
               {readOnly && <div className="pv-readonly">当前引用只读；切到分支即可编辑。</div>}
+              {refsStatus === "error" && (
+                <div className="pv-error-state" role="alert">
+                  <p>加载引用失败：{refsError || "请求出错"}</p>
+                  <button type="button" className="pv-btn" onClick={() => void refresh()}>重试</button>
+                </div>
+              )}
               <FileTree
                 projectId={project.id}
                 refName={refName}
@@ -400,7 +480,18 @@ export function ProjectShell({
           />
         )}
 
-        {!refs && tab !== "files" && <div className="pv-loading">加载引用…</div>}
+        {!refs && tab !== "files" && refsStatus === "loading" && (
+          <div className="pv-loading">加载引用…</div>
+        )}
+
+        {!refs && tab !== "files" && refsStatus === "error" && (
+          <div className="pv-error-state" role="alert">
+            <p>加载引用失败：{refsError || "请求出错"}</p>
+            <button type="button" className="pv-btn pv-btn-accent" onClick={() => void refresh()} disabled={busy}>
+              重试
+            </button>
+          </div>
+        )}
 
         {refs && tab === "history" && (
           <HistoryView
@@ -447,6 +538,8 @@ export function ProjectShell({
           />
         )}
       </main>
+
+      {confirmNode}
     </div>
   );
 }

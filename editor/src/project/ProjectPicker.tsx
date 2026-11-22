@@ -6,6 +6,8 @@ import { errText, formatTime } from "./types";
 export function ProjectPicker({
   projects,
   loading,
+  error,
+  onRetry,
   onMode,
   onOpen,
   onCreate,
@@ -13,6 +15,9 @@ export function ProjectPicker({
 }: {
   projects: Project[];
   loading: boolean;
+  /** 加载失败信息：与「没有项目」区分开，失败时给重试按钮。 */
+  error?: string;
+  onRetry?: () => void;
   onMode: (mode: "pages" | "projects") => void;
   onOpen: (id: string) => void;
   onCreate: (slug: string, description: string) => Promise<void>;
@@ -25,7 +30,7 @@ export function ProjectPicker({
   const [url, setUrl] = useState("");
   const [branch, setBranch] = useState("");
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
+  const [formError, setFormError] = useState("");
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -35,7 +40,7 @@ export function ProjectPicker({
 
   const submit = async () => {
     setBusy(true);
-    setError("");
+    setFormError("");
     try {
       if (mode === "create") await onCreate(slug.trim(), description.trim());
       else if (mode === "import") {
@@ -48,7 +53,7 @@ export function ProjectPicker({
       setUrl("");
       setBranch("");
     } catch (e) {
-      setError(errText(e));
+      setFormError(errText(e));
     } finally {
       setBusy(false);
     }
@@ -72,7 +77,7 @@ export function ProjectPicker({
 
       <nav className="picker-modes" aria-label="编辑对象">
         <button type="button" onClick={() => onMode("pages")}>📄 页面</button>
-        <button type="button" className="is-active" onClick={() => onMode("projects")}>⑂ 项目</button>
+        <button type="button" className="is-active" aria-current="page" onClick={() => onMode("projects")}>⑂ 项目</button>
       </nav>
 
       <div className="picker-search">
@@ -90,7 +95,7 @@ export function ProjectPicker({
           {mode === "import" && (
             <label className="pv-field"><span>只导入指定分支（可留空）</span><input value={branch} onChange={(e) => setBranch(e.target.value)} placeholder="main" autoCapitalize="off" spellCheck={false} /></label>
           )}
-          {error && <p className="pv-error">{error}</p>}
+          {formError && <p className="pv-error" role="alert">{formError}</p>}
           <div className="pv-inline-actions">
             <button type="button" className="pv-btn pv-btn-accent" disabled={busy || (mode === "create" ? !slug.trim() : !url.trim())} onClick={() => void submit()}>{busy ? "处理中…" : "确定"}</button>
             <button type="button" className="pv-btn" onClick={() => setMode(null)}>取消</button>
@@ -100,8 +105,16 @@ export function ProjectPicker({
 
       <div className="picker-list">
         {loading && <div className="picker-empty">加载中…</div>}
-        {!loading && filtered.length === 0 && <div className="picker-empty">没有匹配的项目</div>}
-        {!loading && filtered.map((project) => (
+        {!loading && error && (
+          <div className="picker-error" role="alert">
+            <p>加载项目失败：{error}</p>
+            {onRetry && (
+              <button type="button" className="btn" onClick={onRetry}>重试</button>
+            )}
+          </div>
+        )}
+        {!loading && !error && filtered.length === 0 && <div className="picker-empty">没有匹配的项目</div>}
+        {!loading && !error && filtered.map((project) => (
           <button key={project.id} type="button" className="page-row" onClick={() => onOpen(project.id)}>
             <span className="fmt-badge fmt-html">GIT</span>
             <span className="page-path">{project.slug}</span>

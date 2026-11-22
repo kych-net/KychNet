@@ -1,8 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { EditorView } from "@codemirror/view";
 import { CodeEditor } from "@admin/components/CodeEditor";
 import { api } from "@admin/api";
 import { Toolbar } from "../Toolbar";
+import { useBusy } from "../useBusy";
+import { useConfirm } from "../confirm";
 import { diffText } from "./diff";
 import { LocalDiffView } from "./DiffView";
 import type { BlameResult, FileHistoryEntry } from "./types";
@@ -51,29 +53,39 @@ export function FileEditor({
 }) {
   const [view, setView] = useState<EditorView | null>(null);
   const [panel, setPanel] = useState<Panel>(null);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
+  const { busy, error, setError, clearError, run } = useBusy();
+  const { confirm, confirmNode } = useConfirm();
   const [message, setMessage] = useState("");
   const [renameTo, setRenameTo] = useState("");
   const [renaming, setRenaming] = useState(false);
   const [history, setHistory] = useState<FileHistoryEntry[]>([]);
   const [blame, setBlame] = useState<BlameResult | null>(null);
 
-  const path = file?.path ?? "";
+  // 切换文件时父组件先清空 file 再异步取内容。这里保留上一份快照，
+  // 让 CodeMirror 实例（滚动 / undo / 光标）在加载期间不被卸载，
+  // 只在上面叠一层 loading 遮罩。
+  const lastFile = useRef<OpenFile | null>(null);
+  if (file) lastFile.current = file;
+  const shown = file ?? lastFile.current;
+  const loading = !file;
+
+  const path = shown?.path ?? "";
   useEffect(() => {
     setPanel(null);
-    setError("");
+    clearError();
     setMessage("");
     setRenameTo(path);
     setHistory([]);
     setBlame(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [path, refName]);
 
   const localDiff = useMemo(
-    () => diffText(file?.content ?? "", draft),
-    [file?.content, draft],
+    () => diffText(shown?.content ?? "", loading ? (shown?.content ?? "") : draft),
+    [shown?.content, draft, loading],
   );
-  const changed = draft !== (file?.content ?? "");
+  const changed = !loading && draft !== (shown?.content ?? "");
+  const value = loading ? (shown?.content ?? "") : draft;
 
   const openPanel = async (next: Exclude<Panel, null>) => {
     if (panel === next) {
@@ -81,10 +93,9 @@ export function FileEditor({
       return;
     }
     setPanel(next);
-    setError("");
-    if (!path) return;
-    setBusy(true);
-    try {
+    clearError();
+    if (!path || loading) return;
+    await run(async () => {
       if (next === "history") {
         const res = await api.fileHistory(projectId, refName, path, 60);
         setHistory(res.items);
@@ -92,11 +103,7 @@ export function FileEditor({
         const res = await api.blame(projectId, refName, path);
         setBlame(res.item);
       }
-    } catch (e) {
-      setError(errText(e));
-    } finally {
-      setBusy(false);
-    }
+    });
   };
 
   const quickCommit = async () => {
@@ -104,48 +111,48 @@ export function FileEditor({
       setError("请填写提交说明");
       return;
     }
-    setBusy(true);
-    setError("");
-    try {
+    await run(async () => {
       await onQuickCommit(message.trim());
       setMessage("");
       setPanel(null);
-    } catch (e) {
-      setError(errText(e));
-    } finally {
-      setBusy(false);
-    }
+    });
   };
 
   const doRename = async () => {
     if (!renameTo.trim() || renameTo === path) return;
-    setBusy(true);
-    setError("");
-    try {
+    await run(async () => {
       await onRename(renameTo.trim());
       setRenaming(false);
-    } catch (e) {
-      setError(errText(e));
-    } finally {
-      setBusy(false);
-    }
+    });
   };
 
   const doDelete = async () => {
-    if (!window.confirm(`确定删除 ${path}？此操作会生成一次提交。`)) return;
-    setBusy(true);
-    setError("");
-    try {
+    const ok = await confirm({
+      title: `删除 ${path}？`,
+      body: "删除会立即在当前分支生成一次提交，必须再提交一次才能恢复。",
+      confirmText: "删除并提交",
+      danger: true,
+    });
+    if (!ok) return;
+    await run(async () => {
       await onDelete();
-    } catch (e) {
-      setError(errText(e));
-    } finally {
-      setBusy(false);
-    }
+    });
+  };
+
+  const discard = async () => {
+    const ok = await confirm({
+      title: "放弃草稿？",
+      body: `将丢弃 ${path} 的本地改动并回到服务端当前版本。此操作不可撤销。`,
+      confirmText: "放弃草稿",
+      danger: true,
+    });
+    if (!ok) return;
+    onDiscard();
+    clearError();
   };
 
   const download = () => {
-    const blob = new Blob([draft], { type: "text/plain;charset=utf-8" });
+    const blob = new Blob([value], { type: "text/plain;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
@@ -154,26 +161,22 @@ export function FileEditor({
     URL.revokeObjectURL(url);
   };
 
-  if (!file) {
-    return <div className="pv-loading">打开文件…</div>;
-  }
-
-  const format = formatForPath(path);
+  const format = formatForPath(path || "untitled.md");
 
   return (
     <div className="pv-editor">
       <div className="pv-editor-head">
         <div className="pv-editor-title">
           <code className="pv-path">{path}</code>
-          {file.isNew && <span className="pv-chip pv-chip-add">新文件</span>}
+          {shown?.isNew && <span className="pv-chip pv-chip-add">新文件</span>}
           {changed && <span className="pv-chip pv-chip-modify">已修改</span>}
           {readOnly && <span className="pv-chip">只读</span>}
         </div>
         <div className="pv-editor-actions">
-          <button type="button" className="pv-btn pv-btn-ghost" onClick={() => void copyText(path).then(() => onNotify("路径已复制")).catch((e) => setError(errText(e)))}>复制路径</button>
-          <button type="button" className="pv-btn pv-btn-ghost" onClick={download}>下载</button>
-          <button type="button" className="pv-btn pv-btn-ghost" onClick={() => setRenaming((v) => !v)}>移动/改名</button>
-          <button type="button" className="pv-btn pv-btn-ghost" onClick={() => void doDelete()} disabled={readOnly || file.isNew || busy}>删除</button>
+          <button type="button" className="pv-btn pv-btn-ghost" disabled={loading} onClick={() => void copyText(path).then(() => onNotify("路径已复制")).catch((e) => setError(errText(e)))}>复制路径</button>
+          <button type="button" className="pv-btn pv-btn-ghost" disabled={loading} onClick={download}>下载</button>
+          <button type="button" className="pv-btn pv-btn-ghost" disabled={loading || readOnly} onClick={() => setRenaming((v) => !v)}>移动/改名</button>
+          <button type="button" className="pv-btn pv-btn-ghost" onClick={() => void doDelete()} disabled={loading || readOnly || !!shown?.isNew || busy}>删除</button>
         </div>
       </div>
 
@@ -197,14 +200,14 @@ export function FileEditor({
         </div>
       )}
 
-      <div className="pv-editor-tabs">
-        <button type="button" className={`pv-tab${panel === "diff" ? " is-active" : ""}`} onClick={() => void openPanel("diff")}>差异{localDiff.additions + localDiff.deletions > 0 ? ` (${localDiff.additions + localDiff.deletions})` : ""}</button>
-        <button type="button" className={`pv-tab${panel === "history" ? " is-active" : ""}`} onClick={() => void openPanel("history")}>文件历史</button>
-        <button type="button" className={`pv-tab${panel === "blame" ? " is-active" : ""}`} onClick={() => void openPanel("blame")}>逐行追溯</button>
-        <button type="button" className="pv-tab" onClick={() => { onDraft(file.content); setPanel(null); }} disabled={!changed || readOnly}>撤销本地改动</button>
+      <div className="pv-editor-tabs" role="group" aria-label="文件详情面板">
+        <button type="button" className={`pv-tab${panel === "diff" ? " is-active" : ""}`} aria-pressed={panel === "diff"} disabled={loading} onClick={() => void openPanel("diff")}>差异{localDiff.additions + localDiff.deletions > 0 ? ` (${localDiff.additions + localDiff.deletions})` : ""}</button>
+        <button type="button" className={`pv-tab${panel === "history" ? " is-active" : ""}`} aria-pressed={panel === "history"} disabled={loading} onClick={() => void openPanel("history")}>文件历史</button>
+        <button type="button" className={`pv-tab${panel === "blame" ? " is-active" : ""}`} aria-pressed={panel === "blame"} disabled={loading} onClick={() => void openPanel("blame")}>逐行追溯</button>
+        <button type="button" className="pv-tab" disabled={loading || !changed || readOnly} onClick={() => { onDraft(shown?.content ?? ""); setPanel(null); }}>撤销本地改动</button>
       </div>
 
-      {error && <p className="pv-error">{error}</p>}
+      {error && <p className="pv-error" role="alert">{error}</p>}
 
       {panel === "diff" && (
         <div className="pv-panel">
@@ -253,29 +256,36 @@ export function FileEditor({
         </div>
       )}
 
-      <div className="pv-code">
+      <div className={`pv-code${loading ? " is-loading" : ""}`} aria-busy={loading}>
         <CodeEditor
-          value={draft}
+          value={value}
           format={format}
           onChange={onDraft}
           onViewReady={setView}
           fontSize={fontSize}
+          readOnly={readOnly || loading}
         />
+        {loading && <div className="pv-code-loading" role="status">打开文件…</div>}
       </div>
 
-      <div className="pv-quick-commit">
-        <input
-          value={message}
-          onChange={(e) => setMessage(e.target.value)}
-          placeholder="提交说明（单文件快速提交）"
-          disabled={readOnly || busy}
-          aria-label="提交说明"
-        />
-        <button type="button" className="pv-btn pv-btn-accent" onClick={() => void quickCommit()} disabled={readOnly || busy || !changed || !message.trim()}>提交此文件</button>
-        <button type="button" className="pv-btn" onClick={onDiscard} disabled={!changed}>放弃草稿</button>
-      </div>
+      {/* 只读引用下没有提交入口，避免点了才发现提交不了。 */}
+      {!readOnly && (
+        <div className="pv-quick-commit">
+          <input
+            value={message}
+            onChange={(e) => setMessage(e.target.value)}
+            placeholder="提交说明（单文件快速提交）"
+            disabled={busy || loading}
+            aria-label="提交说明"
+          />
+          <button type="button" className="pv-btn pv-btn-accent" onClick={() => void quickCommit()} disabled={busy || loading || !changed || !message.trim()}>提交此文件</button>
+          <button type="button" className="pv-btn" onClick={() => void discard()} disabled={loading || !changed}>放弃草稿</button>
+        </div>
+      )}
 
       <Toolbar format={format} view={view} />
+
+      {confirmNode}
     </div>
   );
 }

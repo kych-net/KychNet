@@ -14,16 +14,21 @@ export function InvitesView() {
   const [busyCode, setBusyCode] = useState<string | null>(null);
   // 最新生成的邀请码：一次性凭据，单独常驻展示，不被提示的超时清掉。
   const [createdCode, setCreatedCode] = useState("");
+  // 首屏加载中：区分「加载中 / 空列表 / 有数据」三态，避免先闪一下「暂无」。
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     void refresh();
   }, []);
 
   async function refresh() {
+    setLoading(true);
     try {
       setItems((await api.invites()).items);
     } catch (e) {
       setError((e as Error).message);
+    } finally {
+      setLoading(false);
     }
   }
 
@@ -31,11 +36,13 @@ export function InvitesView() {
     event.preventDefault();
     await run(async () => {
       setError("");
-      setNotice("邀请码已生成");
+      setNotice("");
       try {
         const created = await api.createInvite(maxUses, expiresInDays);
         // 邀请码只显示一次：像执行器注册码一样常驻展示，不吃 notice 的自动消失。
         setCreatedCode(created.item.code);
+        // 提示放在拿到结果之后：失败时不能先播报「已生成」。
+        setNotice("邀请码已生成");
         await refresh();
       } catch (e) {
         setError((e as Error).message);
@@ -68,7 +75,14 @@ export function InvitesView() {
   return (
     <section>
       <h2>邀请码</h2>
-      {error && <p className="error" role="alert">{error}</p>}
+      {error && (
+        <p className="error" role="alert">
+          {error}
+          <button type="button" onClick={() => void refresh()}>
+            重试
+          </button>
+        </p>
+      )}
       {notice && <p className="notice" role="status">{notice}</p>}
 
       <form onSubmit={(e) => void create(e)} className="row align">
@@ -113,6 +127,20 @@ export function InvitesView() {
           </tr>
         </thead>
         <tbody>
+          {/* 已有数据时不再显示「加载中」，避免每次刷新表格闪一下。 */}
+          {loading && items.length === 0 ? (
+            <tr>
+              <td colSpan={4} className="hint">
+                加载中…
+              </td>
+            </tr>
+          ) : items.length === 0 ? (
+            <tr>
+              <td colSpan={4} className="hint">
+                还没有邀请码。在上方设置使用次数与有效期后点「生成」，把生成的邀请码发给要邀请的人。
+              </td>
+            </tr>
+          ) : null}
           {items.map((invite) => (
             <tr key={invite.code}>
               <td className="mono">{invite.code}</td>

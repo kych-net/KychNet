@@ -18,7 +18,8 @@ import {
 import { CodeEditor } from "../components/CodeEditor";
 import { ProjectWorkflowsPanel } from "./WorkflowsView";
 import { useFeedback } from "../hooks/useFeedback";
-import { useConfirm } from "../components/ConfirmProvider";
+import { useBusy } from "../hooks/useBusy";
+import { useConfirm, usePrompt } from "../components/ConfirmProvider";
 
 /** 提交历史每次加载的页大小。 */
 const COMMIT_PAGE = 100;
@@ -155,7 +156,21 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
   const [showArchived, setShowArchived] = useState(false);
   const { error, notice, setError, setNotice } = useFeedback();
   const confirm = useConfirm();
-  const [busy, setBusy] = useState(false);
+  const promptText = usePrompt();
+  // 动作按面板拆分 busy：某个面板在跑时不再让其他面板的按钮一起变灰、文案错乱。
+  // useBusy 在 await confirm 之前就已上锁，确认框期间也不会重复提交。
+  const formBusy = useBusy(); // 新建 / 导入项目
+  const projectBusy = useBusy(); // 编辑信息 / 归档 / 删除项目
+  const branchBusy = useBusy(); // 创建 / 删除分支
+  const commitBusy = useBusy(); // 提交项目更改
+  const loadMoreBusy = useBusy(); // 加载更多提交
+  const revertBusy = useBusy(); // 还原提交
+  const prCreateBusy = useBusy(); // 新建 PR
+  const prCommentBusy = useBusy(); // PR 评论
+  const prActionBusy = useBusy(); // 合并 / 关闭 PR
+  const discussionCreateBusy = useBusy(); // 新建讨论
+  const discussionCommentBusy = useBusy(); // 讨论评论
+  const discussionActionBusy = useBusy(); // 关闭讨论
 
   const [selected, setSelected] = useState<Project | null>(null);
   const [branches, setBranches] = useState<string[]>([]);
@@ -179,6 +194,18 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
   // 不一致就丢弃，避免慢响应覆盖新选择。文件与目录树各自独立计数。
   const fileGen = useRef(0);
   const treeGen = useRef(0);
+  // 详情（PR / 提交 / 讨论）共用一个代际号：切换项目或打开另一条详情都会
+  // 立即作废在途响应，避免慢响应把旧详情盖回新选择上。
+  const detailGen = useRef(0);
+  // 列表请求的独立代际：提交列表与 PR 列表各自只受自己的新请求影响。
+  const commitListGen = useRef(0);
+  const prListGen = useRef(0);
+  const discussionListGen = useRef(0);
+  // 渲染期同步的最新值，供异步回调判断「发起时的项目是否仍是当前项目」。
+  const selectedRef = useRef<Project | null>(null);
+  selectedRef.current = selected;
+  const branchRef = useRef(branch);
+  branchRef.current = branch;
 
   const [creating, setCreating] = useState(false);
   const [newSlug, setNewSlug] = useState("");
@@ -198,6 +225,9 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
   const [commitDetail, setCommitDetail] = useState<CommitDetail | null>(null);
   const [selectedCommit, setSelectedCommit] = useState<string | null>(null);
   const [newBranch, setNewBranch] = useState("");
+  // 分支下拉是受控的：用户在确认框里点「取消」时 DOM 值已是新分支，
+  // 递增这个 key 让 select 重建，值回到真正的当前分支。
+  const [branchSelectKey, setBranchSelectKey] = useState(0);
   // 提交历史分页：每次拉一页，往下追加。
   const [commitsOffset, setCommitsOffset] = useState(0);
 
@@ -219,6 +249,12 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
   const [discussions, setDiscussions] = useState<Discussion[]>([]);
   const [discussionDetail, setDiscussionDetail] = useState<DiscussionDetail | null>(null);
   const [selectedDiscussion, setSelectedDiscussion] = useState<string | null>(null);
+  // 详情面板内的就地错误：全局 error 在页面顶部，滚到详情后看不到。
+  const [commitDetailError, setCommitDetailError] = useState("");
+  const [prError, setPrError] = useState("");
+  const [discussionError, setDiscussionError] = useState("");
+  // 打开当前提交详情时所属的项目：切换项目后据此拒绝误操作。
+  const [commitDetailProject, setCommitDetailProject] = useState<string | null>(null);
   const [discussionTitle, setDiscussionTitle] = useState("");
   const [discussionBody, setDiscussionBody] = useState("");
   const [discussionComment, setDiscussionComment] = useState("");
@@ -257,8 +293,16 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
     setSelected(project);
     setBranch(project.default_branch);
     setDir("");
-    // 切换项目作废仍在途的文件加载。
+    // 切换项目作废仍在途的文件、详情与列表请求。
     fileGen.current += 1;
+    detailGen.current += 1;
+    commitListGen.current += 1;
+    prListGen.current += 1;
+    discussionListGen.current += 1;
+    setCommitDetailError("");
+    setPrError("");
+    setDiscussionError("");
+    setCommitDetailProject(null);
     setFile(null);
     setDraftPath("");
     setContent("");
@@ -289,14 +333,60 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
     setSelectedDiscussion(null);
     try {
       const detail = await api.project(project.id);
+      // 快速连点两个项目时，先发起的那次响应回来不能再覆盖当前项目的分支列表。
+      if (selectedRef.current?.id !== project.id) return;
       setBranches(detail.branches.length > 0 ? detail.branches : [project.default_branch]);
       await loadTree(project, project.default_branch, "");
       void loadCommits(project, project.default_branch).catch((e) =>
         setError((e as Error).message),
       );
     } catch (e) {
+      if (selectedRef.current?.id !== project.id) return;
       setError((e as Error).message);
     }
+  }
+
+  /**
+   * 切换分支的统一入口：两个分支下拉（文件面板 / 提交历史面板）都走这里。
+   * 未提交改动先确认、清空待提交与所有详情、再同时刷新文件树与提交历史，
+   * 避免出现「切了分支但提交历史还停在旧分支」的半更新状态。
+   */
+  async function switchBranch(next: string) {
+    if (!selected || next === branch) return;
+    if (
+      pendingCount > 0 &&
+      !(await confirm("切换分支会丢弃当前待提交的更改，继续？", {
+        title: "未提交的更改",
+        confirmLabel: "继续切换",
+        danger: true,
+      }))
+    ) {
+      setBranchSelectKey((value) => value + 1);
+      return;
+    }
+    const project = selected;
+    clearStaged();
+    setBranch(next);
+    // 作废仍在途的文件 / 详情 / 列表请求。
+    fileGen.current += 1;
+    detailGen.current += 1;
+    setFile(null);
+    setDraftPath("");
+    setContent("");
+    setCommitDetail(null);
+    setSelectedCommit(null);
+    setCommitDetailError("");
+    setCommitDetailProject(null);
+    setPrDetail(null);
+    setSelectedPr(null);
+    setPrError("");
+    setDiscussionDetail(null);
+    setSelectedDiscussion(null);
+    setDiscussionError("");
+    setError("");
+    setNotice("");
+    void loadTree(project, next, "").catch((err) => setError((err as Error).message));
+    void loadCommits(project, next).catch((err) => setError((err as Error).message));
   }
 
   function switchMiddleTab(next: "files" | "discussions" | "workflows") {
@@ -321,8 +411,11 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
   }
 
   async function loadCommits(project: Project, ref: string, append = false) {
+    const gen = ++commitListGen.current;
     const offset = append ? commitsOffset : 0;
     const result = await api.commits(project.id, ref, COMMIT_PAGE, offset);
+    // 项目/分支已切换，或已有更新的加载发起：丢弃这次陈旧响应。
+    if (gen !== commitListGen.current || selectedRef.current?.id !== project.id) return;
     setCommits((prev) => (append ? [...prev, ...result.items] : result.items));
     setCommitsOffset(offset + result.items.length);
     setCommitDetail(null);
@@ -331,11 +424,13 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
 
   async function loadMoreCommits() {
     if (!selected) return;
-    try {
-      await loadCommits(selected, branch, true);
-    } catch (e) {
-      setError((e as Error).message);
-    }
+    await loadMoreBusy.run(async () => {
+      try {
+        await loadCommits(selected!, branch, true);
+      } catch (e) {
+        setError((e as Error).message);
+      }
+    });
   }
 
   async function runCompare() {
@@ -355,153 +450,195 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
 
   async function openCommit(oid: string) {
     if (!selected) return;
+    const project = selected;
+    const gen = ++detailGen.current;
     try {
-      const result = await api.commitDetail(selected.id, oid);
+      const result = await api.commitDetail(project.id, oid);
+      // 已切走（切项目 / 打开了另一条详情）：丢弃这次响应。
+      if (gen !== detailGen.current || selectedRef.current?.id !== project.id) return;
       setCommitDetail(result.item);
       setSelectedCommit(oid);
+      setCommitDetailProject(project.id);
+      setCommitDetailError("");
       setError("");
     } catch (e) {
-      setError((e as Error).message);
+      if (gen !== detailGen.current) return;
+      setCommitDetailError((e as Error).message);
     }
   }
 
   async function revertCommit() {
     if (!selected || !commitDetail) return;
-    const short = commitDetail.oid.slice(0, 7);
-    if (
-      !(await confirm(`在 ${branch} 上反向应用提交 ${short}？`, {
-        title: "反向应用提交",
-        confirmLabel: "反向应用",
-        danger: true,
-      }))
-    ) return;
-    setBusy(true);
-    setError("");
-    setNotice("");
-    try {
-      const result = await api.revertCommit(selected.id, {
-        ref: branch,
-        commit: commitDetail.oid,
-      });
-      setNotice(`已生成还原提交 ${result.item.commit.slice(0, 7)}`);
-      await loadCommits(selected, branch);
-      await loadTree(selected, branch, dir);
-      await refreshProjects();
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setBusy(false);
+    // 详情可能来自上一个项目：先确认它仍属于当前项目，再动手。
+    if (commitDetailProject !== selected.id) {
+      setError("项目已切换，请重新打开该详情");
+      return;
     }
+    const project = selected;
+    const targetBranch = branchRef.current;
+    const detail = commitDetail;
+    await revertBusy.run(async () => {
+      const short = detail.oid.slice(0, 7);
+      if (
+        !(await confirm(`在 ${targetBranch} 上反向应用提交 ${short}？`, {
+          title: "反向应用提交",
+          confirmLabel: "反向应用",
+          danger: true,
+        }))
+      ) return;
+      setError("");
+      setNotice("");
+      setCommitDetailError("");
+      try {
+        const result = await api.revertCommit(project.id, {
+          ref: targetBranch,
+          commit: detail.oid,
+        });
+        setNotice(`已生成还原提交 ${result.item.commit.slice(0, 7)}`);
+        // 还原期间已切换项目：只提示结果，不再刷新上一个项目的工作区。
+        if (selectedRef.current?.id !== project.id) return;
+        await loadCommits(project, targetBranch);
+        await loadTree(project, targetBranch, dir);
+        await refreshProjects();
+      } catch (e) {
+        setCommitDetailError((e as Error).message || "还原失败，请重试");
+      }
+    });
   }
 
   async function createBranch(event: React.FormEvent) {
     event.preventDefault();
     if (!selected) return;
-    setBusy(true);
-    setError("");
-    setNotice("");
-    try {
-      const result = await api.createBranch(selected.id, {
-        name: newBranch.trim(),
-        from: branch,
-      });
-      setBranches(result.branches.length > 0 ? result.branches : [selected.default_branch]);
-      setNotice(`分支 ${newBranch.trim()} 已创建`);
-      setNewBranch("");
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setBusy(false);
-    }
+    const project = selected;
+    const name = newBranch.trim();
+    await branchBusy.run(async () => {
+      setError("");
+      setNotice("");
+      try {
+        const result = await api.createBranch(project.id, { name, from: branchRef.current });
+        if (selectedRef.current?.id !== project.id) return;
+        setBranches(result.branches.length > 0 ? result.branches : [project.default_branch]);
+        setNotice(`分支 ${name} 已创建`);
+        setNewBranch("");
+      } catch (e) {
+        setError((e as Error).message);
+      }
+    });
   }
 
   async function removeBranch(name: string) {
     if (!selected || name === selected.default_branch) return;
-    if (
-      !(await confirm(`删除分支 ${name}？`, { title: "删除分支", confirmLabel: "删除", danger: true }))
-    ) return;
-    setBusy(true);
-    setError("");
-    setNotice("");
-    try {
-      const result = await api.deleteBranch(selected.id, name);
-      const next = result.branches.length > 0 ? result.branches : [selected.default_branch];
-      setBranches(next);
-      setNotice(`分支 ${name} 已删除`);
-      if (branch === name) {
-        const fallback = selected.default_branch;
-        setBranch(fallback);
-        await loadTree(selected, fallback, "");
-        await loadCommits(selected, fallback);
+    const project = selected;
+    await branchBusy.run(async () => {
+      if (
+        !(await confirm(`删除分支 ${name}？`, {
+          title: "删除分支",
+          confirmLabel: "删除",
+          danger: true,
+        }))
+      ) return;
+      setError("");
+      setNotice("");
+      try {
+        const result = await api.deleteBranch(project.id, name);
+        if (selectedRef.current?.id !== project.id) return;
+        const next = result.branches.length > 0 ? result.branches : [project.default_branch];
+        setBranches(next);
+        setNotice(`分支 ${name} 已删除`);
+        if (branchRef.current === name) {
+          const fallback = project.default_branch;
+          setBranch(fallback);
+          detailGen.current += 1;
+          fileGen.current += 1;
+          setFile(null);
+          setDraftPath("");
+          setContent("");
+          await loadTree(project, fallback, "");
+          await loadCommits(project, fallback);
+        }
+      } catch (e) {
+        setError((e as Error).message);
       }
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setBusy(false);
-    }
+    });
   }
 
   async function loadPrs(project: Project) {
+    const gen = ++prListGen.current;
     const result = await api.prs(project.id);
+    // 项目已切换或已有更新的 PR 列表请求：丢弃陈旧响应。
+    if (gen !== prListGen.current || selectedRef.current?.id !== project.id) return;
     setPrs(result.items);
   }
 
   async function openPr(number: number) {
     if (!selected) return;
+    const project = selected;
+    const gen = ++detailGen.current;
     try {
-      const result = await api.prDetail(selected.id, number);
+      const result = await api.prDetail(project.id, number);
+      if (gen !== detailGen.current || selectedRef.current?.id !== project.id) return;
       setPrDetail(result.item);
       setSelectedPr(number);
       setPrComment("");
+      setPrError("");
       setError("");
     } catch (e) {
-      setError((e as Error).message);
+      if (gen !== detailGen.current) return;
+      setPrError((e as Error).message);
     }
   }
 
   async function createPr(event: React.FormEvent) {
     event.preventDefault();
     if (!selected) return;
-    setBusy(true);
-    setError("");
-    setNotice("");
-    try {
-      const result = await api.createPr(selected.id, {
-        title: prTitle,
-        body: prBody,
-        source_branch: prSource,
-        target_branch: prTarget,
-      });
-      setPrTitle("");
-      setPrBody("");
-      setNotice(`PR #${result.item.number} 已创建`);
-      await loadPrs(selected);
-      await openPr(result.item.number);
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setBusy(false);
-    }
+    const project = selected;
+    await prCreateBusy.run(async () => {
+      setError("");
+      setNotice("");
+      try {
+        const result = await api.createPr(project.id, {
+          title: prTitle,
+          body: prBody,
+          source_branch: prSource,
+          target_branch: prTarget,
+        });
+        if (selectedRef.current?.id !== project.id) return;
+        setPrTitle("");
+        setPrBody("");
+        setNotice(`PR #${result.item.number} 已创建`);
+        await loadPrs(project);
+        await openPr(result.item.number);
+      } catch (e) {
+        setError((e as Error).message);
+      }
+    });
   }
 
   async function commentPr(event: React.FormEvent) {
     event.preventDefault();
     if (!selected || selectedPr === null) return;
-    setBusy(true);
-    setError("");
-    try {
-      await api.addPrComment(selected.id, selectedPr, prComment);
-      setPrComment("");
-      await openPr(selectedPr);
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setBusy(false);
-    }
+    const project = selected;
+    const number = selectedPr;
+    await prCommentBusy.run(async () => {
+      setError("");
+      try {
+        await api.addPrComment(project.id, number, prComment);
+        if (selectedRef.current?.id !== project.id) return;
+        setPrComment("");
+        await openPr(number);
+      } catch (e) {
+        setPrError((e as Error).message);
+      }
+    });
   }
 
   async function mergePr() {
     if (!selected || !prDetail) return;
+    // 详情可能属于上一个项目：先确认它仍属于当前项目，再动手。
+    if (prDetail.project_id !== selected.id) {
+      setError("项目已切换，请重新打开该详情");
+      return;
+    }
     // 服务端按 merge-base 做三方合并，冲突时直接拒绝；前端先拦下，
     // 别让用户点一个注定失败、还以为会丢数据的按钮。
     if (prDetail.conflicts?.length) {
@@ -510,138 +647,167 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
       );
       return;
     }
-    const warning = prDetail.is_fast_forward
+    const project = selected;
+    const detail = prDetail;
+    const warning = detail.is_fast_forward
       ? ""
       : "\n\n这不是快进合并：服务端会生成双亲 merge commit，并逐文件三方合并，两侧改动都会保留。";
-    if (
-      !(await confirm(`合并 PR #${prDetail.number} 到 ${prDetail.target_branch}？${warning}`, {
-        title: "合并 Pull Request",
-        confirmLabel: "合并",
-      }))
-    ) {
-      return;
-    }
-    setBusy(true);
-    setError("");
-    setNotice("");
-    try {
-      const result = await api.mergePr(selected.id, prDetail.number);
-      setNotice(
-        result.item.target_branch === selected.default_branch
-          ? `已合并到 ${result.item.target_branch}，并触发整站编译`
-          : `已合并到 ${result.item.target_branch}`,
-      );
-      await loadPrs(selected);
-      await openPr(prDetail.number);
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setBusy(false);
-    }
+    await prActionBusy.run(async () => {
+      if (
+        !(await confirm(`合并 PR #${detail.number} 到 ${detail.target_branch}？${warning}`, {
+          title: "合并 Pull Request",
+          confirmLabel: "合并",
+        }))
+      ) {
+        return;
+      }
+      setError("");
+      setNotice("");
+      setPrError("");
+      try {
+        const result = await api.mergePr(project.id, detail.number);
+        const message =
+          result.item.target_branch === project.default_branch
+            ? `已合并到 ${result.item.target_branch}，并触发整站编译`
+            : `已合并到 ${result.item.target_branch}`;
+        setNotice(message);
+        // 合并期间已切换项目：只提示结果，不再刷新上一个项目的 PR 列表。
+        if (selectedRef.current?.id !== project.id) return;
+        await loadPrs(project);
+        await openPr(detail.number);
+      } catch (e) {
+        setPrError((e as Error).message || "合并失败，请重试");
+      }
+    });
   }
 
   async function closePr() {
     if (!selected || !prDetail) return;
-    setBusy(true);
-    setError("");
-    setNotice("");
-    try {
-      await api.closePr(selected.id, prDetail.number);
-      setNotice(`PR #${prDetail.number} 已关闭`);
-      await loadPrs(selected);
-      await openPr(prDetail.number);
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setBusy(false);
+    if (prDetail.project_id !== selected.id) {
+      setError("项目已切换，请重新打开该详情");
+      return;
     }
+    const project = selected;
+    const detail = prDetail;
+    await prActionBusy.run(async () => {
+      setError("");
+      setNotice("");
+      setPrError("");
+      try {
+        await api.closePr(project.id, detail.number);
+        setNotice(`PR #${detail.number} 已关闭`);
+        if (selectedRef.current?.id !== project.id) return;
+        await loadPrs(project);
+        await openPr(detail.number);
+      } catch (e) {
+        setPrError((e as Error).message || "关闭失败，请重试");
+      }
+    });
   }
 
   async function loadDiscussions(project: Project) {
+    const gen = ++discussionListGen.current;
     const result = await api.discussions(project.id);
+    if (gen !== discussionListGen.current || selectedRef.current?.id !== project.id) return;
     setDiscussions(result.items);
   }
 
   async function openDiscussion(id: string) {
     if (!selected) return;
+    const project = selected;
+    const gen = ++detailGen.current;
     try {
-      const result = await api.discussionDetail(selected.id, id);
+      const result = await api.discussionDetail(project.id, id);
+      if (gen !== detailGen.current || selectedRef.current?.id !== project.id) return;
       setDiscussionDetail(result.item);
       setSelectedDiscussion(id);
       setDiscussionComment("");
+      setDiscussionError("");
       setError("");
     } catch (e) {
-      setError((e as Error).message);
+      if (gen !== detailGen.current) return;
+      setDiscussionError((e as Error).message);
     }
   }
 
   async function createDiscussion(event: React.FormEvent) {
     event.preventDefault();
     if (!selected) return;
-    setBusy(true);
-    setError("");
-    setNotice("");
-    try {
-      const result = await api.createDiscussion(selected.id, {
-        title: discussionTitle,
-        body: discussionBody,
-      });
-      setDiscussionTitle("");
-      setDiscussionBody("");
-      setNotice("讨论已创建");
-      await loadDiscussions(selected);
-      await openDiscussion(result.item.id);
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setBusy(false);
-    }
+    const project = selected;
+    await discussionCreateBusy.run(async () => {
+      setError("");
+      setNotice("");
+      try {
+        const result = await api.createDiscussion(project.id, {
+          title: discussionTitle,
+          body: discussionBody,
+        });
+        if (selectedRef.current?.id !== project.id) return;
+        setDiscussionTitle("");
+        setDiscussionBody("");
+        setNotice("讨论已创建");
+        await loadDiscussions(project);
+        await openDiscussion(result.item.id);
+      } catch (e) {
+        setError((e as Error).message);
+      }
+    });
   }
 
   async function commentDiscussion(event: React.FormEvent) {
     event.preventDefault();
     if (!selected || !selectedDiscussion) return;
-    setBusy(true);
-    setError("");
-    try {
-      await api.addDiscussionComment(selected.id, selectedDiscussion, discussionComment);
-      setDiscussionComment("");
-      await openDiscussion(selectedDiscussion);
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setBusy(false);
-    }
+    const project = selected;
+    const id = selectedDiscussion;
+    await discussionCommentBusy.run(async () => {
+      setError("");
+      try {
+        await api.addDiscussionComment(project.id, id, discussionComment);
+        if (selectedRef.current?.id !== project.id) return;
+        setDiscussionComment("");
+        await openDiscussion(id);
+      } catch (e) {
+        setDiscussionError((e as Error).message);
+      }
+    });
   }
 
   async function closeDiscussion() {
     if (!selected || !selectedDiscussion) return;
-    setBusy(true);
-    setError("");
-    setNotice("");
-    try {
-      await api.closeDiscussion(selected.id, selectedDiscussion);
-      setNotice("讨论已关闭");
-      await loadDiscussions(selected);
-      await openDiscussion(selectedDiscussion);
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setBusy(false);
+    if (discussionDetail && discussionDetail.project_id !== selected.id) {
+      setError("项目已切换，请重新打开该详情");
+      return;
     }
+    const project = selected;
+    const id = selectedDiscussion;
+    await discussionActionBusy.run(async () => {
+      setError("");
+      setNotice("");
+      setDiscussionError("");
+      try {
+        await api.closeDiscussion(project.id, id);
+        if (selectedRef.current?.id !== project.id) return;
+        setNotice("讨论已关闭");
+        await loadDiscussions(project);
+        await openDiscussion(id);
+      } catch (e) {
+        setDiscussionError((e as Error).message || "关闭讨论失败，请重试");
+      }
+    });
   }
 
   async function loadTree(project: Project, ref: string, path: string) {
     const gen = ++treeGen.current;
     try {
       const result = await api.projectTree(project.id, ref, path);
-      if (gen !== treeGen.current) return;
+      // 代际或项目已变：丢弃陈旧响应（含快速切换项目时的慢响应）。
+      if (gen !== treeGen.current || selectedRef.current?.id !== project.id) return;
       setItems(result.items);
       setBranches(result.branches.length > 0 ? result.branches : [project.default_branch]);
       setDir(path);
     } catch (e) {
       // 已被更新的加载取代时，陈旧请求的错误也一并丢弃。
-      if (gen === treeGen.current) throw e;
+      if (gen === treeGen.current && selectedRef.current?.id === project.id) throw e;
     }
   }
 
@@ -681,9 +847,15 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
     }
   }
 
-  function newFile() {
-    const name = window.prompt("新文件路径（相对于当前目录）", "untitled.md");
-    if (!name) return;
+  async function newFile() {
+    const name = await promptText("新建文件（路径相对于当前目录）", {
+      title: "新建文件",
+      label: "文件路径",
+      initial: "untitled.md",
+      confirmLabel: "创建",
+      validate: (value) => (value.trim() ? null : "请填写文件路径"),
+    });
+    if (name === null) return;
     const path = joinPath(dir, name);
     fileGen.current += 1;
     setFile(null);
@@ -711,41 +883,50 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
       ...staged.map(([path, value]) => ({ path, content: value })),
     ];
     if (changes.length === 0) return;
-    setBusy(true);
-    setError("");
-    setNotice("");
-    setCommitError("");
-    setCommitNotice("");
-    try {
-      const result = await api.commitProjectChanges(selected.id, {
-        ref: branch,
-        message: commitMessage || undefined,
-        changes,
-      });
-      setDrafts({});
-      setDeletions([]);
-      setCommitMessage("");
-      fileGen.current += 1;
-      setFile(null);
-      setDraftPath("");
-      setContent("");
-      setCommitNotice(
-        `已提交 ${result.item.commit.slice(0, 7)}，共 ${result.item.paths.length} 个文件`,
-      );
-      // 提交已经成功，后续刷新失败只写顶部全局错误，不覆盖面板里的成功提示。
-      await loadTree(selected, branch, dir).catch((e) =>
-        setError((e as Error).message),
-      );
-      await loadCommits(selected, branch).catch((e) =>
-        setError((e as Error).message),
-      );
-      await refreshProjects();
-    } catch (e) {
-      // 错误必须显示在工作区面板内，全局 error 在页面顶部，用户看不到。
-      setCommitError((e as Error).message || "提交失败，请重试");
-    } finally {
-      setBusy(false);
-    }
+    const project = selected;
+    const targetBranch = branchRef.current;
+    const targetDir = dir;
+    await commitBusy.run(async () => {
+      setError("");
+      setNotice("");
+      setCommitError("");
+      setCommitNotice("");
+      try {
+        const result = await api.commitProjectChanges(project.id, {
+          ref: targetBranch,
+          message: commitMessage || undefined,
+          changes,
+        });
+        if (selectedRef.current?.id !== project.id) {
+          // 提交期间已切换项目：只提示结果，不再改动上一个项目的工作区状态。
+          setCommitNotice(
+            `已提交 ${result.item.commit.slice(0, 7)}，共 ${result.item.paths.length} 个文件`,
+          );
+          return;
+        }
+        setDrafts({});
+        setDeletions([]);
+        setCommitMessage("");
+        fileGen.current += 1;
+        setFile(null);
+        setDraftPath("");
+        setContent("");
+        setCommitNotice(
+          `已提交 ${result.item.commit.slice(0, 7)}，共 ${result.item.paths.length} 个文件`,
+        );
+        // 提交已经成功，后续刷新失败只写顶部全局错误，不覆盖面板里的成功提示。
+        await loadTree(project, targetBranch, targetDir).catch((e) =>
+          setError((e as Error).message),
+        );
+        await loadCommits(project, targetBranch).catch((e) =>
+          setError((e as Error).message),
+        );
+        await refreshProjects();
+      } catch (e) {
+        // 错误必须显示在工作区面板内，全局 error 在页面顶部，用户看不到。
+        setCommitError((e as Error).message || "提交失败，请重试");
+      }
+    });
   }
 
   async function removeFile() {
@@ -771,15 +952,37 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
     setCommitNotice("文件已标记删除，等待项目提交");
   }
 
-  function renameFile() {
+  async function renameFile() {
     if (!file) return;
-    const target = window.prompt("新路径", file.path);
-    if (!target || target === file.path) return;
+    const source = file.path;
+    const target = await promptText("重命名文件", {
+      title: "重命名文件",
+      label: "新路径",
+      initial: source,
+      confirmLabel: "重命名",
+      validate: (value) => {
+        const next = value.trim();
+        if (!next) return "请填写新路径";
+        if (next === source) return "路径没有变化";
+        // 目标已存在于待提交草稿或当前目录的文件列表时，不能覆盖。
+        if (Object.prototype.hasOwnProperty.call(drafts, next)) {
+          return `已存在待提交的文件：${next}`;
+        }
+        if (items.some((item) => !item.is_dir && item.path === next)) {
+          return `目标路径已存在：${next}`;
+        }
+        if (deletions.includes(next)) return `目标路径已被标记删除：${next}`;
+        return null;
+      },
+    });
+    if (target === null) return;
+    const next = target.trim();
+    if (next === source) return;
     fileGen.current += 1;
-    setDrafts((current) => ({ ...current, [target]: content }));
-    setDeletions((current) => Array.from(new Set([...current, file.path])));
+    setDrafts((current) => ({ ...current, [next]: content }));
+    setDeletions((current) => Array.from(new Set([...current, source])));
     setFile(null);
-    setDraftPath(target);
+    setDraftPath(next);
     setContent(content);
     setCommitError("");
     setCommitNotice("重命名已加入待提交，提交项目时生效");
@@ -787,74 +990,81 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
 
   async function createProject(event: React.FormEvent) {
     event.preventDefault();
-    setBusy(true);
-    setError("");
-    try {
-      const result = await api.createProject({
-        slug: newSlug,
-        description: newDescription,
-        template: templateSlug || undefined,
-      });
-      setCreating(false);
-      setNewSlug("");
-      setNewDescription("");
-      setTemplateSlug("");
-      setNotice(
-        result.template
-          ? `项目「${result.item.slug}」已从模板「${result.template}」浅克隆创建`
-          : `项目「${result.item.slug}」已创建`,
-      );
-      await refreshProjects();
-      await selectProject(result.item);
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setBusy(false);
-    }
+    await formBusy.run(async () => {
+      setError("");
+      try {
+        const result = await api.createProject({
+          slug: newSlug,
+          description: newDescription,
+          template: templateSlug || undefined,
+        });
+        setCreating(false);
+        setNewSlug("");
+        setNewDescription("");
+        setTemplateSlug("");
+        setNotice(
+          result.template
+            ? `项目「${result.item.slug}」已从模板「${result.template}」浅克隆创建`
+            : `项目「${result.item.slug}」已创建`,
+        );
+        await refreshProjects();
+        await selectProject(result.item);
+      } catch (e) {
+        setError((e as Error).message);
+      }
+    });
   }
 
   async function importProject(event: React.FormEvent) {
     event.preventDefault();
-    setBusy(true);
-    setError("");
-    setNotice("");
-    try {
-      const result = await api.importProject({
-        slug: newSlug.trim(),
-        description: newDescription,
-        url: importUrl.trim(),
-        branch: importBranch.trim() || undefined,
-      });
-      setImporting(false);
-      setImportUrl("");
-      setImportBranch("");
-      setNewSlug("");
-      setNewDescription("");
-      setNotice(
-        `项目「${result.item.slug}」已导入：${result.branches.length} 个分支、` +
-          `${result.commits} 个提交、${result.objects} 个对象`,
-      );
-      await refreshProjects();
-      await selectProject(result.item);
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setBusy(false);
-    }
+    await formBusy.run(async () => {
+      setError("");
+      setNotice("");
+      try {
+        const result = await api.importProject({
+          slug: newSlug.trim(),
+          description: newDescription,
+          url: importUrl.trim(),
+          branch: importBranch.trim() || undefined,
+        });
+        setImporting(false);
+        setImportUrl("");
+        setImportBranch("");
+        setNewSlug("");
+        setNewDescription("");
+        setNotice(
+          `项目「${result.item.slug}」已导入：${result.branches.length} 个分支、` +
+            `${result.commits} 个提交、${result.objects} 个对象`,
+        );
+        await refreshProjects();
+        await selectProject(result.item);
+      } catch (e) {
+        setError((e as Error).message);
+      }
+    });
   }
 
   async function editProject() {
     if (!selected) return;
-    const description = window.prompt("项目描述", selected.description);
-    if (description === null) return;
-    try {
-      const result = await api.updateProject(selected.id, { description });
-      setSelected(result.item);
-      setNotice("项目信息已更新");
-      await refreshProjects();
-    } catch (e) {
-      setError((e as Error).message);
-    }
+    const project = selected;
+    await projectBusy.run(async () => {
+      const description = await promptText("修改项目描述", {
+        title: "编辑项目信息",
+        label: "项目描述",
+        initial: project.description,
+        placeholder: "留空表示没有描述",
+        confirmLabel: "保存",
+      });
+      if (description === null) return;
+      try {
+        const result = await api.updateProject(project.id, { description });
+        if (selectedRef.current?.id === project.id) setSelected(result.item);
+        setNotice("项目信息已更新");
+        await refreshProjects();
+      } catch (e) {
+        setError((e as Error).message);
+      }
+    });
   }
 
   async function copyCloneUrl(kind: "https" | "ssh") {
@@ -870,51 +1080,72 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
 
   async function archiveProject() {
     if (!selected) return;
-    if (
-      !(await confirm(`归档项目「${selected.slug}」？归档后不再出现在列表和站点中。`, {
-        title: "归档项目",
-        confirmLabel: "归档",
-      }))
-    ) return;
-    try {
-      await api.updateProject(selected.id, { archived: true });
-      setSelected(null);
-      setNotice("项目已归档");
-      await refreshProjects();
-    } catch (e) {
-      setError((e as Error).message);
-    }
+    const project = selected;
+    await projectBusy.run(async () => {
+      if (
+        !(await confirm(`归档项目「${project.slug}」？归档后不再出现在列表和站点中。`, {
+          title: "归档项目",
+          confirmLabel: "归档",
+        }))
+      ) return;
+      try {
+        await api.updateProject(project.id, { archived: true });
+        if (selectedRef.current?.id === project.id) setSelected(null);
+        setNotice("项目已归档");
+        await refreshProjects();
+      } catch (e) {
+        setError((e as Error).message);
+      }
+    });
   }
 
   async function unarchiveProject() {
     if (!selected) return;
-    try {
-      const result = await api.updateProject(selected.id, { archived: false });
-      setSelected(result.item);
-      setNotice("已取消归档，项目重新出现在站点中");
-      await refreshProjects();
-    } catch (e) {
-      setError((e as Error).message);
-    }
+    const project = selected;
+    await projectBusy.run(async () => {
+      try {
+        const result = await api.updateProject(project.id, { archived: false });
+        if (selectedRef.current?.id === project.id) setSelected(result.item);
+        setNotice("已取消归档，项目重新出现在站点中");
+        await refreshProjects();
+      } catch (e) {
+        setError((e as Error).message);
+      }
+    });
   }
 
   async function deleteProject() {
     if (!selected) return;
-    const slug = selected.slug;
-    const typed = window.prompt(
-      `永久删除项目「${slug}」？全部提交、文件、PR 与 LFS 对象都会被删除，且不可恢复。\n请输入项目名 ${slug} 确认：`,
-    );
-    if (typed !== slug) return;
-    try {
-      await api.deleteProject(selected.id);
-      setSelected(null);
-      setItems([]);
-      setFile(null);
-      setNotice(`项目「${slug}」已删除`);
-      await refreshProjects();
-    } catch (e) {
-      setError((e as Error).message);
-    }
+    const project = selected;
+    const slug = project.slug;
+    await projectBusy.run(async () => {
+      const typed = await promptText(
+        `永久删除项目「${slug}」？全部提交、文件、PR 与 LFS 对象都会被删除，且不可恢复。请输入项目名 ${slug} 确认：`,
+        {
+          title: "删除项目",
+          label: "项目名",
+          placeholder: slug,
+          confirmLabel: "永久删除",
+        },
+      );
+      if (typed === null) return;
+      if (typed.trim() !== slug) {
+        setError(`项目名不匹配：需要输入「${slug}」才能删除，本次未执行任何操作。`);
+        return;
+      }
+      try {
+        await api.deleteProject(project.id);
+        if (selectedRef.current?.id === project.id) {
+          setSelected(null);
+          setItems([]);
+          setFile(null);
+        }
+        setNotice(`项目「${slug}」已删除`);
+        await refreshProjects();
+      } catch (e) {
+        setError((e as Error).message);
+      }
+    });
   }
 
   const crumbs = dir ? dir.split("/") : [];
@@ -925,8 +1156,16 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
   return (
     <section>
       <h2>项目</h2>
-      {error && <p className="error">{error}</p>}
-      {notice && <p className="notice">{notice}</p>}
+      {error && (
+        <p className="error" role="alert">
+          {error}
+        </p>
+      )}
+      {notice && (
+        <p className="notice" role="status">
+          {notice}
+        </p>
+      )}
 
       {selected && (
         <div className="project-topbar">
@@ -1058,8 +1297,11 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
                 服务端会克隆该公开仓库的分支与完整提交历史，导入后可直接用站内 Git 地址继续推送。
                 只支持 http/https 公开仓库，且历史里不能包含二进制文件（站内 Git 仅存 UTF-8 文本）。
               </p>
-              <button type="submit" disabled={busy || !importUrl.trim() || !newSlug.trim()}>
-                {busy ? "克隆中…" : "开始导入"}
+              <button
+                type="submit"
+                disabled={formBusy.busy || !importUrl.trim() || !newSlug.trim()}
+              >
+                {formBusy.busy ? "克隆中…" : "开始导入"}
               </button>
             </form>
           )}
@@ -1109,8 +1351,8 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
                   不带模板的提交历史；新项目的第一次提交记录为「从模板创建」。
                 </p>
               )}
-              <button type="submit" disabled={busy}>
-                创建
+              <button type="submit" disabled={formBusy.busy}>
+                {formBusy.busy ? "创建中…" : "创建"}
               </button>
             </form>
           )}
@@ -1150,6 +1392,11 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
         ) : (
           <>
             <div className="project-workbench">
+              {/* 就近提示：文件 / 讨论操作出错时不必滚动到页面顶部才能看到。 */}
+              <div className="project-inline-feedback" aria-live="polite">
+                {error && <p className="project-commit-feedback error">{error}</p>}
+                {notice && <p className="project-commit-feedback notice">{notice}</p>}
+              </div>
               <div className="project-tabs project-middle-tabs">
                 <button
                   type="button"
@@ -1181,30 +1428,9 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
                 <label>
                   分支
                   <select
+                    key={`files-branch-${branchSelectKey}`}
                     value={branch}
-                    onChange={async (e) => {
-                      const next = e.target.value;
-                      if (
-                        pendingCount > 0 &&
-                        !(await confirm("切换分支会丢弃当前待提交的更改，继续？", {
-                          title: "未提交的更改",
-                          confirmLabel: "继续切换",
-                          danger: true,
-                        }))
-                      ) {
-                        return;
-                      }
-                      clearStaged();
-                      setBranch(next);
-                      // 切换分支作废仍在途的文件加载。
-                      fileGen.current += 1;
-                      setFile(null);
-                      setDraftPath("");
-                      setContent("");
-                      void loadTree(selected, next, "").catch((err) =>
-                        setError((err as Error).message),
-                      );
-                    }}
+                    onChange={(e) => void switchBranch(e.target.value)}
                   >
                     {branches.map((name) => (
                       <option key={name} value={name}>
@@ -1213,7 +1439,7 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
                     ))}
                   </select>
                 </label>
-                <button type="button" onClick={newFile}>
+                <button type="button" onClick={() => void newFile()}>
                   新建文件
                 </button>
               </div>
@@ -1321,7 +1547,7 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
                       <div className="row align editor-actions">
                         {file && (
                           <>
-                            <button type="button" onClick={renameFile}>
+                            <button type="button" onClick={() => void renameFile()}>
                               重命名
                             </button>
                             <button type="button" onClick={removeFile}>
@@ -1380,9 +1606,13 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
                       </label>
                       <button
                         type="submit"
-                        disabled={busy || !discussionTitle.trim() || !discussionBody.trim()}
+                        disabled={
+                          discussionCreateBusy.busy ||
+                          !discussionTitle.trim() ||
+                          !discussionBody.trim()
+                        }
                       >
-                        创建
+                        {discussionCreateBusy.busy ? "创建中…" : "创建"}
                       </button>
                     </form>
 
@@ -1407,6 +1637,11 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
                   </div>
 
                   <div className="collab-detail">
+                    {discussionError && (
+                      <p className="error" role="alert">
+                        {discussionError}
+                      </p>
+                    )}
                     {!discussionDetail ? (
                       <p className="hint">选择一个讨论查看详情。</p>
                     ) : (
@@ -1430,9 +1665,11 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
                           <button
                             type="button"
                             onClick={() => void closeDiscussion()}
-                            disabled={busy || discussionDetail.closed_at !== null}
+                            disabled={
+                              discussionActionBusy.busy || discussionDetail.closed_at !== null
+                            }
                           >
-                            关闭讨论
+                            {discussionActionBusy.busy ? "关闭中…" : "关闭讨论"}
                           </button>
                         </div>
 
@@ -1463,12 +1700,12 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
                           <button
                             type="submit"
                             disabled={
-                              busy ||
+                              discussionCommentBusy.busy ||
                               discussionDetail.closed_at !== null ||
                               !discussionComment.trim()
                             }
                           >
-                            发表评论
+                            {discussionCommentBusy.busy ? "发表中…" : "发表评论"}
                           </button>
                         </form>
                       </>
@@ -1494,6 +1731,11 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
                 <span className="project-git-meta">
                   {selected.slug} · {branch}
                 </span>
+              </div>
+              {/* 分支 / 提交 / PR 操作的就近提示，同样用 aria-live 播报。 */}
+              <div className="project-inline-feedback" aria-live="polite">
+                {error && <p className="project-commit-feedback error">{error}</p>}
+                {notice && <p className="project-commit-feedback notice">{notice}</p>}
               </div>
               <div className="project-commit-panel">
                 <div className="project-commit-head">
@@ -1530,9 +1772,9 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
                   type="button"
                   className="project-commit-button"
                   onClick={() => void commitProject()}
-                  disabled={busy || pendingCount === 0}
+                  disabled={commitBusy.busy || pendingCount === 0}
                 >
-                  {busy
+                  {commitBusy.busy
                     ? "提交中…"
                     : `提交 ${pendingCount > 0 ? `${pendingCount} 个文件` : "项目更改"}`}
                 </button>
@@ -1580,30 +1822,9 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
                       <h4>分支</h4>
                       <div className="row align">
                         <select
+                          key={`history-branch-${branchSelectKey}`}
                           value={branch}
-                          onChange={async (e) => {
-                            const next = e.target.value;
-                            if (
-                              pendingCount > 0 &&
-                              !(await confirm("切换分支会丢弃当前待提交的更改，继续？", {
-                                title: "未提交的更改",
-                                confirmLabel: "继续切换",
-                                danger: true,
-                              }))
-                            ) {
-                              return;
-                            }
-                            clearStaged();
-                            setBranch(next);
-                            // 切换分支作废仍在途的文件加载。
-                            fileGen.current += 1;
-                            void loadCommits(selected, next).catch((err) =>
-                              setError((err as Error).message),
-                            );
-                            void loadTree(selected, next, "").catch((err) =>
-                              setError((err as Error).message),
-                            );
-                          }}
+                          onChange={(e) => void switchBranch(e.target.value)}
                         >
                           {branches.map((name) => (
                             <option key={name} value={name}>
@@ -1615,7 +1836,7 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
                           <button
                             type="button"
                             onClick={() => void removeBranch(branch)}
-                            disabled={busy}
+                            disabled={branchBusy.busy}
                           >
                             删除分支
                           </button>
@@ -1627,8 +1848,8 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
                           onChange={(e) => setNewBranch(e.target.value)}
                           placeholder="新分支名"
                         />
-                        <button type="submit" disabled={busy || !newBranch.trim()}>
-                          基于 {branch} 创建
+                        <button type="submit" disabled={branchBusy.busy || !newBranch.trim()}>
+                          {branchBusy.busy ? "创建中…" : `基于 ${branch} 创建`}
                         </button>
                       </form>
                       <p className="hint">默认分支为 {selected.default_branch}，不能删除。</p>
@@ -1659,7 +1880,7 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
                           type="button"
                           className="collab-load-more"
                           onClick={() => void loadMoreCommits()}
-                          disabled={busy}
+                          disabled={loadMoreBusy.busy}
                         >
                           加载更多
                         </button>
@@ -1667,6 +1888,11 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
                   </div>
 
                   <div className="collab-detail">
+                    {commitDetailError && (
+                      <p className="error" role="alert">
+                        {commitDetailError}
+                      </p>
+                    )}
                     {!commitDetail ? (
                       <p className="hint">选择一个提交查看详情。</p>
                     ) : (
@@ -1687,7 +1913,7 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
                           <button
                             type="button"
                             onClick={() => void revertCommit()}
-                            disabled={busy}
+                            disabled={revertBusy.busy}
                           >
                             还原此提交
                           </button>
@@ -1831,9 +2057,9 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
                       </div>
                       <button
                         type="submit"
-                        disabled={busy || !prTitle.trim() || prSource === prTarget}
+                        disabled={prCreateBusy.busy || !prTitle.trim() || prSource === prTarget}
                       >
-                        创建
+                        {prCreateBusy.busy ? "创建中…" : "创建"}
                       </button>
                     </form>
 
@@ -1862,6 +2088,11 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
                   </div>
 
                   <div className="collab-detail">
+                    {prError && (
+                      <p className="error" role="alert">
+                        {prError}
+                      </p>
+                    )}
                     {!prDetail ? (
                       <p className="hint">选择一个 PR 查看详情。</p>
                     ) : (
@@ -1888,15 +2119,17 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
                             type="button"
                             onClick={() => void mergePr()}
                             disabled={
-                              busy || prDetail.status !== "open" || !prDetail.mergeable
+                              prActionBusy.busy ||
+                              prDetail.status !== "open" ||
+                              !prDetail.mergeable
                             }
                           >
-                            合并
+                            {prActionBusy.busy ? "处理中…" : "合并"}
                           </button>
                           <button
                             type="button"
                             onClick={() => void closePr()}
-                            disabled={busy || prDetail.status !== "open"}
+                            disabled={prActionBusy.busy || prDetail.status !== "open"}
                           >
                             关闭
                           </button>
@@ -1943,8 +2176,8 @@ export function ProjectsView({ isAdmin }: { isAdmin: boolean }) {
                             rows={3}
                             placeholder="发表评论"
                           />
-                          <button type="submit" disabled={busy || !prComment.trim()}>
-                            发表评论
+                          <button type="submit" disabled={prCommentBusy.busy || !prComment.trim()}>
+                            {prCommentBusy.busy ? "发表中…" : "发表评论"}
                           </button>
                         </form>
                       </>

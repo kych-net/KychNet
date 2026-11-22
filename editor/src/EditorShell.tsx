@@ -5,6 +5,8 @@ import type { PageLink } from "@admin/components/editorCompletions";
 import { api, type Content, type ContentFormat } from "@admin/api";
 import { Toolbar } from "./Toolbar";
 import { Preview } from "./Preview";
+import { Modal } from "./Modal";
+import { useConfirm } from "./confirm";
 import { useAutosave, useMediaQuery, type SaveStatus } from "./hooks";
 
 const FORMATS: ContentFormat[] = ["markdown", "html", "typst", "wikidot", "css", "svg"];
@@ -16,6 +18,17 @@ const STATUS_TEXT: Record<SaveStatus, string> = {
   error: "保存失败",
 };
 
+function draftKeyFor(page: Content): string | null {
+  return page.id ? `kychnet-editor-draft:${page.id}` : null;
+}
+
+/**
+ * 页面编辑器外壳。
+ *
+ * 实例由父组件按「打开动作」保持稳定：自动保存只更新 page 属性，不会重建
+ * 本组件，因此光标 / undo / 输入内容在首次保存后仍然保留。
+ * 未保存判定的快照覆盖 路径 / 格式 / 发布状态 / 正文，任一变化都会触发保存。
+ */
 export function EditorShell({
   page,
   pages,
@@ -32,29 +45,52 @@ export function EditorShell({
   onToggleTheme: () => void;
 }) {
   const isDesktop = useMediaQuery("(min-width: 900px)");
-  const draftKey = page.id ? `kychnet-editor-draft:${page.id}` : null;
+  const draftKey = draftKeyFor(page);
 
-  const [body, setBody] = useState(() => {
-    if (draftKey) {
-      const draft = localStorage.getItem(draftKey);
-      if (draft !== null) return draft;
+  // 首次挂载时读一次本地草稿：与服务端内容相同就当没有草稿（顺手清掉），
+  // 不同才恢复并提示。
+  const [initial] = useState(() => {
+    if (!draftKey) return { body: page.body, restored: false };
+    try {
+      const raw = localStorage.getItem(draftKey);
+      if (raw === null) return { body: page.body, restored: false };
+      if (raw === page.body) {
+        localStorage.removeItem(draftKey);
+        return { body: page.body, restored: false };
+      }
+      return { body: raw, restored: true };
+    } catch {
+      return { body: page.body, restored: false };
     }
-    return page.body;
   });
+
+  const [body, setBody] = useState(initial.body);
   const [format, setFormat] = useState<ContentFormat>(page.format);
   const [slug, setSlug] = useState(page.slug);
   const [published, setPublished] = useState(page.published);
-  const [dirty, setDirty] = useState(false);
+  const [restored, setRestored] = useState(initial.restored);
   const [view, setView] = useState<EditorView | null>(null);
   const [previewOn, setPreviewOn] = useState(isDesktop);
   const [focus, setFocus] = useState(false);
   const [fontSize, setFontSize] = useState(isDesktop ? 14 : 16);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [restored] = useState(() =>
-    draftKey ? localStorage.getItem(draftKey) !== null : false,
+  const [errorHidden, setErrorHidden] = useState(false);
+  // 上次保存成功的快照：路径 / 格式 / 发布状态 / 正文任一变化都算「待保存」。
+  const [savedSignature, setSavedSignature] = useState(() =>
+    JSON.stringify({
+      slug: page.slug,
+      format: page.format,
+      published: page.published,
+      body: page.body,
+    }),
   );
+  const { confirm, confirmNode } = useConfirm();
+
+  const signature = JSON.stringify({ slug, format, published, body });
+  const dirty = signature !== savedSignature;
 
   const save = useCallback(async () => {
+    const sent = signature;
     const res = await api.saveContent({
       id: page.id || undefined,
       slug,
@@ -65,15 +101,17 @@ export function EditorShell({
       published,
       message: "",
     });
+    setSavedSignature(sent);
+    setRestored(false);
     onSaved(res.item);
-  }, [page.id, slug, format, body, published, onSaved]);
+  }, [page.id, page.head, slug, format, body, published, signature, onSaved]);
 
-  const { status, flush } = useAutosave(save, draftKey, body, dirty);
+  const { status, error, flush } = useAutosave(save, draftKey, body, dirty);
 
-  const onChange = useCallback((value: string) => {
-    setBody(value);
-    setDirty(true);
-  }, []);
+  // 新的保存失败重新弹出横幅（用户手动关掉过也要再提示）。
+  useEffect(() => {
+    if (error) setErrorHidden(false);
+  }, [error]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -86,29 +124,74 @@ export function EditorShell({
     return () => window.removeEventListener("keydown", onKey);
   }, [flush]);
 
+  // 未保存就关闭 / 刷新标签页时让浏览器确认。
+  const unsaved = dirty || status === "saving" || status === "error";
+  useEffect(() => {
+    if (!unsaved) return;
+    const handler = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", handler);
+    return () => window.removeEventListener("beforeunload", handler);
+  }, [unsaved]);
+
+  const requestBack = useCallback(async () => {
+    if (dirty || status === "saving") {
+      const ok = await confirm({
+        title: "离开编辑器？",
+        body: "还有未保存的改动。本地草稿会保留在本机，下次打开这一页可以恢复。",
+        confirmText: "离开",
+        danger: true,
+      });
+      if (!ok) return;
+    }
+    onBack();
+  }, [dirty, status, confirm, onBack]);
+
   const split = previewOn && isDesktop;
 
   return (
     <div className={`shell${focus ? " is-focus" : ""}${split ? " is-split" : ""}`}>
       {!focus && (
         <header className="topbar">
-          <button type="button" className="icon-btn back-btn" onClick={onBack} aria-label="返回列表">‹</button>
+          <button type="button" className="icon-btn back-btn" onClick={() => void requestBack()} aria-label="返回列表">‹</button>
           <button type="button" className="title-btn" onClick={() => setSettingsOpen(true)} title="页面设置">
             <span className="title-path">{slug || "未命名"}</span>
             <span className={`fmt-badge fmt-${format}`}>{format}</span>
             {!published && <span className="draft-tag">草稿</span>}
           </button>
-          <span className={`status-pill st-${status}`} role="status">
+          <span className={`status-pill st-${status}`} role="status" aria-live="polite">
             <span className="dot" aria-hidden="true" />
             {STATUS_TEXT[status]}
           </span>
           <div className="topbar-actions">
             <button type="button" className="icon-btn" onClick={() => setPreviewOn((v) => !v)} aria-pressed={previewOn} title="预览" aria-label="预览">👁</button>
             <button type="button" className="icon-btn" onClick={() => setFocus(true)} title="专注模式" aria-label="专注模式">⛶</button>
-            <button type="button" className="icon-btn" onClick={onToggleTheme} title="切换主题" aria-label="切换主题">◐</button>
+            <button type="button" className="icon-btn" onClick={onToggleTheme} title={theme === "dark" ? "切换为浅色主题" : "切换为深色主题"} aria-label={theme === "dark" ? "切换为浅色主题" : "切换为深色主题"}>◐</button>
             <button type="button" className="btn btn-accent save-btn" onClick={() => void flush()} disabled={status === "saving"}>保存</button>
           </div>
         </header>
+      )}
+
+      {/* 失败横幅跟随最近一次错误：即使随后继续输入（状态回到「待保存」）也仍可见，直到保存成功。 */}
+      {(error || status === "error") && !errorHidden && (
+        <div className="save-error" role="alert">
+          <span className="save-error-text">
+            保存失败{error ? `：${error}` : ""}。改动仍在本机草稿里，可重试。
+          </span>
+          <button type="button" className="btn btn-accent save-error-retry" onClick={() => void flush()}>
+            重试保存
+          </button>
+          <button
+            type="button"
+            className="icon-btn save-error-close"
+            aria-label="关闭保存失败提示"
+            onClick={() => setErrorHidden(true)}
+          >
+            ✕
+          </button>
+        </div>
       )}
 
       {focus && (
@@ -121,7 +204,7 @@ export function EditorShell({
           <CodeEditor
             value={body}
             format={format}
-            onChange={onChange}
+            onChange={setBody}
             onViewReady={setView}
             fontSize={fontSize}
             pages={pages}
@@ -133,13 +216,13 @@ export function EditorShell({
       <Toolbar format={format} view={view} />
 
       {previewOn && !isDesktop && (
-        <div className="preview-overlay">
-          <div className="preview-overlay-head">
-            <span>实时预览</span>
-            <button type="button" className="icon-btn" onClick={() => setPreviewOn(false)} aria-label="关闭预览">✕</button>
-          </div>
+        <Modal
+          title="实时预览"
+          onClose={() => setPreviewOn(false)}
+          className="modal-preview"
+        >
           <Preview format={format} body={body} active={previewOn} />
-        </div>
+        </Modal>
       )}
 
       {settingsOpen && (
@@ -155,6 +238,8 @@ export function EditorShell({
           onClose={() => setSettingsOpen(false)}
         />
       )}
+
+      {confirmNode}
     </div>
   );
 }
@@ -181,35 +266,32 @@ function SettingsModal({
   onClose: () => void;
 }) {
   return (
-    <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()} role="dialog" aria-label="页面设置">
-        <h2>页面设置</h2>
-        <label className="field">
-          <span>路径</span>
-          <input value={slug} onChange={(e) => onSlug(e.target.value)} placeholder="如 xef/index.md" autoCapitalize="off" autoCorrect="off" spellCheck={false} />
-        </label>
-        <label className="field">
-          <span>格式</span>
-          <select value={format} onChange={(e) => onFormat(e.target.value as ContentFormat)}>
-            {FORMATS.map((f) => (
-              <option key={f} value={f}>{f}</option>
-            ))}
-          </select>
-        </label>
-        <label className="field field-row">
-          <span>发布</span>
-          <input type="checkbox" checked={published} onChange={(e) => onPublished(e.target.checked)} />
-        </label>
-        <div className="field">
-          <span>字号</span>
-          <div className="font-ctrl">
-            <button type="button" className="icon-btn" onClick={() => onFontSize(Math.max(12, fontSize - 1))} aria-label="减小字号">A−</button>
-            <span className="font-val">{fontSize}px</span>
-            <button type="button" className="icon-btn" onClick={() => onFontSize(Math.min(24, fontSize + 1))} aria-label="增大字号">A＋</button>
-          </div>
+    <Modal title="页面设置" onClose={onClose}>
+      <label className="field">
+        <span>路径</span>
+        <input value={slug} onChange={(e) => onSlug(e.target.value)} placeholder="如 xef/index.md" autoCapitalize="off" autoCorrect="off" spellCheck={false} />
+      </label>
+      <label className="field">
+        <span>格式</span>
+        <select value={format} onChange={(e) => onFormat(e.target.value as ContentFormat)}>
+          {FORMATS.map((f) => (
+            <option key={f} value={f}>{f}</option>
+          ))}
+        </select>
+      </label>
+      <label className="field field-row">
+        <span>发布</span>
+        <input type="checkbox" checked={published} onChange={(e) => onPublished(e.target.checked)} />
+      </label>
+      <div className="field">
+        <span>字号</span>
+        <div className="font-ctrl">
+          <button type="button" className="icon-btn" onClick={() => onFontSize(Math.max(12, fontSize - 1))} aria-label="减小字号">A−</button>
+          <span className="font-val">{fontSize}px</span>
+          <button type="button" className="icon-btn" onClick={() => onFontSize(Math.min(24, fontSize + 1))} aria-label="增大字号">A＋</button>
         </div>
-        <button type="button" className="btn btn-accent modal-done" onClick={onClose}>完成</button>
       </div>
-    </div>
+      <button type="button" className="btn btn-accent modal-done" onClick={onClose}>完成</button>
+    </Modal>
   );
 }

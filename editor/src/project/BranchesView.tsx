@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import { api, gitUrl, sshGitUrl } from "@admin/api";
+import { useBusy } from "../useBusy";
 import { ServerDiffView } from "./DiffView";
 import type { BranchCompare, Project, ProjectRefs } from "./types";
 import { copyText, errText, firstLine, formatTime, shortOid } from "./types";
@@ -22,8 +23,7 @@ export function BranchesView({
   onOpenRef: (ref: string) => void;
   onNotify: (message: string) => void;
 }) {
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
+  const { busy, error, setError, run: runBusy } = useBusy();
   const [newName, setNewName] = useState("");
   const [newFrom, setNewFrom] = useState(currentRef);
   const [cmpSource, setCmpSource] = useState(currentRef);
@@ -43,18 +43,13 @@ export function BranchesView({
     [refs],
   );
 
+  // 失败统一由 useBusy 记到 error 并渲染，避免合并 / 重置出错时界面毫无反馈。
   const run = async (action: () => Promise<void>, success: string) => {
-    setBusy(true);
-    setError("");
-    try {
+    await runBusy(async () => {
       await action();
       if (success) onNotify(success);
       onChanged();
-    } catch (e) {
-      setError(errText(e));
-    } finally {
-      setBusy(false);
-    }
+    });
   };
 
   const create = () =>
@@ -73,16 +68,10 @@ export function BranchesView({
   };
 
   const doCompare = async () => {
-    setBusy(true);
-    setError("");
-    try {
+    await runBusy(async () => {
       const res = await api.compare(project.id, cmpSource, cmpTarget);
       setCompare(res.item);
-    } catch (e) {
-      setError(errText(e));
-    } finally {
-      setBusy(false);
-    }
+    });
   };
 
   const doMerge = () =>
@@ -130,7 +119,7 @@ export function BranchesView({
 
   return (
     <div className="pv-git">
-      {error && <p className="pv-error">{error}</p>}
+      {error && <p className="pv-error" role="alert">{error}</p>}
 
       <section className="pv-card">
         <h2>当前引用</h2>

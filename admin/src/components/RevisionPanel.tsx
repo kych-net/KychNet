@@ -171,6 +171,10 @@ export function RevisionPanel({
   // 代际守卫：快速切换内容时递增代际号，响应回来比对，
   // 不一致就丢弃，避免陈旧列表覆盖新列表（进而回滚错版本）。
   const loadGen = useRef(0);
+  // 最新 contentId 的同步副本：回滚是异步的，响应回来时据此判断
+  // 编辑器是否已经切到别的内容，避免把旧内容的回滚结果写进新内容。
+  const contentIdRef = useRef(contentId);
+  contentIdRef.current = contentId;
 
   const load = useCallback(async (id: string) => {
     const gen = ++loadGen.current;
@@ -281,11 +285,18 @@ export function RevisionPanel({
     ) {
       return;
     }
+    const startedFor = contentId!;
     setBusy(true);
     setBusyLabel("回滚…");
     try {
-      const result = await api.revertRevision(contentId!, seq);
-      await load(contentId!);
+      const result = await api.revertRevision(startedFor, seq);
+      // 回滚期间编辑器已切到别的内容：结果只提示，不回写当前编辑器。
+      if (contentIdRef.current !== startedFor) {
+        setError("");
+        setNotice(`版本 ${seq} 已回滚，但编辑器已切换到其他内容，未自动刷新`);
+        return;
+      }
+      await load(startedFor);
       setMode({ kind: "list" });
       onReverted(result.item);
       setError("");

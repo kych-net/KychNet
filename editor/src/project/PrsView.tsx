@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "@admin/api";
 import { ServerDiffView } from "./DiffView";
+import { useBusy } from "../useBusy";
 import type { PrDetail, ProjectRefs, PullRequest } from "./types";
 import { errText, formatTime } from "./types";
 
@@ -33,9 +34,11 @@ export function PrsView({
   const [source, setSource] = useState(refs.branches.find((b) => b !== refs.default_branch) ?? refs.default_branch);
   const [target, setTarget] = useState(refs.default_branch);
   const [comment, setComment] = useState("");
-  const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const epoch = useRef(0);
+  // 详情请求单独计数：慢响应不能覆盖用户后点的 PR。
+  const detailEpoch = useRef(0);
+  const { busy, error: actionError, run: runAction } = useBusy();
 
   const load = useCallback(async (token: number) => {
     try {
@@ -49,44 +52,44 @@ export function PrsView({
 
   useEffect(() => {
     const token = ++epoch.current;
+    detailEpoch.current += 1;
     void load(token);
   }, [load, refreshKey]);
 
   const open = async (number: number) => {
     if (selected === number) {
+      detailEpoch.current += 1;
       setSelected(null);
       setDetail(null);
       return;
     }
+    const token = ++detailEpoch.current;
     setSelected(number);
     setDetail(null);
     setError("");
     try {
       const res = await api.prDetail(projectId, number);
+      if (detailEpoch.current !== token) return;
       setDetail(res.item);
     } catch (e) {
-      setError(errText(e));
+      if (detailEpoch.current === token) setError(errText(e));
     }
   };
 
   const run = async (action: () => Promise<void>, success: string) => {
-    setBusy(true);
-    setError("");
-    try {
+    const ok = await runAction(async () => {
       await action();
       onNotify(success);
       onChanged();
       const token = ++epoch.current;
       await load(token);
       if (selected !== null) {
+        const detailToken = ++detailEpoch.current;
         const res = await api.prDetail(projectId, selected);
-        setDetail(res.item);
+        if (detailEpoch.current === detailToken) setDetail(res.item);
       }
-    } catch (e) {
-      setError(errText(e));
-    } finally {
-      setBusy(false);
-    }
+    });
+    if (ok) setError("");
   };
 
   const create = () =>
@@ -108,7 +111,7 @@ export function PrsView({
         <div><h2>拉取请求 <span className="pv-count">{prs.length}</span></h2></div>
         <button type="button" className="pv-btn pv-btn-accent" onClick={() => setCreating((v) => !v)}>＋ 新建</button>
       </div>
-      {error && <p className="pv-error">{error}</p>}
+      {(error || actionError) && <p className="pv-error" role="alert">{error || actionError}</p>}
 
       {creating && (
         <section className="pv-card">

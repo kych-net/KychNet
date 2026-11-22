@@ -3,7 +3,10 @@ import type { ChangeMap } from "./drafts";
 import { changeStats } from "./drafts";
 import { diffText } from "./diff";
 import { LocalDiffView } from "./DiffView";
-import { errText } from "./types";
+import { useConfirm } from "../confirm";
+import { useBusy } from "../useBusy";
+
+const MESSAGE_MAX = 200;
 
 /** 本地变更暂存区：勾选文件 → 写提交说明 → 一次性提交。 */
 export function ChangesView({
@@ -23,8 +26,9 @@ export function ChangesView({
   const [selected, setSelected] = useState<Record<string, boolean>>({});
   const [expanded, setExpanded] = useState<string | null>(null);
   const [message, setMessage] = useState("");
-  const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const { busy, error: busyError, run } = useBusy();
+  const { confirm, confirmNode } = useConfirm();
 
   useEffect(() => {
     setSelected((prev) => {
@@ -46,17 +50,25 @@ export function ChangesView({
       setError("请填写提交说明");
       return;
     }
-    setBusy(true);
     setError("");
-    try {
+    await run(async () => {
       await onCommit(chosen, message.trim());
       setMessage("");
       setExpanded(null);
-    } catch (e) {
-      setError(errText(e));
-    } finally {
-      setBusy(false);
-    }
+    });
+  };
+
+  const discard = async () => {
+    const targets = chosen.length ? chosen : paths;
+    const ok = await confirm({
+      title: "放弃草稿？",
+      body: `将丢弃 ${targets.length} 个文件的本地草稿（${targets.slice(0, 3).join("、")}${targets.length > 3 ? " 等" : ""}），并回到服务端当前版本。此操作不可撤销。`,
+      confirmText: "放弃草稿",
+      danger: true,
+    });
+    if (!ok) return;
+    onDiscard(targets);
+    setError("");
   };
 
   if (paths.length === 0) {
@@ -85,7 +97,6 @@ export function ChangesView({
       </div>
 
       {readOnly && <div className="pv-readonly">当前 ref 不是分支，无法提交。请切换到分支。</div>}
-      {error && <p className="pv-error">{error}</p>}
 
       <div className="pv-change-list">
         {paths.map((path) => {
@@ -95,7 +106,12 @@ export function ChangesView({
             <section className="pv-change-item" key={path}>
               <div className="pv-change-row">
                 <label className="pv-check">
-                  <input type="checkbox" checked={!!selected[path]} onChange={(e) => setSelected((prev) => ({ ...prev, [path]: e.target.checked }))} />
+                  <input
+                    type="checkbox"
+                    checked={!!selected[path]}
+                    aria-label={`选择 ${path}`}
+                    onChange={(e) => setSelected((prev) => ({ ...prev, [path]: e.target.checked }))}
+                  />
                 </label>
                 <span className={`pv-chip pv-chip-${change.kind === "delete" ? "delete" : change.kind === "add" ? "add" : "modify"}`}>
                   {change.kind === "add" ? "新增" : change.kind === "delete" ? "删除" : "修改"}
@@ -123,19 +139,30 @@ export function ChangesView({
             onChange={(e) => setMessage(e.target.value)}
             placeholder="描述这次改动…"
             rows={2}
+            maxLength={MESSAGE_MAX}
+            aria-describedby="pv-commit-message-count"
             disabled={readOnly || busy}
           />
         </label>
+        <p className="pv-hint pv-char-count" id="pv-commit-message-count">
+          {message.length}/{MESSAGE_MAX} 字
+        </p>
+        {/* 校验/请求错误紧贴提交按钮显示：列表很长时用户不会错过。 */}
+        {(error || busyError) && (
+          <p className="pv-error pv-commit-error" role="alert">{error || busyError}</p>
+        )}
         <div className="pv-inline-actions">
           <button type="button" className="pv-btn pv-btn-accent" onClick={() => void commit()} disabled={readOnly || busy || chosen.length === 0}>
-            提交 {chosen.length} 个变更
+            {busy ? "提交中…" : `提交 ${chosen.length} 个变更`}
           </button>
-          <button type="button" className="pv-btn" onClick={() => onDiscard(chosen.length ? chosen : paths)} disabled={busy}>
+          <button type="button" className="pv-btn" onClick={() => void discard()} disabled={busy}>
             放弃{chosen.length ? "所选" : "全部"}草稿
           </button>
         </div>
         <p className="pv-hint">提交会一次性生成一个新的 commit，并触发默认分支的站点构建。</p>
       </div>
+
+      {confirmNode}
     </div>
   );
 }

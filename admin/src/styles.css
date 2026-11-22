@@ -448,7 +448,7 @@ td button {
 .preview-empty{padding:1rem;color:var(--muted);font-size:.85rem;background:var(--bg);border-top:1px solid var(--border);}
 .code-editor .cm-editor{min-height:20rem;}
 .code-editor .cm-scroller{max-height:58vh;}
-.code-editor .cm-editor.cm-focused{outline:none;}
+.code-editor .cm-editor.cm-focused{outline:none;box-shadow:0 0 0 2px color-mix(in srgb, var(--accent) 45%, transparent);border-radius:6px;}
 .modal-backdrop{position:fixed;inset:0;z-index:100;display:grid;place-items:center;padding:1rem;background:rgba(0,0,0,.48);}
 .modal{width:min(26rem,100%);background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:1.25rem;box-shadow:0 20px 60px rgba(0,0,0,.28);}
 .modal h3{margin:0 0 .35rem;font-size:1.05rem;}
@@ -3156,6 +3156,20 @@ code,
   padding: 0.5rem 0.7rem;
   font-size: 0.78rem;
   line-height: 1.5;
+}
+
+/* 工作区就近提示：全局 error/notice 在页面顶部，滚到面板后看不见。 */
+.project-inline-feedback {
+  margin: 0 0 0.65rem;
+}
+.project-inline-feedback:empty {
+  display: none;
+}
+.project-inline-feedback .project-commit-feedback {
+  margin: 0;
+}
+.project-inline-feedback .project-commit-feedback + .project-commit-feedback {
+  margin-top: 0.4rem;
 }
 
 .staged-badge {

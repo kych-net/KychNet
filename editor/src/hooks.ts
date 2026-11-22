@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { errText } from "./project/types";
 
 // 可视视口：移动端软键盘弹出时 visualViewport 收缩，据此把编辑区与工具栏
 // 顶到键盘上方，避免遮挡。不支持 visualViewport 的环境退化为 innerHeight。
@@ -42,14 +43,23 @@ export function useMediaQuery(query: string): boolean {
 
 export type SaveStatus = "idle" | "dirty" | "saving" | "saved" | "error";
 
-// 防抖自动保存 + localStorage 草稿兜底。返回状态与手动保存函数。
+const AUTOSAVE_DELAY = 1600;
+
+/**
+ * 防抖自动保存 + localStorage 草稿兜底。
+ *
+ * `dirty` 由调用方按「路径 / 格式 / 发布状态 / 正文」整体快照与上次保存结果
+ * 比较得出，所以这些字段任一变化都会触发保存，状态点也会显示「待保存」。
+ * 返回状态、最近一次失败信息与手动保存函数。
+ */
 export function useAutosave(
   save: () => Promise<void>,
   draftKey: string | null,
   body: string,
-  enabled: boolean,
+  dirty: boolean,
 ) {
   const [status, setStatus] = useState<SaveStatus>("idle");
+  const [error, setError] = useState("");
   const timer = useRef<number | null>(null);
   const saveRef = useRef(save);
   saveRef.current = save;
@@ -59,11 +69,15 @@ export function useAutosave(
   const inFlight = useRef(false);
   const pending = useRef(false);
 
-  const flush = useCallback(async () => {
+  const clearTimer = useCallback(() => {
     if (timer.current) {
       window.clearTimeout(timer.current);
       timer.current = null;
     }
+  }, []);
+
+  const flush = useCallback(async () => {
+    clearTimer();
     if (inFlight.current) {
       pending.current = true;
       return;
@@ -77,33 +91,41 @@ export function useAutosave(
         // 保存期间用户又改了：立刻再存一次，直到没有新的待保存标记。
       } while (pending.current);
       setStatus("saved");
+      setError("");
       if (draftKey) localStorage.removeItem(draftKey);
-    } catch {
+    } catch (e) {
       setStatus("error");
+      setError(errText(e));
     } finally {
       inFlight.current = false;
     }
-  }, [draftKey]);
+  }, [clearTimer, draftKey]);
 
-  // 内容变化：落草稿并排程自动保存。
+  // 草稿兜底：只在有未保存改动时写本地，刷新/崩溃后还能恢复。
+  // 保存成功后不再写，避免下次打开时把已保存内容当成「恢复的草稿」。
   useEffect(() => {
-    if (!enabled) return;
-    if (draftKey) {
-      try {
-        localStorage.setItem(draftKey, body);
-      } catch {
-        /* 配额满时忽略，仍走服务端保存 */
-      }
+    if (!draftKey || !dirty) return;
+    try {
+      localStorage.setItem(draftKey, body);
+    } catch {
+      /* 配额满时忽略，仍走服务端保存 */
     }
-    setStatus("dirty");
-    if (timer.current) window.clearTimeout(timer.current);
-    timer.current = window.setTimeout(() => void flush(), 1600);
-    return () => {
-      if (timer.current) window.clearTimeout(timer.current);
-    };
-    // body 变化即排程；flush 稳定。
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [body, enabled, draftKey]);
+  }, [body, dirty, draftKey]);
 
-  return { status, flush };
+  // 有待保存内容时排程自动保存；dirty 归零（刚保存完）则取消计时器。
+  useEffect(() => {
+    if (!dirty) {
+      clearTimer();
+      return;
+    }
+    setStatus((current) => (current === "saving" ? current : "dirty"));
+    clearTimer();
+    timer.current = window.setTimeout(() => {
+      timer.current = null;
+      void flush();
+    }, AUTOSAVE_DELAY);
+    return clearTimer;
+  }, [body, dirty, flush, clearTimer]);
+
+  return { status, error, flush, clearError: useCallback(() => setError(""), []) };
 }
