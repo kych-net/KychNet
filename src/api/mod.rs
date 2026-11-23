@@ -684,7 +684,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
                 .layer(DefaultBodyLimit::max(GIT_MAX_BODY_BYTES)),
         )
         .route("/api/invites", get(invites).post(create_invite))
-        .route("/api/invites/{code}", delete(revoke_invite))
+        .route("/api/invites/{id}", delete(revoke_invite))
         .route("/api/users", get(users))
         .route("/api/users/{id}", patch(patch_user))
         // 整站重建：POST 触发、GET 查询状态，共用一个路径。挂管理员 +

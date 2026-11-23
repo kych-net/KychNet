@@ -318,15 +318,15 @@ async fn main() -> Result<()> {
             match command {
                 InviteCommand::Create { uses, expires } => {
                     let expires_at = service::parse_expiry(&expires)?;
-                    let invite = service::create_invite(&pool, None, uses, expires_at).await?;
-                    println!("{}", invite.code);
+                    let created = service::create_invite(&pool, None, uses, expires_at).await?;
+                    println!("{}", created.code);
                     Ok(())
                 }
                 InviteCommand::List => {
                     for invite in service::list_invites(&pool).await? {
                         println!(
-                            "{}\t{}/{}\t过期: {}\t作废: {}",
-                            invite.code,
+                            "{}…\t{}/{}\t过期: {}\t作废: {}",
+                            invite.code_prefix,
                             invite.used_count,
                             invite.max_uses,
                             invite
@@ -338,7 +338,9 @@ async fn main() -> Result<()> {
                     }
                     Ok(())
                 }
-                InviteCommand::Revoke { code } => service::revoke_invite(&pool, &code).await,
+                InviteCommand::Revoke { code } => {
+                    service::revoke_invite_by_code(&pool, &code).await
+                }
             }
         }
         Command::User { command } => {

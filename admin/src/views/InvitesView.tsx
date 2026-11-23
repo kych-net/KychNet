@@ -39,8 +39,8 @@ export function InvitesView() {
       setNotice("");
       try {
         const created = await api.createInvite(maxUses, expiresInDays);
-        // 邀请码只显示一次：像执行器注册码一样常驻展示，不吃 notice 的自动消失。
-        setCreatedCode(created.item.code);
+        // 邀请码只显示一次：明文只在这次创建响应里出现，库里只有摘要。
+        setCreatedCode(created.code);
         // 提示放在拿到结果之后：失败时不能先播报「已生成」。
         setNotice("邀请码已生成");
         await refresh();
@@ -52,7 +52,7 @@ export function InvitesView() {
 
   async function revoke(invite: Invite) {
     if (
-      !(await confirm(`作废邀请码「${invite.code}」？作废后立即失效。`, {
+      !(await confirm(`作废邀请码「${invite.code_prefix}…」？作废后立即失效。`, {
         title: "作废邀请码",
         confirmLabel: "作废",
         danger: true,
@@ -61,9 +61,9 @@ export function InvitesView() {
       return;
     }
     setError("");
-    setBusyCode(invite.code);
+    setBusyCode(invite.id);
     try {
-      await api.revokeInvite(invite.code);
+      await api.revokeInvite(invite.id);
       await refresh();
     } catch (e) {
       setError((e as Error).message);
@@ -120,7 +120,7 @@ export function InvitesView() {
       <table>
         <thead>
           <tr>
-            <th>邀请码</th>
+            <th>邀请码（前缀）</th>
             <th>使用</th>
             <th>过期</th>
             <th />
@@ -142,8 +142,10 @@ export function InvitesView() {
             </tr>
           ) : null}
           {items.map((invite) => (
-            <tr key={invite.code}>
-              <td className="mono">{invite.code}</td>
+            <tr key={invite.id}>
+              <td className="mono" title="完整邀请码仅在生成时显示一次，之后无法恢复">
+                {invite.code_prefix}…
+              </td>
               <td>
                 {invite.used_count}/{invite.max_uses}
               </td>
@@ -154,10 +156,10 @@ export function InvitesView() {
                 ) : (
                   <button
                     className="danger-text"
-                    disabled={busyCode === invite.code}
+                    disabled={busyCode === invite.id}
                     onClick={() => void revoke(invite)}
                   >
-                    {busyCode === invite.code ? "作废中…" : "作废"}
+                    {busyCode === invite.id ? "作废中…" : "作废"}
                   </button>
                 )}
               </td>

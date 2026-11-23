@@ -105,7 +105,7 @@ const CMDS: &[Cmd] = &[
         en: "invite list",
         group: "邀请码",
         usage: "列出邀请码",
-        desc: "列出全部邀请码",
+        desc: "列出全部邀请码（仅显示前缀，完整码只在创建时输出一次）",
     },
     Cmd {
         kind: Kind::InviteRevoke,

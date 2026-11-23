@@ -112,15 +112,27 @@ impl Default for SiteSettings {
     }
 }
 
+/// 邀请码记录：数据库只存 SHA-256 摘要，明文只在生成时返回一次。
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct Invite {
-    pub code: String,
+    pub id: Uuid,
+    #[serde(skip_serializing)]
+    pub code_hash: String,
+    /// 明文前 6 位，仅供管理端识别；完整码不可恢复。
+    pub code_prefix: String,
     pub created_by: Option<Uuid>,
     pub max_uses: i32,
     pub used_count: i32,
     pub expires_at: Option<DateTime<Utc>>,
     pub revoked_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+}
+
+/// 生成结果：明文 code 只在这一次响应里出现，不落库。
+#[derive(Debug, Clone, Serialize)]
+pub struct CreatedInvite {
+    pub invite: Invite,
+    pub code: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

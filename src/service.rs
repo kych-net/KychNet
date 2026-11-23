@@ -1,16 +1,22 @@
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use rand::RngCore;
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::models::{Content, ContentFormat, Invite, SiteSettings, User};
+use crate::models::{Content, ContentFormat, CreatedInvite, Invite, SiteSettings, User};
 
 /// 使用 CSPRNG 生成 16 字节、Base32(Crockford) 编码的邀请码(约 80 bit 熵)。
 pub fn generate_invite_code() -> String {
     let mut bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut bytes);
     base32::encode(base32::Alphabet::Crockford, &bytes)
+}
+
+/// 邀请码只以 SHA-256 摘要入库，与迁移 SQL 的 `encode(digest(...), 'hex')` 一致。
+pub fn hash_invite_code(code: &str) -> String {
+    hex::encode(Sha256::digest(code.as_bytes()))
 }
 
 pub fn parse_expiry(spec: &str) -> Result<Option<DateTime<Utc>>> {
@@ -327,19 +333,22 @@ pub async fn create_invite(
     created_by: Option<Uuid>,
     max_uses: i32,
     expires_at: Option<DateTime<Utc>>,
-) -> Result<Invite> {
+) -> Result<CreatedInvite> {
     let code = generate_invite_code();
+    let code_hash = hash_invite_code(&code);
+    let code_prefix: String = code.chars().take(6).collect();
     let invite = sqlx::query_as::<_, Invite>(
-        "INSERT INTO invites (code, created_by, max_uses, expires_at)
-         VALUES ($1, $2, $3, $4) RETURNING *",
+        "INSERT INTO invites (code_hash, code_prefix, created_by, max_uses, expires_at)
+         VALUES ($1, $2, $3, $4, $5) RETURNING *",
     )
-    .bind(&code)
+    .bind(&code_hash)
+    .bind(&code_prefix)
     .bind(created_by)
     .bind(max_uses)
     .bind(expires_at)
     .fetch_one(pool)
     .await?;
-    Ok(invite)
+    Ok(CreatedInvite { invite, code })
 }
 
 pub async fn list_invites(pool: &PgPool) -> Result<Vec<Invite>> {
@@ -350,9 +359,22 @@ pub async fn list_invites(pool: &PgPool) -> Result<Vec<Invite>> {
     )
 }
 
-pub async fn revoke_invite(pool: &PgPool, code: &str) -> Result<()> {
-    let result = sqlx::query("UPDATE invites SET revoked_at = now() WHERE code = $1")
-        .bind(code)
+/// 管理端按 ID 作废：列表里只有前缀，无法还原完整码。
+pub async fn revoke_invite_by_id(pool: &PgPool, id: Uuid) -> Result<()> {
+    let result = sqlx::query("UPDATE invites SET revoked_at = now() WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        bail!("邀请码不存在");
+    }
+    Ok(())
+}
+
+/// 命令行按明文码作废：先算摘要再匹配，调用方仍需持有完整码。
+pub async fn revoke_invite_by_code(pool: &PgPool, code: &str) -> Result<()> {
+    let result = sqlx::query("UPDATE invites SET revoked_at = now() WHERE code_hash = $1")
+        .bind(hash_invite_code(code))
         .execute(pool)
         .await?;
     if result.rows_affected() == 0 {
@@ -363,8 +385,8 @@ pub async fn revoke_invite(pool: &PgPool, code: &str) -> Result<()> {
 
 /// 只读校验邀请码：让注册在开始前就能报出准确原因，同时不占用名额。
 pub async fn peek_invite(pool: &PgPool, code: &str) -> Result<Invite> {
-    let invite = sqlx::query_as::<_, Invite>("SELECT * FROM invites WHERE code = $1")
-        .bind(code)
+    let invite = sqlx::query_as::<_, Invite>("SELECT * FROM invites WHERE code_hash = $1")
+        .bind(hash_invite_code(code))
         .fetch_optional(pool)
         .await?
         .context("邀请码无效")?;
@@ -378,21 +400,23 @@ pub async fn peek_invite(pool: &PgPool, code: &str) -> Result<Invite> {
 /// 再建号的话，一次取消就永久烧掉一个邀请名额，还会留下没有凭证、谁也登不
 /// 进去的孤立用户。用户名唯一性交给数据库兜底，撞名时整体回滚并给出提示。
 /// `user_id` 由调用方提前生成，必须与 WebAuthn 挑战里的 user handle 完全一致。
+/// `code_hash` 是邀请码摘要，由注册流程在暂存阶段就算好，避免明文落进 auth_flows。
 pub async fn complete_registration(
     pool: &PgPool,
     user_id: Uuid,
-    code: &str,
+    code_hash: &str,
     username: &str,
     credential_id: &str,
     passkey: &serde_json::Value,
 ) -> Result<User> {
     let mut tx = pool.begin().await?;
 
-    let invite = sqlx::query_as::<_, Invite>("SELECT * FROM invites WHERE code = $1 FOR UPDATE")
-        .bind(code)
-        .fetch_optional(&mut *tx)
-        .await?
-        .context("邀请码无效")?;
+    let invite =
+        sqlx::query_as::<_, Invite>("SELECT * FROM invites WHERE code_hash = $1 FOR UPDATE")
+            .bind(code_hash)
+            .fetch_optional(&mut *tx)
+            .await?
+            .context("邀请码无效")?;
     check_invite(&invite)?;
 
     let user = match sqlx::query_as::<_, User>(
@@ -412,8 +436,8 @@ pub async fn complete_registration(
         Err(e) => return Err(e.into()),
     };
 
-    sqlx::query("UPDATE invites SET used_count = used_count + 1 WHERE code = $1")
-        .bind(code)
+    sqlx::query("UPDATE invites SET used_count = used_count + 1 WHERE id = $1")
+        .bind(invite.id)
         .execute(&mut *tx)
         .await?;
 

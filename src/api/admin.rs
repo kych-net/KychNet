@@ -45,18 +45,19 @@ pub(crate) async fn create_invite(
     } else {
         Some(Utc::now() + chrono::Duration::days(req.expires_in_days))
     };
-    let invite =
+    let created =
         service::create_invite(&state.pool, Some(user.id), req.max_uses, expires_at).await?;
-    Ok(Json(json!({ "item": invite })))
+    // 明文只在这一次响应里出现；列表接口不会返回它。
+    Ok(Json(json!({ "item": created.invite, "code": created.code })))
 }
 
 pub(crate) async fn revoke_invite(
     State(state): State<AppState>,
     session: Session,
-    Path(code): Path<String>,
+    Path(id): Path<Uuid>,
 ) -> ApiResult<StatusCode> {
     current_admin(&state, &session).await?;
-    service::revoke_invite(&state.pool, &code).await?;
+    service::revoke_invite_by_id(&state.pool, id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

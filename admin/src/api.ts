@@ -51,7 +51,8 @@ export type SiteSettings = {
 };
 
 export type Invite = {
-  code: string;
+  id: string;
+  code_prefix: string;
   created_by: string | null;
   max_uses: number;
   used_count: number;
@@ -612,11 +613,11 @@ export const api = {
 
   invites: () => request<{ items: Invite[] }>("/invites"),
   createInvite: (maxUses: number, expiresInDays: number) =>
-    request<{ item: Invite }>("/invites", {
+    request<{ item: Invite; code: string }>("/invites", {
       method: "POST",
       body: JSON.stringify({ max_uses: maxUses, expires_in_days: expiresInDays }),
     }),
-  revokeInvite: (code: string) => request<void>(`/invites/${code}`, { method: "DELETE" }),
+  revokeInvite: (id: string) => request<void>(`/invites/${id}`, { method: "DELETE" }),
 
   users: () => request<{ items: User[] }>("/users"),
   setDisabled: (id: string, disabled: boolean) =>

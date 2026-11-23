@@ -14,12 +14,13 @@ use crate::service;
 
 /// 一次没走完的用户注册：用户还不存在，资料暂存在认证流程里。
 ///
-/// `code` 只在校验凭证成功后才拿去占用邀请码，所以中途放弃不消耗名额。
+/// `code_hash` 只在校验凭证成功后才拿去占用邀请码，中途放弃不消耗名额。
+/// 存摘要而不是明文：auth_flows.state 也是数据库里的一行，不该留完整邀请码。
 #[derive(Serialize, Deserialize)]
 struct PendingRegistration {
     user_id: Uuid,
     username: String,
-    code: String,
+    code_hash: String,
     registration: Value,
 }
 
@@ -140,7 +141,7 @@ impl Auth {
         let pending = PendingRegistration {
             user_id: user.id,
             username: user.username.clone(),
-            code: code.to_owned(),
+            code_hash: service::hash_invite_code(code),
             registration,
         };
         self.save_flow(pool, None, "register", serde_json::to_value(pending)?)
@@ -170,7 +171,7 @@ impl Auth {
         service::complete_registration(
             pool,
             pending.user_id,
-            &pending.code,
+            &pending.code_hash,
             &pending.username,
             &hex_cred_id(&passkey),
             &serde_json::to_value(&passkey)?,
