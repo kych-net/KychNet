@@ -227,6 +227,30 @@ export function Shell({
     }
   }
 
+  // 顶部可见导航的顺序，与 Alt+数字 快捷键一一对应。
+  const shortcutViews: View[] = ["contents", "projects", ...(user.is_admin ? adminViews : [])];
+
+  // 用 ref 始终指向最新的 go，避免把 go 放进监听依赖导致反复注册。
+  const goRef = useRef(go);
+  goRef.current = go;
+
+  // Alt + 1..N 快速切换视图；在输入框/可编辑区内不拦截，避免干扰打字。
+  useEffect(() => {
+    function onKey(event: KeyboardEvent) {
+      if (!event.altKey || event.ctrlKey || event.metaKey) return;
+      const target = event.target as HTMLElement | null;
+      if (target?.isContentEditable) return;
+      const tag = target?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+      const index = Number(event.key) - 1;
+      if (!Number.isInteger(index) || index < 0 || index >= shortcutViews.length) return;
+      event.preventDefault();
+      void goRef.current(shortcutViews[index]);
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [shortcutViews.length]);
+
   function switchTheme() {
     onThemeChange(theme === "dark" ? "light" : "dark");
   }
@@ -263,17 +287,26 @@ export function Shell({
         )}
 
         <nav className="appnav">
-          <button className={view === "contents" ? "active" : ""} onClick={() => void go("contents")}>
+          <button
+            className={view === "contents" ? "active" : ""}
+            title="切换视图快捷键：Alt + 1"
+            onClick={() => void go("contents")}
+          >
             内容
           </button>
-          <button className={view === "projects" ? "active" : ""} onClick={() => void go("projects")}>
+          <button
+            className={view === "projects" ? "active" : ""}
+            title="切换视图快捷键：Alt + 2"
+            onClick={() => void go("projects")}
+          >
             项目
           </button>
           {user.is_admin &&
-            adminViews.map((item) => (
+            adminViews.map((item, index) => (
               <button
                 key={item}
                 className={view === item ? "active" : ""}
+                title={`切换视图快捷键：Alt + ${index + 3}`}
                 onClick={() => void go(item)}
               >
                 {viewMeta[item].title}
