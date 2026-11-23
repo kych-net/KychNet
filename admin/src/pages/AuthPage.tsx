@@ -139,105 +139,136 @@ export function AuthPage({ onLogin }: Props) {
 
   return (
     <div className="auth">
-      <h1>{siteName || "管理"}</h1>
-      <div className="tabs">
-        <button className={mode === "login" ? "active" : ""} onClick={() => setMode("login")}>
-          登录
-        </button>
-        <button className={mode === "register" ? "active" : ""} onClick={() => setMode("register")}>
-          注册
-        </button>
-      </div>
-
-      {mode === "login" ? (
-        <form onSubmit={handleLogin}>
-          <label>
-            用户名
-            <input value={username} onChange={(e) => setUsername(e.target.value)} required />
-          </label>
-          <div className="tabs small">
-            <button
-              type="button"
-              className={method === "passkey" ? "active" : ""}
-              onClick={() => setMethod("passkey")}
-              disabled={!passkeySupported}
-            >
-              通行密钥
-            </button>
-            <button
-              type="button"
-              className={method === "totp" ? "active" : ""}
-              onClick={() => setMethod("totp")}
-            >
-              动态验证码
-            </button>
+      <div className="auth-card">
+        <div className="auth-brand">
+          <span className="auth-brand-mark" aria-hidden="true" />
+          <div className="auth-brand-copy">
+            <h1>{siteName || "管理"}</h1>
+            <p className="auth-brand-sub">管理后台 · 安全登录</p>
           </div>
-          {!passkeySupported && (
-            <p className="hint">
-              当前浏览器不支持 WebAuthn 通行密钥（例如部分外置磁盘/便携版 Chrome），请使用动态验证码。
-            </p>
-          )}
-          {method === "passkey" && platformAuthenticator === false && (
-            <p className="hint">
-              当前浏览器没有可用的平台认证器（Touch ID / Windows Hello）。通行密钥可能不会弹窗；
-              请改用动态验证码，或换成正常安装的 Chrome/Safari/Edge 后再试。
-            </p>
-          )}
-          <p className="hint">
-            先填写用户名，再点下方「{method === "passkey" ? "使用通行密钥登录" : "使用动态验证码登录"}」。
-            没有绑定过通行密钥，请先用动态验证码登录后在「用户设置」绑定。
-          </p>
-          {method === "totp" && (
+        </div>
+
+        <div className="tabs auth-tabs" aria-label="登录或注册">
+          <button
+            type="button"
+            className={mode === "login" ? "active" : ""}
+            onClick={() => setMode("login")}
+          >
+            登录
+          </button>
+          <button
+            type="button"
+            className={mode === "register" ? "active" : ""}
+            onClick={() => setMode("register")}
+          >
+            注册
+          </button>
+        </div>
+
+        {mode === "login" ? (
+          <form onSubmit={handleLogin} className="auth-form">
+            <div className="tabs small auth-methods" aria-label="登录方式">
+              <button
+                type="button"
+                className={method === "passkey" ? "active" : ""}
+                onClick={() => setMethod("passkey")}
+                disabled={!passkeySupported}
+              >
+                通行密钥
+              </button>
+              <button
+                type="button"
+                className={method === "totp" ? "active" : ""}
+                onClick={() => setMethod("totp")}
+              >
+                动态验证码
+              </button>
+            </div>
             <label>
-              6 位验证码
+              <span className="field-label">用户名</span>
               <input
-                value={code}
-                onChange={(e) => setCode(e.target.value)}
-                inputMode="numeric"
-                autoComplete="one-time-code"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                autoComplete="username"
+                placeholder="请输入用户名"
                 required
               />
             </label>
-          )}
-          <button type="submit" disabled={busy}>
-            {busy
-              ? method === "passkey"
-                ? "等待通行密钥窗口…"
-                : "处理中…"
-              : method === "passkey"
-                ? "使用通行密钥登录"
-                : "使用动态验证码登录"}
-          </button>
-          {busy && method === "passkey" && (
+            {!passkeySupported && (
+              <p className="hint hint-warn">
+                当前浏览器不支持 WebAuthn 通行密钥（例如部分外置磁盘/便携版 Chrome），请使用动态验证码。
+              </p>
+            )}
+            {method === "passkey" && platformAuthenticator === false && (
+              <p className="hint hint-warn">
+                当前浏览器没有可用的平台认证器（Touch ID / Windows Hello）。通行密钥可能不会弹窗；
+                请改用动态验证码，或换成正常安装的 Chrome/Safari/Edge 后再试。
+              </p>
+            )}
             <p className="hint">
-              正在等待浏览器弹出通行密钥窗口；如果 60 秒内没有弹窗，可以改用动态验证码。
+              先填写用户名，再点下方「{method === "passkey" ? "使用通行密钥登录" : "使用动态验证码登录"}」。
+              没有绑定过通行密钥，请先用动态验证码登录后在「用户设置」绑定。
             </p>
-          )}
-        </form>
-      ) : (
-        <form onSubmit={handleRegister}>
-          <label>
-            邀请码
-            <input value={invite} onChange={(e) => setInvite(e.target.value)} required />
-          </label>
-          <label>
-            用户名
-            <input
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
-              minLength={3}
-              maxLength={32}
-              required
-            />
-          </label>
-          <p className="hint">注册后将立即创建通行密钥。</p>
-          <button type="submit" disabled={busy}>
-            {busy ? "处理中…" : "注册并绑定通行密钥"}
-          </button>
-        </form>
-      )}
+            {method === "totp" && (
+              <label>
+                <span className="field-label">6 位验证码</span>
+                <input
+                  value={code}
+                  onChange={(e) => setCode(e.target.value)}
+                  inputMode="numeric"
+                  autoComplete="one-time-code"
+                  placeholder="6 位数字验证码"
+                  required
+                />
+              </label>
+            )}
+            <button type="submit" disabled={busy} className="auth-submit">
+              {busy
+                ? method === "passkey"
+                  ? "等待通行密钥窗口…"
+                  : "处理中…"
+                : method === "passkey"
+                  ? "使用通行密钥登录"
+                  : "使用动态验证码登录"}
+            </button>
+            {busy && method === "passkey" && (
+              <p className="hint">
+                正在等待浏览器弹出通行密钥窗口；如果 60 秒内没有弹窗，可以改用动态验证码。
+              </p>
+            )}
+          </form>
+        ) : (
+          <form onSubmit={handleRegister} className="auth-form">
+            <label>
+              <span className="field-label">邀请码</span>
+              <input
+                value={invite}
+                onChange={(e) => setInvite(e.target.value)}
+                placeholder="请输入邀请码"
+                required
+              />
+            </label>
+            <label>
+              <span className="field-label">用户名</span>
+              <input
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                minLength={3}
+                maxLength={32}
+                placeholder="3–32 个字符"
+                required
+              />
+            </label>
+            <p className="hint">注册后将立即创建通行密钥。</p>
+            <button type="submit" disabled={busy} className="auth-submit">
+              {busy ? "处理中…" : "注册并绑定通行密钥"}
+            </button>
+          </form>
+        )}
 
-      {error && <p className="error">{error}</p>}
+        {error && <p className="error" role="alert">{error}</p>}
+      </div>
+      <p className="auth-foot">端到端加密 · 通行密钥安全登录</p>
     </div>
   );
 }
