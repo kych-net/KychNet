@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import type { EditorView } from "@codemirror/view";
 import { marked } from "marked";
 import { api, Content, ContentFormat, ContentSummary, editorPath, sourcePath } from "../api";
 import { CodeEditor } from "../components/CodeEditor";
@@ -199,6 +200,10 @@ export function ContentsView() {
   const previewSupported =
     format === "markdown" || format === "html" || format === "wikidot" || format === "svg";
 
+  // 预览与编辑器同步滚动：拿到 CodeMirror 的滚动容器与预览 iframe。
+  const [editorView, setEditorView] = useState<EditorView | null>(null);
+  const previewFrameRef = useRef<HTMLIFrameElement | null>(null);
+
   useEffect(() => {
     if (!previewOn || !previewSupported) {
       setPreviewHtml("");
@@ -285,6 +290,42 @@ export function ContentsView() {
       window.clearTimeout(timer);
     };
   }, [body, format, previewOn, previewSupported]);
+
+  // 编辑器 → 预览的滚动同步：按滚动比例映射（两侧排版高度不同，按比例误差最小）。
+  // 预览 iframe 每次重新渲染都会重新加载，load 时按当前编辑器位置再对齐一次。
+  useEffect(() => {
+    if (!previewOn || !editorView) return;
+    const scroller = editorView.scrollDOM;
+    const frame = previewFrameRef.current;
+    let raf = 0;
+
+    const applyPreviewScroll = () => {
+      const doc = frame?.contentDocument;
+      if (!doc) return;
+      const root = doc.documentElement;
+      const editorMax = scroller.scrollHeight - scroller.clientHeight;
+      const previewMax = root.scrollHeight - root.clientHeight;
+      if (editorMax <= 0 || previewMax <= 0) return;
+      const ratio = Math.min(1, Math.max(0, scroller.scrollTop / editorMax));
+      frame?.contentWindow?.scrollTo(0, Math.round(ratio * previewMax));
+    };
+
+    const onScroll = () => {
+      if (raf) return;
+      raf = window.requestAnimationFrame(() => {
+        raf = 0;
+        applyPreviewScroll();
+      });
+    };
+
+    scroller.addEventListener("scroll", onScroll, { passive: true });
+    frame?.addEventListener("load", applyPreviewScroll);
+    return () => {
+      scroller.removeEventListener("scroll", onScroll);
+      frame?.removeEventListener("load", applyPreviewScroll);
+      if (raf) window.cancelAnimationFrame(raf);
+    };
+  }, [previewOn, editorView, previewHtml]);
 
 
   async function refresh() {
@@ -605,7 +646,7 @@ export function ContentsView() {
           </div>
           <div className={`editor-workbench ${previewOn && previewSupported ? "with-preview" : ""}`}>
             <div className="editor-pane">
-              <CodeEditor value={body} format={format} onChange={setBody} />
+              <CodeEditor value={body} format={format} onChange={setBody} onViewReady={setEditorView} />
               {rendersHtml(format) && (
                 <details className="head-editor" open={head.trim() !== ""}>
                   <summary>
@@ -638,9 +679,10 @@ export function ContentsView() {
                   <p className="error preview-error">{previewError}</p>
                 ) : (
                   <iframe
+                    ref={previewFrameRef}
                     className="preview-frame"
                     title="内容预览"
-                    sandbox=""
+                    sandbox="allow-same-origin"
                     srcDoc={previewDocument(previewHtml)}
                   />
                 )}
