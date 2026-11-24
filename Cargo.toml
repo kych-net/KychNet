@@ -65,6 +65,7 @@ typst-pdf = "0.15"
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
+latex2mathml = "0.2.3"
 
 [profile.release]
 lto = true

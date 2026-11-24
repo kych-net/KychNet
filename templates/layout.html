@@ -506,6 +506,20 @@
       }
       .content pre code { background: none; border: 0; padding: 0; font-size: inherit; }
 
+      /* LaTeX 公式：服务端已渲染成 MathML，这里只补排版与溢出处理 */
+      .content math { font-size: 1.06em; }
+      .content math[display="block"] {
+        display: block;
+        margin: 1.4rem 0;
+        overflow-x: auto;
+        overflow-y: hidden;
+        padding: 0.2rem 0;
+        text-align: center;
+      }
+      .content math[display="inline"] { vertical-align: -0.15em; }
+      /* MathML 是块级渲染模型，避免被浏览器按行高裁掉上下标 */
+      .content math[display="block"] > * { margin: 0 auto; }
+
       /* 代码块复制按钮 */
       .wj-code-copy {
         position: absolute;

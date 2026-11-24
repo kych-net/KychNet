@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from "react";
-import { marked } from "marked";
 import { api, Content, ContentFormat, ContentSummary, editorPath, sourcePath } from "../api";
 import { CodeEditor } from "../components/CodeEditor";
 import { DirTree } from "../components/DirTree";
@@ -211,23 +210,14 @@ export function ContentsView() {
       setPreviewLoading(false);
       return;
     }
-    if (format === "html" || format === "markdown") {
+    if (format === "html") {
       // 长文档逐字符解析会拖慢输入：延迟一小段时间再渲染，
       // 期间用户继续打字就取消上一次。
       let cancelled = false;
       const timer = window.setTimeout(() => {
         if (cancelled) return;
         try {
-          const source = stripPreviewHeader(body);
-          const html =
-            format === "html"
-              ? source
-              : (marked.parse(source, {
-                  async: false,
-                  gfm: true,
-                  breaks: false,
-                }) as string);
-          setPreviewHtml(html);
+          setPreviewHtml(stripPreviewHeader(body));
           setPreviewError("");
         } catch (e) {
           setPreviewHtml("");
@@ -242,12 +232,13 @@ export function ContentsView() {
       };
     }
 
-    // Wikidot 需要 ftml，继续走服务端预览，并做防抖。
+    // Markdown 与 Wikidot 都走服务端预览：Markdown 里的 LaTeX 公式要在服务端
+    // 转成 MathML，浏览器端 marked 做不到，否则预览和线上页面会不一致。
     let cancelled = false;
     setPreviewLoading(true);
     const timer = window.setTimeout(() => {
       api
-        .previewContent(format, body)
+        .previewContent(format, format === "markdown" ? stripPreviewHeader(body) : body)
         .then((result) => {
           if (!cancelled) {
             setPreviewHtml(result.html);

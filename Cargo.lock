@@ -3076,6 +3076,7 @@ dependencies = [
  "ftml",
  "futures-util",
  "hex",
+ "latex2mathml",
  "libc",
  "openssl",
  "pulldown-cmark",

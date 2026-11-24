@@ -407,9 +407,129 @@ fn render_wikidot(body: &str, ctx: &DocContext) -> Result<Rendered> {
     })
 }
 
+/// 找行内公式的闭合 `$`：不跨行，且闭合符前不能是空白（避免把 `$5 和 $6` 当成公式）。
+fn find_inline_math_end(chars: &[char], start: usize) -> Option<usize> {
+    let mut i = start;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => i += 2,
+            '\n' => return None,
+            '$' => {
+                let has_body = i > start;
+                let closed = has_body && !chars[i - 1].is_whitespace();
+                return if closed { Some(i) } else { None };
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// 找块级公式的闭合 `$$`（允许跨行）。
+fn find_block_math_end(chars: &[char], start: usize) -> Option<usize> {
+    let mut i = start;
+    while i + 1 < chars.len() {
+        if chars[i] == '\\' {
+            i += 2;
+            continue;
+        }
+        if chars[i] == '$' && chars[i + 1] == '$' {
+            return if i > start { Some(i) } else { None };
+        }
+        i += 1;
+    }
+    None
+}
+
+/// 找 `\)` / `\]` 的闭合位置（跳过转义字符）。
+fn find_escaped_math_end(chars: &[char], start: usize, close: char) -> Option<usize> {
+    let mut i = start;
+    while i + 1 < chars.len() {
+        if chars[i] == '\\' && chars[i + 1] == close {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// 把正文里的 LaTeX 公式转成 MathML。
+///
+/// 支持 `$…$` / `\(…\)`（行内）与 `$$…$$` / `\[…\]`（块级）。
+/// 判定偏保守：`\$` 视为转义，行内公式不跨行且首尾非空白，避免把价格之类的
+/// 单个美元符号误当公式；单个公式解析失败只保留原文，不影响整篇渲染。
+fn embed_latex_math(body: &str) -> String {
+    use latex2mathml::{latex_to_mathml, DisplayStyle};
+
+    let chars: Vec<char> = body.chars().collect();
+    let mut out = String::with_capacity(body.len() + 64);
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' && i + 1 < chars.len() {
+            let next = chars[i + 1];
+            if next == '(' || next == '[' {
+                let close = if next == '(' { ')' } else { ']' };
+                if let Some(end) = find_escaped_math_end(&chars, i + 2, close) {
+                    let tex: String = chars[i + 2..end].iter().collect();
+                    let style = if next == '(' { DisplayStyle::Inline } else { DisplayStyle::Block };
+                    if let Ok(mathml) = latex_to_mathml(tex.trim(), style) {
+                        if next == '[' {
+                            out.push_str("\n\n");
+                            out.push_str(&mathml);
+                            out.push_str("\n\n");
+                        } else {
+                            out.push_str(&mathml);
+                        }
+                        i = end + 2;
+                        continue;
+                    }
+                }
+            }
+            out.push(c);
+            out.push(next);
+            i += 2;
+            continue;
+        }
+        if c == '$' {
+            let block = i + 1 < chars.len() && chars[i + 1] == '$';
+            let open = if block { 2 } else { 1 };
+            let found = if block {
+                find_block_math_end(&chars, i + open).map(|end| (end, open))
+            } else {
+                find_inline_math_end(&chars, i + open).map(|end| (end, open))
+            };
+            if let Some((end, open_len)) = found {
+                let tex: String = chars[i + open_len..end].iter().collect();
+                let style = if block { DisplayStyle::Block } else { DisplayStyle::Inline };
+                if let Ok(mathml) = latex_to_mathml(tex.trim(), style) {
+                    if block {
+                        out.push_str("\n\n");
+                        out.push_str(&mathml);
+                        out.push_str("\n\n");
+                    } else {
+                        out.push_str(&mathml);
+                    }
+                    i = end + open_len;
+                    continue;
+                }
+            }
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
 fn render_markdown(body: &str) -> String {
+    // 先把 LaTeX 公式落成 MathML（浏览器原生渲染，静态站不需要额外 JS/字体），
+    // 再交给 Markdown 解析：MathML 是内嵌 HTML，会被原样保留。
+    let with_math = embed_latex_math(body);
     let mut output = String::new();
-    let parser = Parser::new_ext(body, Options::all());
+    let parser = Parser::new_ext(&with_math, Options::all());
     html::push_html(&mut output, parser);
     output
 }
@@ -912,6 +1032,50 @@ mod tests {
         let body = "# Hi\n\n<script>alert(1)</script>";
         let out = render(ContentFormat::Markdown, body, Path::new(".")).unwrap();
         assert!(out.html.contains("<script>alert(1)</script>"));
+    }
+
+    #[test]
+    fn markdown_renders_inline_latex_as_mathml() {
+        let out = render(ContentFormat::Markdown, "质能方程 $E = mc^2$ 很有名", Path::new(".")).unwrap();
+        assert!(out.html.contains("<math"), "{}", out.html);
+        assert!(out.html.contains("display=\"inline\""), "{}", out.html);
+        // 公式两侧的普通文字不能被吞掉
+        assert!(out.html.contains("质能方程"), "{}", out.html);
+        assert!(out.html.contains("很有名"), "{}", out.html);
+    }
+
+    #[test]
+    fn markdown_renders_block_latex_as_mathml() {
+        let out = render(
+            ContentFormat::Markdown,
+            "行间公式：\n\n$$\n\\int_0^1 x^2 \\mathrm{d}x = \\frac{1}{3}\n$$\n\n后文",
+            Path::new("."),
+        )
+        .unwrap();
+        assert!(out.html.contains("display=\"block\""), "{}", out.html);
+        assert!(out.html.contains("后文"), "{}", out.html);
+    }
+
+    #[test]
+    fn markdown_ignores_isolated_dollar_signs() {
+        // 价格里的美元符号不能当公式，也不能让整篇渲染失败
+        let out = render(ContentFormat::Markdown, "苹果 $5 一个，香蕉 $6 一根", Path::new(".")).unwrap();
+        assert!(!out.html.contains("<math"), "{}", out.html);
+        assert!(out.html.contains("$5"), "{}", out.html);
+    }
+
+    #[test]
+    fn markdown_keeps_escaped_dollar_literal() {
+        let out = render(ContentFormat::Markdown, r"路径是 \$DSH_HOME 目录", Path::new(".")).unwrap();
+        assert!(!out.html.contains("<math"), "{}", out.html);
+        assert!(out.html.contains("$DSH_HOME"), "{}", out.html);
+    }
+
+    #[test]
+    fn markdown_invalid_latex_falls_back_to_text() {
+        // 解析不了的公式保留原文，不让整页失败
+        let out = render(ContentFormat::Markdown, "坏公式 $\\undefinedmacro{$ 结束", Path::new(".")).unwrap();
+        assert!(out.html.contains("结束"), "{}", out.html);
     }
 
     #[test]
