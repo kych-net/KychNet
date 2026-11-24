@@ -128,27 +128,6 @@ pub(crate) async fn put_settings(
     Ok(Json(json!({ "site": site })))
 }
 
-pub(crate) async fn upload_avatar(
-    State(state): State<AppState>,
-    session: Session,
-    headers: HeaderMap,
-    body: Bytes,
-) -> ApiResult<Json<User>> {
-    let user = current_user(&state, &session).await?;
-    let content_type = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if !content_type.starts_with("image/svg+xml") {
-        api_bail!("头像必须使用 image/svg+xml");
-    }
-    crate::svg::validate_svg(&body)?;
-    let svg = std::str::from_utf8(&body).context("SVG 必须是 UTF-8 文本")?;
-    let user = service::update_avatar(&state.pool, user.id, svg).await?;
-    Ok(Json(user))
-}
-
 #[derive(serde::Deserialize)]
 pub(crate) struct AvatarUrlRequest {
     url: String,
@@ -178,30 +157,3 @@ pub(crate) async fn set_avatar_url(
     Ok(Json(user))
 }
 
-pub(crate) async fn avatar(State(state): State<AppState>, Path(id): Path<Uuid>) -> ApiResult<Response> {
-    match service::get_avatar(&state.pool, id).await? {
-        Some(svg) => {
-            let mut response = svg.into_response();
-            let headers = response.headers_mut();
-            headers.insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("image/svg+xml; charset=utf-8"),
-            );
-            headers.insert(
-                header::CACHE_CONTROL,
-                HeaderValue::from_static("public, max-age=300"),
-            );
-            headers.insert(
-                axum::http::HeaderName::from_static("content-security-policy"),
-                HeaderValue::from_static("default-src 'none'; style-src 'unsafe-inline'"),
-            );
-            // 防止浏览器把 SVG 嗅探成 HTML 后执行其中的内容。
-            headers.insert(
-                header::X_CONTENT_TYPE_OPTIONS,
-                HeaderValue::from_static("nosniff"),
-            );
-            Ok(response)
-        }
-        None => Ok(StatusCode::NOT_FOUND.into_response()),
-    }
-}

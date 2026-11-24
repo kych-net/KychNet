@@ -469,16 +469,6 @@ pub async fn create_user(pool: &PgPool, username: &str, is_admin: bool) -> Resul
     Ok(user)
 }
 
-pub async fn update_avatar(pool: &PgPool, id: Uuid, svg: &str) -> Result<User> {
-    let user =
-        sqlx::query_as::<_, User>("UPDATE users SET avatar_svg = $2 WHERE id = $1 RETURNING *")
-            .bind(id)
-            .bind(svg)
-            .fetch_one(pool)
-            .await?;
-    Ok(user)
-}
-
 /// 设置或清空头像链接（外部 URL 或站内路径）。
 pub async fn update_avatar_url(pool: &PgPool, id: Uuid, url: &str) -> Result<User> {
     let user =
@@ -488,18 +478,6 @@ pub async fn update_avatar_url(pool: &PgPool, id: Uuid, url: &str) -> Result<Use
             .fetch_one(pool)
             .await?;
     Ok(user)
-}
-
-pub async fn get_avatar(pool: &PgPool, id: Uuid) -> Result<Option<String>> {
-    Ok(
-        sqlx::query_scalar::<_, Option<String>>(
-            "SELECT avatar_svg FROM users WHERE id = $1 AND avatar_svg IS NOT NULL",
-        )
-        .bind(id)
-        .fetch_optional(pool)
-        .await?
-        .flatten(),
-    )
 }
 
 pub async fn get_settings(pool: &PgPool) -> Result<SiteSettings> {

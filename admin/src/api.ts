@@ -436,12 +436,10 @@ function apiUrl(path: string): string {
 }
 
 /** 头像地址同样要跟随 API 基址，否则生产环境下头像会 404。 */
-/** 头像地址：优先用用户自己填的链接，否则回退到上传的 SVG（带版本号破缓存）。 */
-export function avatarUrl(id: string, version?: number, custom?: string | null): string {
+/** 头像地址：只有用户填了链接才有图，否则调用方回退成用户名首字母。 */
+export function avatarUrl(custom?: string | null): string | null {
   const link = custom?.trim();
-  if (link) return link;
-  const suffix = version === undefined ? "" : `?v=${version}`;
-  return `${apiUrl(`/avatar/${id}`)}${suffix}`;
+  return link ? link : null;
 }
 
 /** 公开的 Git 仓库地址；项目名按 URL 段编码。 */
@@ -509,19 +507,6 @@ export const api = {
   /** 设置头像链接；传空字符串恢复默认头像。 */
   setAvatarUrl: (url: string) =>
     request<User>("/me/avatar-url", { method: "PUT", body: JSON.stringify({ url }) }),
-  uploadAvatar: async (file: File) => {
-    const response = await fetch(apiUrl("/me/avatar"), {
-      method: "POST",
-      credentials: "include",
-      headers: { "Content-Type": "image/svg+xml" },
-      body: await file.text(),
-    });
-    if (!response.ok) {
-      const data = await response.json().catch(() => null);
-      throw new Error(data?.error ?? response.statusText);
-    }
-    return (await response.json()) as User;
-  },
   logout: () => request<void>("/auth/logout", { method: "POST" }),
 
   register: (code: string, username: string) =>

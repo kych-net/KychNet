@@ -18,10 +18,8 @@ type Props = {
   site: SiteSettings;
   siteUrl: string;
   theme: Theme;
-  avatarVersion: number;
   onThemeChange: (theme: Theme) => void;
   onUserChange: (user: User) => void;
-  onAvatarChange: () => void;
   onLogout: () => void;
 };
 
@@ -67,10 +65,8 @@ export function Shell({
   site,
   siteUrl,
   theme,
-  avatarVersion,
   onThemeChange,
   onUserChange,
-  onAvatarChange,
   onLogout,
 }: Props) {
   const [view, setView] = useState<View>(() => viewFromHash(user.is_admin));
@@ -86,7 +82,7 @@ export function Shell({
 
   useEffect(() => {
     setAvatarFailed(false);
-  }, [avatarVersion, user.id]);
+  }, [user.id, user.avatar_url]);
 
   // 视图在浏览器历史里的位置索引。用于前进/后退时判断方向，
   // 并在守卫拒绝时精确回拨到原条目，而不是用 pushState 覆盖地址栏
@@ -328,15 +324,15 @@ export function Shell({
               aria-expanded={menuOpen}
               aria-haspopup="menu"
             >
-              {avatarFailed ? (
-                initial
-              ) : (
+              {!avatarFailed && avatarUrl(user.avatar_url) ? (
                 <img
                   className="avatar-img"
-                  src={avatarUrl(user.id, avatarVersion, user.avatar_url)}
+                  src={avatarUrl(user.avatar_url) ?? undefined}
                   alt=""
                   onError={() => setAvatarFailed(true)}
                 />
+              ) : (
+                initial
               )}
             </button>
             {menuOpen && (
@@ -391,9 +387,7 @@ export function Shell({
         {view === "profile" && (
           <ProfileView
             user={user}
-            avatarVersion={avatarVersion}
             onUserChange={onUserChange}
-            onAvatarChange={onAvatarChange}
           />
         )}
         </Suspense>

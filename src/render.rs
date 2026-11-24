@@ -514,7 +514,7 @@ fn convert_math(tex: &str, style: latex2mathml::DisplayStyle) -> Option<String> 
 /// 判定偏保守：`\$` 视为转义，行内公式不跨行且首尾非空白，避免把价格之类的
 /// 单个美元符号误当公式；单个公式解析失败只保留原文，不影响整篇渲染。
 fn embed_latex_math(body: &str) -> String {
-    use latex2mathml::{latex_to_mathml, DisplayStyle};
+    use latex2mathml::DisplayStyle;
 
     let chars: Vec<char> = body.chars().collect();
     let mut out = String::with_capacity(body.len() + 64);

@@ -9,12 +9,10 @@ import { useConfirm } from "../components/ConfirmProvider";
 
 type Props = {
   user: User;
-  avatarVersion: number;
   onUserChange: (user: User) => void;
-  onAvatarChange: () => void;
 };
 
-export function ProfileView({ user, avatarVersion, onUserChange, onAvatarChange }: Props) {
+export function ProfileView({ user, onUserChange }: Props) {
   const { error, notice, setError, setNotice } = useFeedback();
   const { busy, run } = useBusy();
   const confirm = useConfirm();
@@ -94,7 +92,6 @@ export function ProfileView({ user, avatarVersion, onUserChange, onAvatarChange 
         onUserChange(updated);
         setAvatarUrlInput(updated.avatar_url ?? "");
         setAvatarFailed(false);
-        onAvatarChange();
         setNotice(value ? "头像已更新" : "已恢复默认头像");
       } catch (e) {
         setError((e as Error).message);
@@ -166,15 +163,15 @@ export function ProfileView({ user, avatarVersion, onUserChange, onAvatarChange 
 
       <div className="avatar-preview">
         <div className="avatar avatar-large">
-          {avatarFailed ? (
-            initial
-          ) : (
+          {!avatarFailed && avatarUrl(avatarUrlInput) ? (
             <img
               className="avatar-img"
-              src={avatarUrl(user.id, avatarVersion, avatarUrlInput)}
+              src={avatarUrl(avatarUrlInput) ?? undefined}
               alt=""
               onError={() => setAvatarFailed(true)}
             />
+          ) : (
+            initial
           )}
         </div>
         <div className="avatar-link">

@@ -60,10 +60,6 @@ const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 /// Git 推送的 pack 与 Git LFS 上传共用的请求体上限。
 /// LFS 二进制可能较大，这里放宽到 256 MiB；普通文本推送远小于此。
 const GIT_MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
-/// 头像上限：比 svg.rs 自己的 256 KB 稍大，让「超长」由 svg.rs 报出中文提示，
-/// 而不是被传输层截成一句 413。
-const AVATAR_MAX_BODY_BYTES: usize = 256 * 1024 + 1024;
-
 /// 会话最长存活时间。用 OnInactivity 表达，但只有会话被写入时才会顺延，
 /// 实际效果就是「登录后最多 8 小时」，配合下面各处 `cycle_id` 使用。
 const SESSION_TTL: time::Duration = time::Duration::hours(8);
@@ -547,14 +543,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
         .route("/api/auth/step-up/passkey/finish", post(step_up_passkey_finish))
         .route("/api/auth/logout", post(logout))
         .route("/api/me", get(me))
-        .route(
-            "/api/me/avatar",
-            // 头像是纯矢量 SVG，svg.rs 自己限 256 KB，这里给一个更小的
-            // 传输上限，避免先收满 2 MiB 再判长度。
-            post(upload_avatar).layer(DefaultBodyLimit::max(AVATAR_MAX_BODY_BYTES)),
-        )
         .route("/api/me/avatar-url", put(set_avatar_url))
-        .route("/api/avatar/{id}", get(avatar))
         .route("/api/settings", get(get_settings).put(put_settings))
         .route("/api/totp/setup", post(totp_setup))
         .route("/api/totp/confirm", post(totp_confirm))
@@ -815,11 +804,4 @@ mod tests {
         assert!(!step_up_fresh(Some(now + 3600), now));
     }
 
-    #[test]
-    fn body_limits_are_below_database_column_checks() {
-        // 头像：传输层上限必须不小于 svg.rs 的内容上限，否则合法头像会被 413 拦下。
-        assert!(AVATAR_MAX_BODY_BYTES >= crate::svg::MAX_BYTES);
-        // 全局上限必须大于头像上限，否则上一条的「让 svg.rs 报错」意图就反了。
-        assert!(MAX_BODY_BYTES > AVATAR_MAX_BODY_BYTES);
-    }
 }
