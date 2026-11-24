@@ -453,6 +453,61 @@ fn find_escaped_math_end(chars: &[char], start: usize, close: char) -> Option<us
     None
 }
 
+/// 只替换完整的命令：`\le` 不能碰 `\leq` 里的前缀。
+fn replace_command(tex: &str, from: &str, to: &str) -> String {
+    let mut out = String::with_capacity(tex.len());
+    let mut rest = tex;
+    while let Some(pos) = rest.find(from) {
+        let after = &rest[pos + from.len()..];
+        let longer = after.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false);
+        out.push_str(&rest[..pos]);
+        out.push_str(if longer { from } else { to });
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// 把 latex2mathml 不认的常见写法归一化，否则整条公式会退化成错误文本。
+///
+/// - `\dfrac` / `\tfrac` / `\cfrac` 都是 amsmath 的分数别名，统一成 `\frac`
+/// - `cases` / `aligned` 环境未被支持，用 `matrix` 近似（cases 补左大括号）
+/// - `\displaystyle` 等纯排版命令直接去掉
+fn normalize_latex(tex: &str) -> String {
+    let mut out = tex.to_string();
+    // latex2mathml 只认 \leq / \geq，\le / \ge 会被当成未知命令
+    out = replace_command(&out, "\\le", "\\leq");
+    out = replace_command(&out, "\\ge", "\\geq");
+    for alias in ["\\dfrac", "\\tfrac", "\\cfrac"] {
+        out = out.replace(alias, "\\frac");
+    }
+    out = out.replace("\\begin{cases}", "\\left\\{\\begin{matrix}");
+    out = out.replace("\\end{cases}", "\\end{matrix}\\right.");
+    out = out.replace("\\begin{aligned}", "\\begin{matrix}");
+    out = out.replace("\\end{aligned}", "\\end{matrix}");
+    for cmd in [
+        "\\displaystyle",
+        "\\textstyle",
+        "\\scriptstyle",
+        "\\scriptscriptstyle",
+        "\\limits",
+        "\\nolimits",
+    ] {
+        out = out.replace(cmd, "");
+    }
+    out
+}
+
+/// 归一化后转换成 MathML；latex2mathml 对未知命令不总是返回错误，
+/// 偶尔会输出 `[PARSE ERROR: ...]` 文本，这种也算失败，让调用方回退原文。
+fn convert_math(tex: &str, style: latex2mathml::DisplayStyle) -> Option<String> {
+    let normalized = normalize_latex(tex.trim());
+    match latex2mathml::latex_to_mathml(&normalized, style) {
+        Ok(mathml) if !mathml.contains("PARSE ERROR") => Some(mathml),
+        _ => None,
+    }
+}
+
 /// 把正文里的 LaTeX 公式转成 MathML。
 ///
 /// 支持 `$…$` / `\(…\)`（行内）与 `$$…$$` / `\[…\]`（块级）。
@@ -473,7 +528,7 @@ fn embed_latex_math(body: &str) -> String {
                 if let Some(end) = find_escaped_math_end(&chars, i + 2, close) {
                     let tex: String = chars[i + 2..end].iter().collect();
                     let style = if next == '(' { DisplayStyle::Inline } else { DisplayStyle::Block };
-                    if let Ok(mathml) = latex_to_mathml(tex.trim(), style) {
+                    if let Some(mathml) = convert_math(&tex, style) {
                         if next == '[' {
                             out.push_str("\n\n");
                             out.push_str(&mathml);
@@ -502,7 +557,7 @@ fn embed_latex_math(body: &str) -> String {
             if let Some((end, open_len)) = found {
                 let tex: String = chars[i + open_len..end].iter().collect();
                 let style = if block { DisplayStyle::Block } else { DisplayStyle::Inline };
-                if let Ok(mathml) = latex_to_mathml(tex.trim(), style) {
+                if let Some(mathml) = convert_math(&tex, style) {
                     if block {
                         out.push_str("\n\n");
                         out.push_str(&mathml);
@@ -528,8 +583,12 @@ fn render_markdown(body: &str) -> String {
     // 先把 LaTeX 公式落成 MathML（浏览器原生渲染，静态站不需要额外 JS/字体），
     // 再交给 Markdown 解析：MathML 是内嵌 HTML，会被原样保留。
     let with_math = embed_latex_math(body);
+    // pulldown-cmark 0.12 自带数学扩展，会把没转换成功的 `$…$` 包成
+    // `<span class="math math-inline">` 半成品；公式由我们自己转 MathML，这里关掉它。
+    let mut options = Options::all();
+    options.remove(Options::ENABLE_MATH);
     let mut output = String::new();
-    let parser = Parser::new_ext(&with_math, Options::all());
+    let parser = Parser::new_ext(&with_math, options);
     html::push_html(&mut output, parser);
     output
 }
@@ -1034,6 +1093,7 @@ mod tests {
         assert!(out.html.contains("<script>alert(1)</script>"));
     }
 
+
     #[test]
     fn markdown_renders_inline_latex_as_mathml() {
         let out = render(ContentFormat::Markdown, "质能方程 $E = mc^2$ 很有名", Path::new(".")).unwrap();
@@ -1054,6 +1114,25 @@ mod tests {
         .unwrap();
         assert!(out.html.contains("display=\"block\""), "{}", out.html);
         assert!(out.html.contains("后文"), "{}", out.html);
+    }
+
+    #[test]
+    fn markdown_renders_cases_environment() {
+        // cases 环境 `latex2mathml` 不认，需归一化成带大括号的 matrix
+        let body = r"$p = \begin{cases}1, & V > C \\ \dfrac{V}{C}, & V \le C\end{cases}$";
+        let out = render(ContentFormat::Markdown, body, Path::new(".")).unwrap();
+        assert!(out.html.contains("<math"), "{}", out.html);
+        assert!(!out.html.contains("PARSE ERROR"), "{}", out.html);
+        assert!(!out.html.contains("math-inline"), "{}", out.html);
+    }
+
+    #[test]
+    fn markdown_failed_latex_keeps_original_text() {
+        let body = r"坏公式 $\notacommand{xx}$ 结束";
+        let out = render(ContentFormat::Markdown, body, Path::new(".")).unwrap();
+        assert!(!out.html.contains("PARSE ERROR"), "{}", out.html);
+        assert!(!out.html.contains("math-inline"), "{}", out.html);
+        assert!(out.html.contains("结束"), "{}", out.html);
     }
 
     #[test]
