@@ -168,6 +168,12 @@ const editorTheme = EditorView.theme(
     "&.cm-focused": {
       outline: "none",
     },
+    // drawSelection 用 .cm-cursor 元素画光标，@codemirror/view 的 baseTheme
+    // 把它固定成黑色——深色主题下几乎看不见。这里改成跟随主题强调色。
+    ".cm-cursor, .cm-dropCursor": {
+      borderLeftColor: "var(--accent)",
+      borderLeftWidth: "2px",
+    },
     ".cm-tooltip": {
       backgroundColor: "var(--panel)",
       border: "1px solid var(--border)",
