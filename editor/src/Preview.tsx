@@ -24,6 +24,8 @@ function previewDocument(html: string): string {
   :not(pre) > code { background: #f0f1f3; padding: .12em .35em; border-radius: 4px; }
   blockquote { margin: 1em 0; padding: .2em 1em; border-left: 3px solid #d0d7de; color: #57606a; }
   hr { border: none; border-top: 1px solid #eee; margin: 1.6em 0; }
+  math { font-size: 1.06em; }
+  math[display="block"] { display: block; margin: 1.3em 0; overflow-x: auto; text-align: center; }
   .wiki-note { padding: .75rem 1rem; border-left: 4px solid #2f7d5c; background: #eef7f1; border-radius: 6px; }
   .wj-code { display: block; margin: 1rem 0; border: 1px solid #ddd; border-radius: 6px; overflow: hidden; }
   .wj-code pre { margin: 0; border: 0; border-radius: 0; }

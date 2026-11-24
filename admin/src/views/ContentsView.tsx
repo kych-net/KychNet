@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { marked } from "marked";
 import { api, Content, ContentFormat, ContentSummary, editorPath, sourcePath } from "../api";
 import { CodeEditor } from "../components/CodeEditor";
 import { DirTree } from "../components/DirTree";
@@ -68,6 +69,8 @@ function previewDocument(html: string): string {
   .preview-content .wj-footnote-ref-marker, .preview-content .wj-footnote-list-item-marker { color: #1f6feb; }
   .preview-content .wj-footnote-list { margin-top: 1.5rem; padding-top: .75rem; border-top: 1px solid #ddd; font-size: .9rem; }
   .preview-content .wj-math-ml { display: inline-block; }
+  .preview-content math { font-size: 1.06em; }
+  .preview-content math[display="block"] { display: block; margin: 1.3em 0; overflow-x: auto; text-align: center; }
 </style>
 </head>
 <body><article class="preview-content">${html}</article></body>
@@ -210,20 +213,43 @@ export function ContentsView() {
       setPreviewLoading(false);
       return;
     }
-    if (format === "html") {
+    if (format === "html" || format === "markdown") {
       // 长文档逐字符解析会拖慢输入：延迟一小段时间再渲染，
       // 期间用户继续打字就取消上一次。
       let cancelled = false;
-      const timer = window.setTimeout(() => {
+      const timer = window.setTimeout(async () => {
         if (cancelled) return;
         try {
-          setPreviewHtml(stripPreviewHeader(body));
+          const source = stripPreviewHeader(body);
+          let html: string;
+          if (format === "html") {
+            html = source;
+          } else if (/\$|\\\(|\\\[/.test(source)) {
+            // 只有正文里出现公式标记时才加载 Temml：转换器约 200 KB，
+            // 不写公式的用户不必为它买单。转换结果仍是 MathML，与线上一致。
+            const { embedLatexMath } = await import("../components/markdownMath");
+            if (cancelled) return;
+            html = marked.parse(embedLatexMath(source), {
+              async: false,
+              gfm: true,
+              breaks: false,
+            }) as string;
+          } else {
+            html = marked.parse(source, {
+              async: false,
+              gfm: true,
+              breaks: false,
+            }) as string;
+          }
+          if (cancelled) return;
+          setPreviewHtml(html);
           setPreviewError("");
         } catch (e) {
+          if (cancelled) return;
           setPreviewHtml("");
           setPreviewError((e as Error).message);
         }
-        setPreviewLoading(false);
+        if (!cancelled) setPreviewLoading(false);
       }, 200);
       setPreviewLoading(true);
       return () => {
@@ -232,13 +258,12 @@ export function ContentsView() {
       };
     }
 
-    // Markdown 与 Wikidot 都走服务端预览：Markdown 里的 LaTeX 公式要在服务端
-    // 转成 MathML，浏览器端 marked 做不到，否则预览和线上页面会不一致。
+    // Wikidot 需要 ftml，走服务端预览，并做防抖。
     let cancelled = false;
     setPreviewLoading(true);
     const timer = window.setTimeout(() => {
       api
-        .previewContent(format, format === "markdown" ? stripPreviewHeader(body) : body)
+        .previewContent(format, body)
         .then((result) => {
           if (!cancelled) {
             setPreviewHtml(result.html);
