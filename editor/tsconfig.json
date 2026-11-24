@@ -17,6 +17,7 @@
     "src",
     "../admin/src/api.ts",
     "../admin/src/components/CodeEditor.tsx",
-    "../admin/src/components/editorCompletions.ts"
+    "../admin/src/components/editorCompletions.ts",
+    "../admin/src/components/markdownMath.ts"
   ]
 }

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { EditorView } from "@codemirror/view";
 import { CodeEditor } from "@admin/components/CodeEditor";
 import type { PageLink } from "@admin/components/editorCompletions";
@@ -150,6 +150,43 @@ export function EditorShell({
   }, [dirty, status, confirm, onBack]);
 
   const split = previewOn && isDesktop;
+  const previewFrameRef = useRef<HTMLIFrameElement | null>(null);
+
+  // 编辑器 → 预览的滚动同步：按滚动比例映射。两侧排版高度不同，按比例是
+  // 误差最小的做法；预览重绘后（iframe 重新加载）重新对齐一次。
+  useEffect(() => {
+    if (!split || !view) return;
+    const scroller = view.scrollDOM;
+    const frame = previewFrameRef.current;
+    let raf = 0;
+
+    const applyPreviewScroll = () => {
+      const doc = frame?.contentDocument;
+      if (!doc) return;
+      const root = doc.documentElement;
+      const editorMax = scroller.scrollHeight - scroller.clientHeight;
+      const previewMax = root.scrollHeight - root.clientHeight;
+      if (editorMax <= 0 || previewMax <= 0) return;
+      const ratio = Math.min(1, Math.max(0, scroller.scrollTop / editorMax));
+      frame?.contentWindow?.scrollTo(0, Math.round(ratio * previewMax));
+    };
+
+    const onScroll = () => {
+      if (raf) return;
+      raf = window.requestAnimationFrame(() => {
+        raf = 0;
+        applyPreviewScroll();
+      });
+    };
+
+    scroller.addEventListener("scroll", onScroll, { passive: true });
+    frame?.addEventListener("load", applyPreviewScroll);
+    return () => {
+      scroller.removeEventListener("scroll", onScroll);
+      frame?.removeEventListener("load", applyPreviewScroll);
+      if (raf) window.cancelAnimationFrame(raf);
+    };
+  }, [split, view]);
 
   return (
     <div className={`shell${focus ? " is-focus" : ""}${split ? " is-split" : ""}`}>
@@ -210,7 +247,7 @@ export function EditorShell({
             pages={pages}
           />
         </div>
-        {split && <Preview format={format} body={body} active={previewOn} />}
+        {split && <Preview ref={previewFrameRef} format={format} body={body} active={previewOn} />}
       </div>
 
       <Toolbar format={format} view={view} />
