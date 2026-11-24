@@ -507,7 +507,8 @@
       .content pre code { background: none; border: 0; padding: 0; font-size: inherit; }
 
       /* LaTeX 公式：服务端已渲染成 MathML，这里只补排版与溢出处理 */
-      .content math { font-size: 1.06em; }
+      /* 公式跟随正文默认字体：字母与数字用站点字体，运算符缺字时由浏览器回退。 */
+      .content math { font-family: inherit; font-size: 1.06em; }
       .content math[display="block"] {
         display: block;
         margin: 1.4rem 0;

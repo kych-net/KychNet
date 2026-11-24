@@ -70,7 +70,7 @@ function previewDocument(html: string): string {
   .preview-content .wj-footnote-ref-marker, .preview-content .wj-footnote-list-item-marker { color: #1f6feb; }
   .preview-content .wj-footnote-list { margin-top: 1.5rem; padding-top: .75rem; border-top: 1px solid #ddd; font-size: .9rem; }
   .preview-content .wj-math-ml { display: inline-block; }
-  .preview-content math { font-size: 1.06em; }
+  .preview-content math { font-family: inherit; font-size: 1.06em; }
   .preview-content math[display="block"] { display: block; margin: 1.3em 0; overflow-x: auto; text-align: center; }
 </style>
 </head>
