@@ -219,6 +219,7 @@ pub(crate) fn runner_identity() -> User {
         disabled: false,
         is_admin: false,
         created_at: Utc::now(),
+        avatar_url: String::new(),
     }
 }
 

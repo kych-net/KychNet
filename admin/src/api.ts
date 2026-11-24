@@ -4,6 +4,8 @@ export type User = {
   disabled: boolean;
   is_admin: boolean;
   created_at: string;
+  /** 头像图片链接；为空时回退到历史上传的 SVG 或首字母。 */
+  avatar_url?: string;
 };
 
 export type NavLink = { label: string; href: string };
@@ -434,7 +436,10 @@ function apiUrl(path: string): string {
 }
 
 /** 头像地址同样要跟随 API 基址，否则生产环境下头像会 404。 */
-export function avatarUrl(id: string, version?: number): string {
+/** 头像地址：优先用用户自己填的链接，否则回退到上传的 SVG（带版本号破缓存）。 */
+export function avatarUrl(id: string, version?: number, custom?: string | null): string {
+  const link = custom?.trim();
+  if (link) return link;
   const suffix = version === undefined ? "" : `?v=${version}`;
   return `${apiUrl(`/avatar/${id}`)}${suffix}`;
 }
@@ -501,6 +506,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   me: () => request<User | null>("/me"),
+  /** 设置头像链接；传空字符串恢复默认头像。 */
+  setAvatarUrl: (url: string) =>
+    request<User>("/me/avatar-url", { method: "PUT", body: JSON.stringify({ url }) }),
   uploadAvatar: async (file: File) => {
     const response = await fetch(apiUrl("/me/avatar"), {
       method: "POST",

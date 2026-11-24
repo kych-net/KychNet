@@ -10,6 +10,9 @@ pub struct User {
     pub disabled: bool,
     pub is_admin: bool,
     pub created_at: DateTime<Utc>,
+    /// 头像图片链接；非空时优先于历史上传的 avatar_svg。
+    #[serde(default)]
+    pub avatar_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

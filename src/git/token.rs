@@ -173,6 +173,7 @@ pub async fn authenticate(pool: &PgPool, headers: &HeaderMap) -> Result<Option<U
         disabled: row.try_get("disabled")?,
         is_admin: row.try_get("is_admin")?,
         created_at: row.try_get("created_at")?,
+        avatar_url: String::new(),
     };
     if user.disabled {
         return Ok(None);

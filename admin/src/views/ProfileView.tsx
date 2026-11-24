@@ -23,7 +23,8 @@ export function ProfileView({ user, avatarVersion, onUserChange, onAvatarChange 
   const passkeyBusy = useBusy();
   const totpBusy = useBusy();
 
-  const [avatarPreview, setAvatarPreview] = useState("");
+  const avatarBusy = useBusy();
+  const [avatarUrlInput, setAvatarUrlInput] = useState(user.avatar_url ?? "");
   const [avatarFailed, setAvatarFailed] = useState(false);
 
   const [totpSecret, setTotpSecret] = useState("");
@@ -84,26 +85,21 @@ export function ProfileView({ user, avatarVersion, onUserChange, onAvatarChange 
 
   const initial = user.username.slice(0, 1).toUpperCase();
 
-  async function uploadAvatar(event: React.ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0];
-    if (!file) {
-      return;
-    }
-    setError("");
-    if (file.size > 256 * 1024) {
-      setError("SVG 不能超过 256 KB");
-      return;
-    }
-    try {
-      const updated = await api.uploadAvatar(file);
-      onUserChange(updated);
-      setAvatarPreview(URL.createObjectURL(file));
-      setAvatarFailed(false);
-      onAvatarChange();
-      setNotice("头像已更新");
-    } catch (e) {
-      setError((e as Error).message);
-    }
+  async function saveAvatar() {
+    await avatarBusy.run(async () => {
+      setError("");
+      const value = avatarUrlInput.trim();
+      try {
+        const updated = await api.setAvatarUrl(value);
+        onUserChange(updated);
+        setAvatarUrlInput(updated.avatar_url ?? "");
+        setAvatarFailed(false);
+        onAvatarChange();
+        setNotice(value ? "头像已更新" : "已恢复默认头像");
+      } catch (e) {
+        setError((e as Error).message);
+      }
+    });
   }
 
   async function bindPasskey() {
@@ -175,22 +171,31 @@ export function ProfileView({ user, avatarVersion, onUserChange, onAvatarChange 
           ) : (
             <img
               className="avatar-img"
-              src={avatarPreview || avatarUrl(user.id, avatarVersion)}
+              src={avatarUrl(user.id, avatarVersion, avatarUrlInput)}
               alt=""
-              onError={() => {
-                if (!avatarPreview) {
-                  setAvatarFailed(true);
-                }
-              }}
+              onError={() => setAvatarFailed(true)}
             />
           )}
         </div>
-        <div>
-          <label className="upload">
-            上传 SVG 头像
-            <input type="file" accept=".svg,image/svg+xml" onChange={uploadAvatar} />
+        <div className="avatar-link">
+          <label>
+            头像图片链接
+            <input
+              value={avatarUrlInput}
+              onChange={(event) => {
+                setAvatarUrlInput(event.target.value);
+                setAvatarFailed(false);
+              }}
+              placeholder="https://… 或 /图片/xxx.svg"
+              maxLength={512}
+            />
           </label>
-          <p className="hint">仅接受纯矢量 SVG,不能包含位图、脚本或外部资源。</p>
+          <div className="row align">
+            <button type="button" onClick={() => void saveAvatar()} disabled={avatarBusy.busy}>
+              {avatarBusy.busy ? "保存中…" : "保存头像"}
+            </button>
+            <p className="hint">支持完整地址或以 / 开头的站内路径；留空则恢复默认头像。</p>
+          </div>
         </div>
       </div>
 

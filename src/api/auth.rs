@@ -61,6 +61,7 @@ pub(crate) async fn register(
         disabled: false,
         is_admin: false,
         created_at: Utc::now(),
+        avatar_url: String::new(),
     };
     let (options, flow_state) = state.auth.create_registration_challenge(&pending_user)?;
     let flow_id = state

@@ -149,6 +149,35 @@ pub(crate) async fn upload_avatar(
     Ok(Json(user))
 }
 
+#[derive(serde::Deserialize)]
+pub(crate) struct AvatarUrlRequest {
+    url: String,
+}
+
+/// 设置头像链接。留空表示清除，回退到历史 SVG 或默认首字母头像。
+pub(crate) async fn set_avatar_url(
+    State(state): State<AppState>,
+    session: Session,
+    Json(req): Json<AvatarUrlRequest>,
+) -> ApiResult<Json<User>> {
+    let user = current_user(&state, &session).await?;
+    let url = req.url.trim();
+    if url.chars().count() > 512 {
+        api_bail!("头像链接最多 512 个字符");
+    }
+    if !url.is_empty() {
+        let lowered = url.to_ascii_lowercase();
+        let allowed = lowered.starts_with("https://")
+            || lowered.starts_with("http://")
+            || url.starts_with('/');
+        if !allowed {
+            api_bail!("头像链接必须是 http(s) 地址，或以 / 开头的站内路径");
+        }
+    }
+    let user = service::update_avatar_url(&state.pool, user.id, url).await?;
+    Ok(Json(user))
+}
+
 pub(crate) async fn avatar(State(state): State<AppState>, Path(id): Path<Uuid>) -> ApiResult<Response> {
     match service::get_avatar(&state.pool, id).await? {
         Some(svg) => {

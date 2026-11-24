@@ -333,7 +333,7 @@ export function Shell({
               ) : (
                 <img
                   className="avatar-img"
-                  src={avatarUrl(user.id, avatarVersion)}
+                  src={avatarUrl(user.id, avatarVersion, user.avatar_url)}
                   alt=""
                   onError={() => setAvatarFailed(true)}
                 />

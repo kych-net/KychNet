@@ -4,7 +4,7 @@ use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -553,6 +553,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
             // 传输上限，避免先收满 2 MiB 再判长度。
             post(upload_avatar).layer(DefaultBodyLimit::max(AVATAR_MAX_BODY_BYTES)),
         )
+        .route("/api/me/avatar-url", put(set_avatar_url))
         .route("/api/avatar/{id}", get(avatar))
         .route("/api/settings", get(get_settings).put(put_settings))
         .route("/api/totp/setup", post(totp_setup))
