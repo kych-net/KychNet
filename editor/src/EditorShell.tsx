@@ -160,14 +160,60 @@ export function EditorShell({
     const frame = previewFrameRef.current;
     let raf = 0;
 
+    // 源码行与渲染高度不成比例：先按「上一个/下一个标题」锚点插值，找不到再退回比例。
+    const normalizeHeading = (text: string) =>
+      text.replace(/^#{1,6}\s+/, "").replace(/[`*_~]/g, "").trim();
+
+    const headingY = (doc: Document, label: string): number | null => {
+      const el = Array.from(doc.querySelectorAll("h1,h2,h3,h4,h5,h6")).find(
+        (node) => normalizeHeading(node.textContent ?? "") === label,
+      );
+      if (!el) return null;
+      const rect = el.getBoundingClientRect();
+      return rect.top + doc.documentElement.scrollTop;
+    };
+
+    const closestHeading = (docText: (n: number) => string, from: number, dir: 1 | -1, limit: number) => {
+      for (let n = from, i = 0; i < limit && n >= 1 && n <= view.state.doc.lines; n += dir, i++) {
+        const text = docText(n);
+        if (/^#{1,6}\s+\S/.test(text)) return { line: n, label: normalizeHeading(text) };
+      }
+      return null;
+    };
+
     const applyPreviewScroll = () => {
       const doc = frame?.contentDocument;
       if (!doc) return;
       const root = doc.documentElement;
       const editorMax = scroller.scrollHeight - scroller.clientHeight;
-      const previewMax = root.scrollHeight - root.clientHeight;
-      if (editorMax <= 0 || previewMax <= 0) return;
+      if (editorMax <= 0) return;
       const ratio = Math.min(1, Math.max(0, scroller.scrollTop / editorMax));
+
+      const src = view.state.doc;
+      const topLine = src.lineAt(view.viewport.from).number;
+      const docText = (n: number) => src.line(n).text;
+      const prev = closestHeading(docText, topLine, -1, 300);
+      const next = closestHeading(docText, topLine + 1, 1, 300);
+      const yPrev = prev ? headingY(doc, prev.label) : null;
+      const yNext = next ? headingY(doc, next.label) : null;
+
+      if (yPrev !== null && yNext !== null && prev && next) {
+        const span = Math.max(1, next.line - prev.line);
+        const t = Math.min(1, Math.max(0, (topLine - prev.line) / span));
+        frame?.contentWindow?.scrollTo(0, Math.round(yPrev + (yNext - yPrev) * t));
+        return;
+      }
+      if (yPrev !== null) {
+        frame?.contentWindow?.scrollTo(0, Math.round(yPrev));
+        return;
+      }
+      if (yNext !== null) {
+        frame?.contentWindow?.scrollTo(0, Math.round(yNext));
+        return;
+      }
+
+      const previewMax = root.scrollHeight - root.clientHeight;
+      if (previewMax <= 0) return;
       frame?.contentWindow?.scrollTo(0, Math.round(ratio * previewMax));
     };
 

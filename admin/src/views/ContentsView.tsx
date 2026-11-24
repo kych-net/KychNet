@@ -10,6 +10,14 @@ import { useBusy } from "../hooks/useBusy";
 import { useConfirm } from "../components/ConfirmProvider";
 import { useNavigationGuard } from "../components/NavigationGuardProvider";
 
+/** 把标题文本规范化，用于源码标题与预览标题的匹配。 */
+function normalizeHeading(text: string): string {
+  return text
+    .replace(/^#{1,6}\s+/, "")
+    .replace(/[`*_~]/g, "")
+    .trim();
+}
+
 function formatLabel(format: ContentFormat): string {
   switch (format) {
     case "markdown":
@@ -299,14 +307,59 @@ export function ContentsView() {
     const frame = previewFrameRef.current;
     let raf = 0;
 
+    // 源码行与渲染后高度不成比例，纯按比例滚动在长文里会明显偏。先尝试用
+    // 「上一个 / 下一个标题」把两侧锚点对齐，中间线性插值；找不到标题再退回比例。
+    const headingY = (doc: Document, label: string): number | null => {
+      const el = Array.from(doc.querySelectorAll("h1,h2,h3,h4,h5,h6")).find(
+        (node) => normalizeHeading(node.textContent ?? "") === label,
+      );
+      if (!el) return null;
+      const rect = el.getBoundingClientRect();
+      return rect.top + doc.documentElement.scrollTop;
+    };
+
+    const view = editorView;
+    const closestHeading = (docText: (n: number) => string, from: number, dir: 1 | -1, limit: number) => {
+      for (let n = from, i = 0; i < limit && n >= 1 && n <= view.state.doc.lines; n += dir, i++) {
+        const text = docText(n);
+        if (/^#{1,6}\s+\S/.test(text)) return { line: n, label: normalizeHeading(text) };
+      }
+      return null;
+    };
+
     const applyPreviewScroll = () => {
       const doc = frame?.contentDocument;
       if (!doc) return;
       const root = doc.documentElement;
       const editorMax = scroller.scrollHeight - scroller.clientHeight;
-      const previewMax = root.scrollHeight - root.clientHeight;
-      if (editorMax <= 0 || previewMax <= 0) return;
+      if (editorMax <= 0) return;
       const ratio = Math.min(1, Math.max(0, scroller.scrollTop / editorMax));
+
+      const src = view.state.doc;
+      const topLine = src.lineAt(view.viewport.from).number;
+      const docText = (n: number) => src.line(n).text;
+      const prev = closestHeading(docText, topLine, -1, 300);
+      const next = closestHeading(docText, topLine + 1, 1, 300);
+      const yPrev = prev ? headingY(doc, prev.label) : null;
+      const yNext = next ? headingY(doc, next.label) : null;
+
+      if (yPrev !== null && yNext !== null && prev && next) {
+        const span = Math.max(1, next.line - prev.line);
+        const t = Math.min(1, Math.max(0, (topLine - prev.line) / span));
+        frame?.contentWindow?.scrollTo(0, Math.round(yPrev + (yNext - yPrev) * t));
+        return;
+      }
+      if (yPrev !== null) {
+        frame?.contentWindow?.scrollTo(0, Math.round(yPrev));
+        return;
+      }
+      if (yNext !== null) {
+        frame?.contentWindow?.scrollTo(0, Math.round(yNext));
+        return;
+      }
+
+      const previewMax = root.scrollHeight - root.clientHeight;
+      if (previewMax <= 0) return;
       frame?.contentWindow?.scrollTo(0, Math.round(ratio * previewMax));
     };
 
