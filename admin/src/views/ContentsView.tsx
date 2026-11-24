@@ -303,65 +303,87 @@ export function ContentsView() {
   // 预览 iframe 每次重新渲染都会重新加载，load 时按当前编辑器位置再对齐一次。
   useEffect(() => {
     if (!previewOn || !editorView) return;
-    const scroller = editorView.scrollDOM;
+    const view = editorView;
+    const scroller = view.scrollDOM;
     const frame = previewFrameRef.current;
     let raf = 0;
 
-    // 源码行与渲染后高度不成比例，纯按比例滚动在长文里会明显偏。先尝试用
-    // 「上一个 / 下一个标题」把两侧锚点对齐，中间线性插值；找不到标题再退回比例。
-    const headingY = (doc: Document, label: string): number | null => {
-      const el = Array.from(doc.querySelectorAll("h1,h2,h3,h4,h5,h6")).find(
-        (node) => normalizeHeading(node.textContent ?? "") === label,
-      );
-      if (!el) return null;
-      const rect = el.getBoundingClientRect();
-      return rect.top + doc.documentElement.scrollTop;
+    // 源码行与渲染后高度不成比例，纯比例滚动在长文里会偏；只取最近两个标题
+    // 插值又会在跨节时跳一下。这里用「全部标题」建一张 行号 → 预览纵坐标 的
+    // 分段线性映射：映射在节点处连续，滚动时预览不会跳。
+    let lineMap: { lines: number[]; ys: number[] } | null = null;
+
+    const buildLineMap = (doc: Document) => {
+      const nodes = Array.from(doc.querySelectorAll("h1,h2,h3,h4,h5,h6"));
+      if (!nodes.length) return null;
+      const src = view.state.doc;
+      const scrollTop = doc.documentElement.scrollTop;
+      const lines: number[] = [];
+      const ys: number[] = [];
+      let cursor = 0;
+      for (let n = 1; n <= src.lines; n++) {
+        const text = src.line(n).text;
+        if (!/^#{1,6}\s+\S/.test(text)) continue;
+        const label = normalizeHeading(text);
+        // 按顺序匹配，重复标题也不会错位
+        for (let i = cursor; i < nodes.length; i++) {
+          if (normalizeHeading(nodes[i].textContent ?? "") === label) {
+            lines.push(n);
+            ys.push(nodes[i].getBoundingClientRect().top + scrollTop);
+            cursor = i + 1;
+            break;
+          }
+        }
+      }
+      return lines.length >= 2 ? { lines, ys } : null;
     };
 
-    const view = editorView;
-    const closestHeading = (docText: (n: number) => string, from: number, dir: 1 | -1, limit: number) => {
-      for (let n = from, i = 0; i < limit && n >= 1 && n <= view.state.doc.lines; n += dir, i++) {
-        const text = docText(n);
-        if (/^#{1,6}\s+\S/.test(text)) return { line: n, label: normalizeHeading(text) };
+    const previewYForLine = (doc: Document, map: { lines: number[]; ys: number[] }, line: number): number => {
+      const { lines, ys } = map;
+      const last = lines.length - 1;
+      const root = doc.documentElement;
+      const maxScroll = Math.max(0, root.scrollHeight - root.clientHeight);
+      if (line <= lines[0]) {
+        const t = lines[0] > 1 ? (line - 1) / (lines[0] - 1) : 0;
+        return Math.max(0, ys[0]) * Math.min(1, Math.max(0, t));
       }
-      return null;
+      if (line >= lines[last]) {
+        const total = Math.max(1, view.state.doc.lines - lines[last]);
+        const t = Math.min(1, Math.max(0, (line - lines[last]) / total));
+        const endY = Math.max(maxScroll, ys[last]);
+        return ys[last] + (endY - ys[last]) * t;
+      }
+      for (let i = 0; i < last; i++) {
+        if (line >= lines[i] && line <= lines[i + 1]) {
+          const t = (line - lines[i]) / (lines[i + 1] - lines[i]);
+          return ys[i] + (ys[i + 1] - ys[i]) * t;
+        }
+      }
+      return ys[0];
     };
 
     const applyPreviewScroll = () => {
       const doc = frame?.contentDocument;
       if (!doc) return;
-      const root = doc.documentElement;
       const editorMax = scroller.scrollHeight - scroller.clientHeight;
       if (editorMax <= 0) return;
+
+      const topLine = view.state.doc.lineAt(view.viewport.from).number;
+      const map = lineMap ?? buildLineMap(doc);
+      if (map) {
+        lineMap = map;
+        frame?.contentWindow?.scrollTo(0, Math.round(previewYForLine(doc, map, topLine)));
+        return;
+      }
+
+      // 没有标题可用时退回整体比例
       const ratio = Math.min(1, Math.max(0, scroller.scrollTop / editorMax));
-
-      const src = view.state.doc;
-      const topLine = src.lineAt(view.viewport.from).number;
-      const docText = (n: number) => src.line(n).text;
-      const prev = closestHeading(docText, topLine, -1, 300);
-      const next = closestHeading(docText, topLine + 1, 1, 300);
-      const yPrev = prev ? headingY(doc, prev.label) : null;
-      const yNext = next ? headingY(doc, next.label) : null;
-
-      if (yPrev !== null && yNext !== null && prev && next) {
-        const span = Math.max(1, next.line - prev.line);
-        const t = Math.min(1, Math.max(0, (topLine - prev.line) / span));
-        frame?.contentWindow?.scrollTo(0, Math.round(yPrev + (yNext - yPrev) * t));
-        return;
-      }
-      if (yPrev !== null) {
-        frame?.contentWindow?.scrollTo(0, Math.round(yPrev));
-        return;
-      }
-      if (yNext !== null) {
-        frame?.contentWindow?.scrollTo(0, Math.round(yNext));
-        return;
-      }
-
+      const root = doc.documentElement;
       const previewMax = root.scrollHeight - root.clientHeight;
       if (previewMax <= 0) return;
       frame?.contentWindow?.scrollTo(0, Math.round(ratio * previewMax));
     };
+
 
     const onScroll = () => {
       if (raf) return;
@@ -372,10 +394,14 @@ export function ContentsView() {
     };
 
     scroller.addEventListener("scroll", onScroll, { passive: true });
-    frame?.addEventListener("load", applyPreviewScroll);
+    const onLoad = () => {
+      lineMap = null;
+      applyPreviewScroll();
+    };
+    frame?.addEventListener("load", onLoad);
     return () => {
       scroller.removeEventListener("scroll", onScroll);
-      frame?.removeEventListener("load", applyPreviewScroll);
+      frame?.removeEventListener("load", onLoad);
       if (raf) window.cancelAnimationFrame(raf);
     };
   }, [previewOn, editorView, previewHtml]);
